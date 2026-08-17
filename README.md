@@ -38,7 +38,11 @@ dsh plugin --profile web add ./dsh-hermes-bot-0.1.0.tgz --ignore-scripts
 
 ## 配置
 
-Token 不写入 patch 或 Git。推荐使用环境变量：
+安装后打开 `dsh web`，进入设置里的“飞书机器人”。在那里填写 App ID、App Secret，以及允许使用机器人的用户 ID 或群聊 ID，最后点击“保存并启动”即可。
+
+App Secret 通过 DSH 的本机凭据库保存：页面不会回显，插件不会把它写入 settings 文件、patch 或 Git。保存后插件会自动重载飞书连接，不需要重启 DSH。
+
+如果暂时不使用网页设置，也仍然支持环境变量：
 
 ```bash
 export DSH_HERMES_BOT_TELEGRAM_TOKEN='替换为 Telegram Bot Token'
@@ -50,6 +54,8 @@ export DSH_HERMES_BOT_ALLOWED_USERS='123456789'
 # export DSH_HERMES_BOT_ALLOWED_CHATS='-1001234567890'
 dsh web
 ```
+
+其中用户 ID 通常是 `ou_...`，群聊 ID 通常是 `oc_...`。网页表单支持一行一个 ID 或逗号分隔；至少填写一个用户 ID 或群聊 ID，否则默认不会接受任何消息。
 
 完整配置示例见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
@@ -71,6 +77,6 @@ npm test
 ## 安全边界
 
 - 默认 allowlist；空 allowlist 不接受普通消息；
-- Token 只从环境变量读取；
+- Telegram Token 只从环境变量读取；飞书 App Secret 通过 DSH 本机凭据库保存；
 - 运行状态默认位于 `DSH_HOME/hermes-bot`，可用 `DSH_HERMES_BOT_HOME` 指定；
 - 这是 developer-preview 版 DSH 的外部插件，未来 Harness API 变化集中处理在 `src/harness-bridge.ts`。

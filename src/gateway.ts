@@ -125,18 +125,20 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
 
 /** Hermes-style message gateway implemented as a DSH plugin boundary. */
 export class BotGateway {
-  private readonly config: BotGatewayConfig
+  private config: BotGatewayConfig
   private readonly profiles: Map<string, BotProfile>
   private readonly state: JsonState<BotStateFile>
   private readonly wal: InboundWal
   private readonly outbox: Outbox
-  private readonly transports: BotTransport[]
+  private transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
   private readonly lanes = new Map<string, Promise<void>>()
   private readonly inboundRetryTimers = new Set<ReturnType<typeof setTimeout>>()
   private bridge: HarnessBridge | undefined
   private started: Promise<void> = Promise.resolve()
   private stopped = false
+  private running = false
+  private durableLoaded = false
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -151,15 +153,9 @@ export class BotGateway {
     )
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
-    const transports: BotTransport[] = []
-    const token = this.config.telegram?.token
-    if (this.config.telegram?.enabled !== false && token) transports.push(new TelegramTransport(this.config.telegram))
-    const feishu = this.config.feishu
-    if (feishu && feishu.enabled !== false && feishu.appId && feishu.appSecret) {
-      transports.push(new FeishuTransport(feishu))
-    }
-    this.transports = transports
-    this.transportByPlatform = new Map(transports.map(transport => [transport.platform, transport]))
+    this.transports = []
+    this.transportByPlatform = new Map()
+    this.installTransports(this.config)
     this.outbox = new Outbox(
       join(stateDir, 'outbox.jsonl'),
       async (item: OutboxItem) => {
@@ -174,17 +170,55 @@ export class BotGateway {
   }
 
   public async start(): Promise<void> {
+    if (this.running) {
+      await this.started
+      return
+    }
+    this.running = true
+    this.stopped = false
     this.started = this.boot()
-    await this.started
+    try {
+      await this.started
+    } catch (error) {
+      this.running = false
+      throw error
+    }
   }
 
   public async stop(): Promise<void> {
     this.stopped = true
+    this.running = false
     for (const timer of this.inboundRetryTimers) clearTimeout(timer)
     this.inboundRetryTimers.clear()
     await this.started.catch(() => undefined)
-    await Promise.all(this.transports.map(transport => transport.stop()))
+    await this.stopTransports()
     await this.outbox.stop()
+  }
+
+  /** Apply settings changes without requiring the DSH process to restart. */
+  public async reconfigure(rawConfig: unknown = {}): Promise<void> {
+    const next = normalizeConfig(rawConfig)
+    if (!this.running || this.stopped) {
+      this.applyConfig(next)
+      this.installTransports(next)
+      return
+    }
+    await this.started.catch(() => undefined)
+    if (!this.running || this.stopped) return
+    await this.stopTransports()
+    this.applyConfig(next)
+    this.installTransports(next)
+    await this.loadDurableState()
+    await this.activateTransports(true)
+  }
+
+  private applyConfig(next: BotGatewayConfig): void {
+    this.config = next
+    this.profiles.clear()
+    for (const [name, profile] of normalizeProfiles(next)) this.profiles.set(name, profile)
+    if (!this.profiles.has(next.defaultProfile ?? 'default')) {
+      this.profiles.set('default', { name: 'default', title: 'Hermes' })
+    }
   }
 
   public onSessionEvent(session: SessionLike, event: unknown): void {
@@ -207,29 +241,66 @@ export class BotGateway {
 
   private async boot(): Promise<void> {
     if (this.config.enabled === false) return
+    await this.loadDurableState()
+    await this.activateTransports(true)
+  }
+
+  private async loadDurableState(): Promise<void> {
+    if (this.durableLoaded) return
     await this.state.load()
     await this.wal.load()
     await this.outbox.load()
+    this.durableLoaded = true
+  }
+
+  private async activateTransports(recover: boolean): Promise<void> {
+    if (this.config.enabled === false) return
     if (this.transports.length === 0) {
       this.log('warn', 'no enabled Telegram or Feishu transport configured; Bot Gateway is installed but idle')
       return
     }
-    try {
-      this.bridge = new HarnessBridge(this.ctx)
-    } catch (error: unknown) {
-      this.log('warn', `DeepSeek Harness Agent service unavailable: ${String(error)}`)
-      return
+    if (!this.bridge) {
+      try {
+        this.bridge = new HarnessBridge(this.ctx)
+      } catch (error: unknown) {
+        this.log('warn', `DeepSeek Harness Agent service unavailable: ${String(error)}`)
+        return
+      }
     }
-    for (const item of await this.wal.pending()) {
-      void this.queueInbound(item.message, item.id)
+    if (recover) {
+      for (const item of await this.wal.pending()) {
+        void this.queueInbound(item.message, item.id)
+      }
+      void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
     }
-    void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
     for (const transport of this.transports) {
       void transport.start(message => this.acceptInbound(message)).catch(error => {
-        if (!this.stopped) this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+        if (!this.stopped && this.transportByPlatform.get(transport.platform) === transport) {
+          this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+        }
       })
     }
     this.log('info', `Bot Gateway started: ${this.transports.map(transport => transport.platform).join(', ')}`)
+  }
+
+  private installTransports(config: BotGatewayConfig): void {
+    const transports: BotTransport[] = []
+    const token = config.telegram?.token
+    if (config.telegram?.enabled !== false && token) transports.push(new TelegramTransport(config.telegram))
+    const feishu = config.feishu
+    if (feishu && feishu.enabled !== false && feishu.appId && feishu.appSecret) {
+      transports.push(new FeishuTransport(feishu))
+    }
+    this.transports = transports
+    this.transportByPlatform.clear()
+    for (const transport of transports) this.transportByPlatform.set(transport.platform, transport)
+  }
+
+  private async stopTransports(): Promise<void> {
+    const current = this.transports
+    this.transports = []
+    this.transportByPlatform.clear()
+    await Promise.all(current.map(transport => transport.stop()))
   }
 
   private async acceptInbound(message: InboundMessage): Promise<void> {

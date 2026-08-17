@@ -1,5 +1,18 @@
 # 配置示例
 
+## 推荐：网页一键配置
+
+安装插件并启动 `dsh web` 后，进入设置里的“飞书机器人”：
+
+1. 填写飞书 App ID。
+2. 填写 App Secret。
+3. 填写允许使用机器人的用户 ID 或群聊 ID（每行一个）。
+4. 点击“保存并启动”。
+
+App Secret 使用 DSH 的本机凭据库保存，只显示“已配置/未配置”，不会写入项目、settings 文件或 Git。保存后插件会自动重载连接。
+
+网页配置保存的普通字段属于 `dsh-hermes-bot` settings namespace；插件网页通过本机接口读取和保存这组字段，因为 DSH 公共网页设置接口只开放固定的官方 namespace。App Secret 使用固定凭据引用 `DSH_HERMES_BOT_FEISHU_APP_SECRET`，不会作为普通设置返回。
+
 插件配置可以写入 profile 的 overlay，也可以主要通过环境变量提供敏感信息。
 
 ```yaml
