@@ -170,7 +170,7 @@ async function handleRequest(
     sendJson(res, 200, {
       ...snapshot,
       pairingCandidate: candidate,
-      message: '配对成功。该用户会收到提示，请在飞书同一个聊天中发送 /new 开始新的会话；如需把 UID 同步到白名单文本框，请点击“保存并启动”。',
+      message: '配对成功。该用户会收到提示，请在飞书同一个聊天中发送 /new 开始新的会话；UID 已追加到用户 ID 列表，点击“保存并启动”即可长期保存。',
     })
     return
   }

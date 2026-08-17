@@ -124,8 +124,8 @@ interface Draft {
   appSecret: string
   domain: 'feishu' | 'lark'
   requireMention: boolean
-  userIds: string
-  chatIds: string
+  userIds: string[]
+  chatIds: string[]
   pairingEnabled: boolean
 }
 
@@ -141,6 +141,28 @@ function splitIds(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；\r\n]+/u).map(item => item.trim()).filter(Boolean))]
 }
 
+function normalizedRows(values: readonly string[]): string[] {
+  return splitIds(values.join('\n'))
+}
+
+function appendUniqueRow(values: readonly string[], value: string): string[] {
+  const additions = splitIds(value)
+  if (additions.length === 0) return [...values]
+  const existing = normalizedRows(values)
+  return [...values, ...additions.filter(item => !existing.includes(item))]
+}
+
+function updateRowValue(values: readonly string[], index: number, value: string): string[] {
+  const next = [...values]
+  const pieces = splitIds(value)
+  if (pieces.length <= 1) {
+    next[index] = pieces[0] ?? ''
+    return next
+  }
+  next.splice(index, 1, ...pieces)
+  return next
+}
+
 function draftOf(settings: HermesBotSettings): Draft {
   return {
     enabled: settings.enabled,
@@ -149,8 +171,8 @@ function draftOf(settings: HermesBotSettings): Draft {
     appSecret: '',
     domain: settings.feishu.domain,
     requireMention: settings.feishu.requireMention,
-    userIds: settings.access.userIds.join('\n'),
-    chatIds: settings.access.chatIds.join('\n'),
+    userIds: [...settings.access.userIds],
+    chatIds: [...settings.access.chatIds],
     pairingEnabled: settings.access.pairing !== false,
   }
 }
@@ -220,9 +242,9 @@ class FeishuSetupController {
     }
     const appId = draft.appId.trim()
     const discoveredUserId = snapshot.diagnostics.discovery?.candidate?.userId
-    const userIds = splitIds(draft.userIds)
-    if (userIds.length === 0 && discoveredUserId !== undefined) userIds.push(discoveredUserId)
-    const chatIds = splitIds(draft.chatIds)
+    const userIds = normalizedRows(draft.userIds)
+    if (discoveredUserId !== undefined && !userIds.includes(discoveredUserId)) userIds.push(discoveredUserId)
+    const chatIds = normalizedRows(draft.chatIds)
     if (appId === '') {
       this.publish({ error: '请填写飞书 App ID。' })
       return
@@ -260,7 +282,17 @@ class FeishuSetupController {
       const data = setupResponseFromBody(body)
       this.publish({
         status: 'ready',
-        settings: data.settings,
+        // Diagnose temporarily clears the server-side allowlist so that only
+        // the one-time discovery command can authorize a message. Keep the
+        // user's unsaved rows visible in the form until they click Save.
+        settings: {
+          ...data.settings,
+          access: {
+            ...data.settings.access,
+            userIds: normalizedRows(draft.userIds),
+            chatIds: normalizedRows(draft.chatIds),
+          },
+        },
         writable: data.writable,
         credential: data.credential,
         diagnostics: data.diagnostics,
@@ -320,9 +352,18 @@ class FeishuSetupController {
       const body = await readRouteBody(response)
       if (!response.ok) throw new Error(errorFromBody(body, response.status))
       const data = setupResponseFromBody(body)
+      const candidate = data.pairingCandidate
       this.publish({
         status: 'ready',
-        settings: data.settings,
+        settings: candidate?.userId === undefined
+          ? data.settings
+          : {
+              ...data.settings,
+              access: {
+                ...data.settings.access,
+                userIds: appendUniqueRow(data.settings.access.userIds, candidate.userId),
+              },
+            },
         writable: data.writable,
         credential: data.credential,
         diagnostics: data.diagnostics,
@@ -469,6 +510,42 @@ function Field(props: { label: string; hint?: string; children: React.ReactNode 
   return <label className="dsh-hermes-field"><span>{props.label}</span>{props.children}{props.hint === undefined ? null : <small>{props.hint}</small>}</label>
 }
 
+function IdListEditor({
+  label,
+  hint,
+  values,
+  onChange,
+}: {
+  label: string
+  hint: string
+  values: string[]
+  onChange: (values: string[]) => void
+}) {
+  return (
+    <div className="dsh-hermes-id-editor">
+      <div className="dsh-hermes-id-editor-head">
+        <div><span>{label}</span><small>{hint}</small></div>
+        <span className="dsh-hermes-id-count">{values.length} 个</span>
+      </div>
+      {values.length === 0 ? <div className="dsh-hermes-id-empty">暂未添加{label}</div> : values.map((value, index) => (
+        <div className="dsh-hermes-id-row" key={`${label}-${index}`}>
+          <span className="dsh-hermes-id-index">{label} {index + 1}</span>
+          <input
+            value={value}
+            onChange={event => { onChange(updateRowValue(values, index, event.target.value)) }}
+            placeholder={label === '用户 ID' ? '例如 ou_…' : '例如 oc_…'}
+            autoComplete="off"
+          />
+          <button type="button" className="dsh-hermes-id-remove" onClick={() => {
+            onChange(values.filter((_, rowIndex) => rowIndex !== index))
+          }}>删除</button>
+        </div>
+      ))}
+      <button type="button" className="dsh-hermes-id-add" onClick={() => { onChange([...values, '']) }}>＋ 添加{label}</button>
+    </div>
+  )
+}
+
 function formatDiagnosticTime(value: number | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
   return new Date(value).toLocaleString()
@@ -558,8 +635,8 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
   useEffect(() => {
     if (discoveredUserId === undefined) return
     setDraft(current => {
-      if (current === undefined || splitIds(current.userIds).length > 0) return current
-      return { ...current, userIds: discoveredUserId }
+      if (current === undefined || normalizedRows(current.userIds).includes(discoveredUserId)) return current
+      return { ...current, userIds: appendUniqueRow(current.userIds, discoveredUserId) }
     })
   }, [discoveredUserId])
 
@@ -590,7 +667,11 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
   }
   const approvePairing = (): void => {
     void controller.approvePairing(pairingCode).then(candidate => {
-      if (candidate?.userId !== undefined) update('userIds', candidate.userId)
+      if (candidate?.userId !== undefined) {
+        setDraft(current => current === undefined
+          ? current
+          : { ...current, userIds: appendUniqueRow(current.userIds, candidate.userId!) })
+      }
       if (candidate !== undefined) setPairingCode('')
     })
   }
@@ -619,14 +700,14 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
 
       <section className="dsh-hermes-panel">
         <h3>谁可以使用</h3>
-        <p className="dsh-hermes-muted">每行一个，也可以用逗号分隔。可以直接填写用户/群聊 ID，也可以开启安全配对，让陌生用户先拿配对码。群聊里默认需要 @机器人。</p>
+        <p className="dsh-hermes-muted">这里是长期白名单。每个用户或群聊都有独立的输入框，保存后会一直保留；安全配对和一键识别到的新用户会自动追加，不会覆盖已有用户。群聊里默认需要 @机器人。</p>
         <div className="dsh-hermes-grid">
-          <Field label="用户 ID" hint="推荐点击下方“一键测试并自动识别 UID”，不需要手动查 ou_…"><textarea rows={4} value={draft.userIds} onChange={event => { update('userIds', event.target.value) }} /></Field>
-          <Field label="群聊 ID" hint="飞书常见格式：oc_…"><textarea rows={4} value={draft.chatIds} onChange={event => { update('chatIds', event.target.value) }} /></Field>
+          <IdListEditor label="用户 ID" hint="推荐点击下方“一键测试并自动识别 UID”，不需要手动查 ou_…" values={draft.userIds} onChange={values => { update('userIds', values) }} />
+          <IdListEditor label="群聊 ID" hint="飞书常见格式：oc_…；一个群聊一行" values={draft.chatIds} onChange={values => { update('chatIds', values) }} />
         </div>
         <div className="dsh-hermes-action-row">
           <button type="button" className="dsh-hermes-secondary" disabled={!state.writable || state.saving || state.diagnosing} onClick={() => { void controller.startDiscovery(draft) }}>{state.diagnosing ? '正在测试连接…' : '一键测试并自动识别 UID'}</button>
-          {state.diagnostics.discovery?.candidate?.userId === undefined ? null : <button type="button" className="dsh-hermes-secondary" onClick={() => { update('userIds', state.diagnostics.discovery?.candidate?.userId ?? '') }}>再次填入检测到的 UID</button>}
+          {state.diagnostics.discovery?.candidate?.userId === undefined ? null : <button type="button" className="dsh-hermes-secondary" onClick={() => { setDraft(current => current === undefined ? current : { ...current, userIds: appendUniqueRow(current.userIds, state.diagnostics.discovery?.candidate?.userId ?? '') }) }}>再次追加检测到的 UID</button>}
           <span className="dsh-hermes-muted">首次使用仍需填写 App ID 和 App Secret；密钥只保存在本机凭据库。</span>
         </div>
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.pairingEnabled} onChange={event => { update('pairingEnabled', event.target.checked) }} /><span>未知用户私聊时自动回复一次性配对码</span></label>
@@ -640,7 +721,7 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
           <input className="dsh-hermes-pairing-input" value={pairingCode} onChange={event => { setPairingCode(event.target.value.toUpperCase()) }} placeholder="输入配对码，例如 ABCD2345" autoComplete="off" />
           <button type="button" className="dsh-hermes-secondary" disabled={!state.writable || state.saving || state.pairingApproving || pairingCode.trim() === ''} onClick={approvePairing}>{state.pairingApproving ? '正在确认…' : '确认配对并自动填入 UID'}</button>
         </div>
-        <p className="dsh-hermes-muted">当前待确认配对：{String(state.diagnostics.pairing?.pending?.length ?? 0)} 个。配对成功后，对方可以立即使用；点击“保存并启动”还会把 UID 同步到白名单文本框。</p>
+        <p className="dsh-hermes-muted">当前待确认配对：{String(state.diagnostics.pairing?.pending?.length ?? 0)} 个。配对成功后，对方可以立即使用；确认到的 UID 会自动追加到上面的用户 ID 列表，点击“保存并启动”即可长期保存。</p>
         {(state.diagnostics.pairing?.approved?.length ?? 0) === 0 ? null : <div className="dsh-hermes-pairing-approved"><span className="dsh-hermes-muted">已确认的配对用户</span>{state.diagnostics.pairing?.approved?.map(item => item.userId === undefined ? null : <div className="dsh-hermes-pairing-approved-row" key={`${item.platform ?? 'unknown'}:${item.userId}`}><code>{item.userId}</code><button type="button" className="dsh-hermes-secondary" disabled={state.pairingApproving} onClick={() => { void controller.revokePairing(item.platform ?? 'feishu', item.userId ?? '') }}>取消配对</button></div>)}</div>}
       </section>
 
@@ -660,7 +741,8 @@ const CSS = `
 .dsh-hermes-header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:8px 2px}.dsh-hermes-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}.dsh-hermes-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}.dsh-hermes-kicker{font-size:10px;letter-spacing:.1em;color:#6758d4;font-weight:700}.dsh-hermes-badge{font-size:10px;padding:4px 8px;border-radius:999px;font-weight:650;white-space:nowrap}.dsh-hermes-badge.ok{background:rgba(48,154,100,.12);color:#267d52}.dsh-hermes-badge.missing{background:rgba(205,72,72,.1);color:#aa3939}
 .dsh-hermes-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}.dsh-hermes-notice{background:rgba(92,108,213,.09);color:#5149a6}.dsh-hermes-warning{background:rgba(224,162,55,.12);color:#986818}.dsh-hermes-error{background:rgba(205,72,72,.1);color:#aa3939}.dsh-hermes-success{background:rgba(48,154,100,.1);color:#267d52}.dsh-hermes-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
-.dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}
+ .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}
+ .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 
