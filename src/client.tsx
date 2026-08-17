@@ -66,6 +66,13 @@ interface PairingCandidate {
   chatType?: string
 }
 
+interface AuthorizedUserRow {
+  userId: string
+  platform: string
+  allowlisted: boolean
+  paired: boolean
+}
+
 interface Diagnostics {
   enabled?: boolean
   accessMode?: string
@@ -413,7 +420,7 @@ class FeishuSetupController {
     }
   }
 
-  public async revokePairing(platform: string, userId: string): Promise<void> {
+  public async revokePairing(platform: string, userId: string): Promise<boolean> {
     this.publish({ pairingApproving: true, error: undefined, message: undefined })
     try {
       const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
@@ -434,8 +441,10 @@ class FeishuSetupController {
         error: undefined,
         diagnosticsError: undefined,
       })
+      return true
     } catch (error) {
       this.publish({ error: `取消配对失败：${String(error)}` })
+      return false
     } finally {
       this.publish({ pairingApproving: false })
     }
@@ -675,6 +684,43 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
       if (candidate !== undefined) setPairingCode('')
     })
   }
+  const removeUserFromDraft = (userId: string): void => {
+    setDraft(current => current === undefined
+      ? current
+      : { ...current, userIds: current.userIds.flatMap(value => splitIds(value).filter(item => item !== userId)) })
+    setDraftError(undefined)
+  }
+  const revokeAuthorizedUser = (item: AuthorizedUserRow): void => {
+    if (!item.paired) {
+      removeUserFromDraft(item.userId)
+      return
+    }
+    void controller.revokePairing(item.platform, item.userId).then(removed => {
+      if (removed) removeUserFromDraft(item.userId)
+    })
+  }
+
+  const authorizedUsers: AuthorizedUserRow[] = normalizedRows(draft.userIds).map(userId => ({
+    userId,
+    platform: 'feishu',
+    allowlisted: true,
+    paired: false,
+  }))
+  for (const pairing of state.diagnostics.pairing?.approved ?? []) {
+    if (pairing.userId === undefined) continue
+    const existing = authorizedUsers.find(item => item.userId === pairing.userId)
+    if (existing === undefined) {
+      authorizedUsers.push({
+        userId: pairing.userId,
+        platform: pairing.platform ?? 'feishu',
+        allowlisted: false,
+        paired: true,
+      })
+    } else {
+      existing.paired = true
+      existing.platform = pairing.platform ?? existing.platform
+    }
+  }
 
   return (
     <div className="dsh-hermes-settings">
@@ -722,7 +768,14 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
           <button type="button" className="dsh-hermes-secondary" disabled={!state.writable || state.saving || state.pairingApproving || pairingCode.trim() === ''} onClick={approvePairing}>{state.pairingApproving ? '正在确认…' : '确认配对并自动填入 UID'}</button>
         </div>
         <p className="dsh-hermes-muted">当前待确认配对：{String(state.diagnostics.pairing?.pending?.length ?? 0)} 个。配对成功后，对方可以立即使用；确认到的 UID 会自动追加到上面的用户 ID 列表，点击“保存并启动”即可长期保存。</p>
-        {(state.diagnostics.pairing?.approved?.length ?? 0) === 0 ? null : <div className="dsh-hermes-pairing-approved"><span className="dsh-hermes-muted">已确认的配对用户</span>{state.diagnostics.pairing?.approved?.map(item => item.userId === undefined ? null : <div className="dsh-hermes-pairing-approved-row" key={`${item.platform ?? 'unknown'}:${item.userId}`}><code>{item.userId}</code><button type="button" className="dsh-hermes-secondary" disabled={state.pairingApproving} onClick={() => { void controller.revokePairing(item.platform ?? 'feishu', item.userId ?? '') }}>取消配对</button></div>)}</div>}
+        <div className="dsh-hermes-pairing-approved">
+          <span className="dsh-hermes-muted">当前已授权用户</span>
+          {authorizedUsers.length === 0 ? <div className="dsh-hermes-id-empty">暂无已授权用户</div> : authorizedUsers.map(item => {
+            const action = item.paired && item.allowlisted ? '全部解除' : item.paired ? '取消配对' : '移出白名单'
+            const source = item.paired && item.allowlisted ? '白名单 + 安全配对' : item.paired ? '安全配对' : '用户 ID 白名单'
+            return <div className="dsh-hermes-pairing-approved-row" key={`${item.platform}:${item.userId}`}><div className="dsh-hermes-authorized-user"><code>{item.userId}</code><span>{source}</span></div><button type="button" className="dsh-hermes-secondary" disabled={state.pairingApproving} onClick={() => { revokeAuthorizedUser(item) }}>{action}</button></div>
+          })}
+        </div>
       </section>
 
       <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
@@ -742,7 +795,7 @@ const CSS = `
 .dsh-hermes-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}.dsh-hermes-notice{background:rgba(92,108,213,.09);color:#5149a6}.dsh-hermes-warning{background:rgba(224,162,55,.12);color:#986818}.dsh-hermes-error{background:rgba(205,72,72,.1);color:#aa3939}.dsh-hermes-success{background:rgba(48,154,100,.1);color:#267d52}.dsh-hermes-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
  .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}
- .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}
+ .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-authorized-user{display:grid;gap:3px;min-width:0}.dsh-hermes-authorized-user code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-authorized-user span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 
