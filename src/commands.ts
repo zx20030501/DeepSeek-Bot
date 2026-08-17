@@ -1,0 +1,61 @@
+export interface ParsedBotCommand {
+  readonly name: string
+  readonly args: string
+}
+
+const COMMAND_RE = /^\s*\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?\s*$/iu
+
+export function parseBotCommand(text: string): ParsedBotCommand | undefined {
+  const match = COMMAND_RE.exec(text)
+  if (!match) return undefined
+  const name = match[1]
+  if (!name) return undefined
+  return { name: name.toLowerCase(), args: (match[2] ?? '').trim() }
+}
+
+export function splitText(text: string, maxLength: number): string[] {
+  if (maxLength <= 0) throw new Error('maxLength must be positive')
+  const points = [...text]
+  if (points.length === 0) return ['']
+  const chunks: string[] = []
+  for (let index = 0; index < points.length; index += maxLength) {
+    chunks.push(points.slice(index, index + maxLength).join(''))
+  }
+  return chunks
+}
+
+export function formatHelp(): string {
+  return [
+    'DeepSeek Bot',
+    '',
+    '/new — 新建当前聊天会话',
+    '/stop — 停止当前 Agent 回合',
+    '/status — 查看网关、队列和会话状态',
+    '/bots — 查看可用 Bot profile',
+    '/bot <name> — 切换 Bot profile',
+    '/model [provider:model] — 查看或设置当前 profile 的下一回合模型',
+    '/help — 显示帮助',
+    '',
+    '其他普通消息和未知 / 命令会交给 DeepSeek Harness 处理。',
+  ].join('\n')
+}
+
+export function textFromContent(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block): block is { type: 'text'; text: string } => (
+      Boolean(block)
+      && typeof block === 'object'
+      && (block as { type?: unknown }).type === 'text'
+      && typeof (block as { text?: unknown }).text === 'string'
+    ))
+    .map(block => block.text)
+    .join('')
+    .trim()
+}
+
+export function redactId(value: string | number | undefined): string {
+  const text = String(value ?? '')
+  if (text.length <= 4) return '****'
+  return `${text.slice(0, 2)}…${text.slice(-2)}`
+}

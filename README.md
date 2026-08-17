@@ -2,7 +2,7 @@
 
 一个参照 Hermes Agent Bot 能力、按 DeepSeek Harness 官方 Cordis 插件边界实现的可靠消息网关。
 
-当前版本先提供 Telegram 长轮询适配器；入站 WAL、出站 Outbox、会话路由、访问控制和 DSH Agent 适配层均与平台解耦，后续可以复用到飞书、Discord、Slack 或 Webhook。
+当前版本提供 Telegram 长轮询和飞书/Lark WebSocket 长连接适配器；入站 WAL、出站 Outbox、会话路由、访问控制和 DSH Agent 适配层均与平台解耦，后续可以继续复用到 Discord、Slack 或 Webhook。
 
 ## 已实现
 
@@ -10,6 +10,7 @@
 - Inbound WAL：消息交给 Agent 之前先落盘，重启后有限次数补发；
 - Outbox：幂等键、lane 串行发送、发送后确认、指数退避和 dead 状态；
 - Telegram 长轮询、typing、4096 字符切片、文件/图片/语音提示；
+- 飞书/Lark 应用机器人长连接、私聊、群聊 @机器人、话题/回复关系和 Markdown 消息；
 - 默认 allowlist，支持按 user ID 或 chat ID 授权；
 - `/new`、`/reset`、`/stop`、`/status`、`/help`、`/bots`、`/bot <name>`、`/model`；
 - 已安装的 DSH 原生命令优先执行，未知 `/xxx` 仍交给 Agent；
@@ -41,6 +42,9 @@ Token 不写入 patch 或 Git。推荐使用环境变量：
 
 ```bash
 export DSH_HERMES_BOT_TELEGRAM_TOKEN='替换为 Telegram Bot Token'
+# 飞书可与 Telegram 同时启用；只接入飞书时可以关闭 Telegram
+export DSH_HERMES_BOT_FEISHU_APP_ID='cli_xxxxxxxxxxxx'
+export DSH_HERMES_BOT_FEISHU_APP_SECRET='不要提交到 Git'
 export DSH_HERMES_BOT_ALLOWED_USERS='123456789'
 # 或按聊天授权：
 # export DSH_HERMES_BOT_ALLOWED_CHATS='-1001234567890'
@@ -48,6 +52,8 @@ dsh web
 ```
 
 完整配置示例见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+
+飞书推荐使用官方 SDK 的 WebSocket 长连接模式，不需要公网 Webhook 地址。需要在飞书开放平台创建企业自建应用、开启机器人能力、订阅 `im.message.receive_v1`，并发布应用版本。
 
 ## 设计与调研
 
