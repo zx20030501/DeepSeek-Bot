@@ -39,6 +39,33 @@ test('inbound WAL recovers a dispatched message after reload', async () => {
   }
 })
 
+test('inbound WAL keeps transient failures retryable until the attempt budget is exhausted', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-hermes-wal-retry-'))
+  try {
+    const file = join(root, 'inbound.jsonl')
+    const wal = new InboundWal(file, 3)
+    const accepted = await wal.accept(message('telegram:update:retry'))
+
+    const firstClaim = await wal.claim(accepted.item.id, 'hermes-bot-session')
+    const firstFailure = await wal.fail(accepted.item.id, new Error('temporary 1'))
+    assert.equal(firstClaim?.attempts, 1)
+    assert.equal(firstFailure?.state, 'accepted')
+    assert.equal((await wal.pending()).length, 1)
+
+    const secondClaim = await wal.claim(accepted.item.id, 'hermes-bot-session')
+    await wal.fail(accepted.item.id, new Error('temporary 2'))
+    assert.equal(secondClaim?.attempts, 2)
+
+    const thirdClaim = await wal.claim(accepted.item.id, 'hermes-bot-session')
+    const terminal = await wal.fail(accepted.item.id, new Error('final'))
+    assert.equal(thirdClaim?.attempts, 3)
+    assert.equal(terminal?.state, 'failed')
+    assert.equal((await wal.pending()).length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('outbox is idempotent by key and retries in order', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-hermes-outbox-'))
   try {

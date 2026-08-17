@@ -2,6 +2,8 @@ export interface BotTarget {
   readonly platform: string
   readonly chatId: string
   readonly threadId?: string
+  /** The platform message to reply to, when the transport supports it. */
+  readonly replyToMessageId?: string
   readonly userId?: string
   readonly chatType?: 'dm' | 'group' | 'channel' | 'thread'
 }
@@ -114,7 +116,7 @@ export interface ChatBinding {
   readonly profile: string
   readonly generation: number
   readonly sessionId: string
-  readonly modelOverride?: string
+  readonly modelOverride?: ModelOverride | string
   readonly updatedAt: number
 }
 
@@ -128,4 +130,9 @@ export interface DshAgentOptions {
   readonly provider?: string
   readonly model?: string
   readonly maxTokens?: number
+}
+
+export interface ModelOverride {
+  readonly provider?: string
+  readonly model: string
 }

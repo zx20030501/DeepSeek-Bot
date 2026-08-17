@@ -3,7 +3,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { BotProfile, DshAgentOptions } from './types.js'
+import type { BotProfile, DshAgentOptions, ModelOverride } from './types.js'
 
 interface AgentHandleLike {
   readonly agent: Agent
@@ -51,10 +51,17 @@ export function stableSessionId(targetKey: string, profile: string, generation: 
   return `hermes-bot-${digest}` as SessionId
 }
 
-export function profileOptions(profile: BotProfile, modelOverride?: string): DshAgentOptions {
+export function profileOptions(profile: BotProfile, modelOverride?: ModelOverride | string): DshAgentOptions {
+  const override: ModelOverride | undefined = modelOverride === undefined
+    ? undefined
+    : typeof modelOverride === 'string'
+      ? { model: modelOverride }
+      : modelOverride
+  const provider = override?.provider ?? profile.provider
+  const model = override?.model ?? profile.model
   return {
-    ...(profile.provider === undefined ? {} : { provider: profile.provider }),
-    ...(modelOverride ?? profile.model) === undefined ? {} : { model: modelOverride ?? profile.model },
+    ...(provider === undefined ? {} : { provider }),
+    ...(model === undefined ? {} : { model }),
     ...(profile.maxTokens === undefined ? {} : { maxTokens: profile.maxTokens }),
   }
 }
@@ -73,7 +80,7 @@ export class HarnessBridge {
     return this.agents.get(sessionId)
   }
 
-  public async resumeOrCreate(sessionId: SessionId, profile: BotProfile, modelOverride?: string): Promise<Agent> {
+  public async resumeOrCreate(sessionId: SessionId, profile: BotProfile, modelOverride?: ModelOverride | string): Promise<Agent> {
     const live = this.agents.get(sessionId)
     if (live) return live
     const options = profileOptions(profile, modelOverride)

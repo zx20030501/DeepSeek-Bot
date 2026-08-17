@@ -3,7 +3,14 @@ import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { InboundWal, Outbox } from './durable.js'
-import { parseBotCommand, formatHelp, textFromContent, redactId } from './commands.js'
+import {
+  parseBotCommand,
+  parseModelOverride,
+  formatModelOverride,
+  formatHelp,
+  textFromContent,
+  redactId,
+} from './commands.js'
 import { HarnessBridge, stableSessionId } from './harness-bridge.js'
 import { JsonState } from './state.js'
 import { FeishuTransport } from './feishu.js'
@@ -16,6 +23,7 @@ import type {
   BotTransport,
   ChatBinding,
   InboundMessage,
+  ModelOverride,
   OutboxItem,
 } from './types.js'
 
@@ -35,6 +43,14 @@ function targetKey(target: BotTarget): string {
 
 function sessionKey(sessionId: unknown): string {
   return String(sessionId)
+}
+
+export function nextModelOverride(
+  current: Pick<ChatBinding, 'modelOverride'>,
+  requested: ModelOverride | string | null | undefined,
+): Pick<ChatBinding, 'modelOverride'> {
+  const value = requested === null ? undefined : requested ?? current.modelOverride
+  return value === undefined ? {} : { modelOverride: value }
 }
 
 function defaultState(): BotStateFile {
@@ -117,6 +133,7 @@ export class BotGateway {
   private readonly transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
   private readonly lanes = new Map<string, Promise<void>>()
+  private readonly inboundRetryTimers = new Set<ReturnType<typeof setTimeout>>()
   private bridge: HarnessBridge | undefined
   private started: Promise<void> = Promise.resolve()
   private stopped = false
@@ -163,6 +180,8 @@ export class BotGateway {
 
   public async stop(): Promise<void> {
     this.stopped = true
+    for (const timer of this.inboundRetryTimers) clearTimeout(timer)
+    this.inboundRetryTimers.clear()
     await this.started.catch(() => undefined)
     await Promise.all(this.transports.map(transport => transport.stop()))
     await this.outbox.stop()
@@ -270,9 +289,41 @@ export class BotGateway {
       }
       await this.bridge.followup(agent, message.text)
     } catch (error: unknown) {
-      await this.wal.fail(walId, error)
-      await this.sendText(message.target, `Agent 处理失败：${String(error)}`, `error:${message.id}`)
+      await this.handleInboundFailure(message, walId, error)
     }
+  }
+
+  private async handleInboundFailure(
+    message: InboundMessage,
+    walId: string,
+    error: unknown,
+    retry = true,
+    finalText = `Agent 处理失败：${String(error)}`,
+    finalKey = `error:${message.id}`,
+  ): Promise<void> {
+    const item = await this.wal.fail(walId, error, retry)
+    if (!item) return
+    if (item.state === 'failed') {
+      await this.sendText(message.target, finalText, finalKey)
+      return
+    }
+    this.scheduleInboundRetry(message, walId, item.attempts)
+  }
+
+  private scheduleInboundRetry(message: InboundMessage, walId: string, attempts: number): void {
+    if (this.stopped) return
+    const base = Math.max(0, this.config.retryBaseMs ?? 1_000)
+    const maximum = Math.max(base, this.config.retryMaxMs ?? 60_000)
+    const delay = Math.min(maximum, base * 2 ** Math.max(0, attempts - 1))
+    let timer: ReturnType<typeof setTimeout>
+    timer = setTimeout(() => {
+      this.inboundRetryTimers.delete(timer)
+      void this.queueInbound(message, walId).catch(error => {
+        this.log('warn', `inbound retry failed: ${String(error)}`)
+      })
+    }, delay)
+    timer.unref?.()
+    this.inboundRetryTimers.add(timer)
   }
 
   private async handleLocalCommand(
@@ -334,19 +385,30 @@ export class BotGateway {
       }
       const old = this.bridge?.getAgent(binding.sessionId as SessionId)
       if (old) this.bridge?.stop(old)
-      const next = await this.rotateBinding(message.target, binding, profile.name)
+      // A profile switch must start from the new profile's model settings.
+      const next = await this.rotateBinding(message.target, binding, profile.name, null)
       await this.completeWithText(message, walId, next, `已切换到 Bot：${profile.title ?? profile.name}`)
       return true
     }
     if (name === 'model') {
       if (!args) {
         const profile = this.profiles.get(binding.profile)
-        await this.completeWithText(message, walId, binding, `当前模型：${binding.modelOverride ?? profile?.model ?? '由 DSH profile 决定'}`)
+        await this.completeWithText(
+          message,
+          walId,
+          binding,
+          `当前模型：${formatModelOverride(binding.modelOverride) ?? profile?.model ?? '由 DSH profile 决定'}`,
+        )
         return true
       }
-      const modelOverride = args.includes(':') ? args.split(':').slice(1).join(':') : args
+      const modelOverride = parseModelOverride(args)
       const next = await this.rotateBinding(message.target, binding, binding.profile, modelOverride)
-      await this.completeWithText(message, walId, next, `下一回合将使用模型：${modelOverride}`)
+      await this.completeWithText(
+        message,
+        walId,
+        next,
+        `下一回合将使用模型：${formatModelOverride(modelOverride)}`,
+      )
       return true
     }
     return false
@@ -380,14 +442,21 @@ export class BotGateway {
     return binding
   }
 
-  private async rotateBinding(target: BotTarget, current: ChatBinding, profile: string, modelOverride?: string): Promise<ChatBinding> {
+  private async rotateBinding(
+    target: BotTarget,
+    current: ChatBinding,
+    profile: string,
+    modelOverride?: ModelOverride | string | null,
+  ): Promise<ChatBinding> {
+    const modelPatch = nextModelOverride(current, modelOverride)
+    const { modelOverride: _oldModelOverride, ...withoutModelOverride } = current
     const next: ChatBinding = {
-      ...current,
+      ...withoutModelOverride,
       target,
       profile,
       generation: current.generation + 1,
       sessionId: String(stableSessionId(current.key, profile, current.generation + 1)),
-      ...(modelOverride === undefined ? {} : { modelOverride }),
+      ...modelPatch,
       updatedAt: Date.now(),
     }
     await this.state.update(state => {
@@ -431,8 +500,14 @@ export class BotGateway {
       const pending = await this.wal.pendingForSession(id)
       if (!pending[0]) return
       const detail = kind === 'aborted' ? 'Agent 回合已停止。' : 'Agent 回合失败。'
-      await this.sendText(target, detail, `turn-error:${id}:${String(record.seq ?? Date.now())}`)
-      await this.wal.fail(pending[0].id, detail)
+      await this.handleInboundFailure(
+        pending[0].message,
+        pending[0].id,
+        detail,
+        kind !== 'aborted',
+        detail,
+        `turn-error:${id}:${String(record.seq ?? Date.now())}`,
+      )
     }
   }
 

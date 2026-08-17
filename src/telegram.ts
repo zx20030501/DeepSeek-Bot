@@ -110,10 +110,17 @@ export class TelegramTransport implements BotTransport {
         })
         retryMs = 1_000
         for (const update of updates) {
-          this.offset = update.update_id + 1
           const message = this.toInbound(update)
-          if (!message) continue
+          if (!message) {
+            // An update without usable text is intentionally ignored, so it is
+            // safe to acknowledge it immediately.
+            this.offset = update.update_id + 1
+            continue
+          }
           await handler(message)
+          // The gateway handler returns only after the inbound WAL has durably
+          // accepted the message. Do not acknowledge it before that point.
+          this.offset = update.update_id + 1
         }
       } catch (error: unknown) {
         if (!this.running || this.controller.signal.aborted || isAbort(error)) return
@@ -138,10 +145,14 @@ export class TelegramTransport implements BotTransport {
           : ''
     const text = `${message.text ?? message.caption ?? ''}${attachment}`.trim()
     if (!text) return undefined
+    const replyToMessageId = message.reply_to_message?.message_id === undefined
+      ? undefined
+      : asString(message.reply_to_message.message_id)
     const target: BotTarget = {
       platform: this.platform,
       chatId: asString(message.chat.id),
       ...(message.message_thread_id === undefined ? {} : { threadId: asString(message.message_thread_id) }),
+      ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
       ...(message.from?.id === undefined ? {} : { userId: asString(message.from.id) }),
       chatType: message.chat.type === 'private' ? 'dm' : message.message_thread_id === undefined ? 'group' : 'thread',
     }
@@ -151,9 +162,7 @@ export class TelegramTransport implements BotTransport {
       target,
       text,
       receivedAt: Date.now(),
-      ...(message.reply_to_message?.message_id === undefined
-        ? {}
-        : { replyToMessageId: asString(message.reply_to_message.message_id) }),
+      ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
       raw: update,
     }
   }

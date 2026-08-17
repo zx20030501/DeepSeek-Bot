@@ -1,6 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatHelp, parseBotCommand, splitText, textFromContent } from '../dist/commands.js'
+import {
+  formatHelp,
+  formatModelOverride,
+  parseBotCommand,
+  parseModelOverride,
+  splitText,
+  textFromContent,
+} from '../dist/commands.js'
 
 test('parses local commands without consuming normal prompts', () => {
   assert.deepEqual(parseBotCommand('  /MODEL provider:model  '), {
@@ -9,6 +16,13 @@ test('parses local commands without consuming normal prompts', () => {
   })
   assert.equal(parseBotCommand('please /help me'), undefined)
   assert.equal(parseBotCommand('/'), undefined)
+})
+
+test('preserves both provider and model in model overrides', () => {
+  assert.deepEqual(parseModelOverride('openai:gpt-5'), { provider: 'openai', model: 'gpt-5' })
+  assert.deepEqual(parseModelOverride('gpt-5'), { model: 'gpt-5' })
+  assert.equal(formatModelOverride({ provider: 'openai', model: 'gpt-5' }), 'openai:gpt-5')
+  assert.equal(formatModelOverride({ model: 'gpt-5' }), 'gpt-5')
 })
 
 test('splits by Unicode code points for platform message limits', () => {

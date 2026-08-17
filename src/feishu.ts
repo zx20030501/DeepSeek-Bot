@@ -45,10 +45,12 @@ export function toFeishuInbound(message: NormalizedMessage): InboundMessage | un
   if (!text) return undefined
   const eventId = rawEventId(message.raw)
   const threadId = message.threadId ?? message.rootId
+  const replyToMessageId = message.replyToMessageId
   const target: BotTarget = {
     platform: 'feishu',
     chatId: message.chatId,
     ...(threadId ? { threadId } : {}),
+    ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
     userId: message.senderId,
     chatType: message.chatType === 'p2p' ? 'dm' : 'group',
   }
@@ -58,7 +60,7 @@ export function toFeishuInbound(message: NormalizedMessage): InboundMessage | un
     target,
     text,
     receivedAt: message.createTime || Date.now(),
-    ...(message.replyToMessageId === undefined ? {} : { replyToMessageId: message.replyToMessageId }),
+    ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
     raw: message.raw,
   }
 }
