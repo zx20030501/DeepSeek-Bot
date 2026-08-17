@@ -1,3 +1,4 @@
+import { randomInt } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
@@ -27,9 +28,17 @@ import type {
   InboundDecisionDiagnostic,
   ModelOverride,
   OutboxItem,
+  GatewayDiscoveryCandidate,
+  GatewayDiscoveryStatus,
 } from './types.js'
 
 interface SessionLike { readonly id: unknown }
+
+interface DiscoveryState {
+  readonly command: string
+  readonly expiresAt: number
+  readonly candidate?: GatewayDiscoveryCandidate
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
@@ -45,6 +54,19 @@ function targetKey(target: BotTarget): string {
 
 function sessionKey(sessionId: unknown): string {
   return String(sessionId)
+}
+
+export function discoveryCandidateFor(
+  message: InboundMessage,
+  command: string,
+): GatewayDiscoveryCandidate | undefined {
+  if (message.text.trim() !== command || message.target.userId === undefined) return undefined
+  return {
+    receivedAt: Date.now(),
+    userId: message.target.userId,
+    chatId: message.target.chatId,
+    ...(message.target.chatType === undefined ? {} : { chatType: message.target.chatType }),
+  }
 }
 
 export function nextModelOverride(
@@ -146,6 +168,7 @@ export class BotGateway {
   private inboundUnauthorized = 0
   private inboundDuplicate = 0
   private lastInboundDecision: InboundDecisionDiagnostic | null = null
+  private discovery: DiscoveryState | undefined
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -195,6 +218,7 @@ export class BotGateway {
   public async stop(): Promise<void> {
     this.stopped = true
     this.running = false
+    this.discovery = undefined
     for (const timer of this.inboundRetryTimers) clearTimeout(timer)
     this.inboundRetryTimers.clear()
     await this.started.catch(() => undefined)
@@ -244,6 +268,36 @@ export class BotGateway {
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
       inbound: this.inboundDiagnostics(),
+      discovery: this.discoveryStatus(),
+    }
+  }
+
+  /** Start a short-lived, local-UI-driven identity discovery flow. */
+  public beginDiscovery(ttlMs = 5 * 60 * 1_000): GatewayDiscoveryStatus {
+    const expiresAt = Date.now() + Math.max(30_000, Math.min(15 * 60 * 1_000, ttlMs))
+    const code = String(randomInt(100_000, 1_000_000))
+    this.discovery = { command: `/bind ${code}`, expiresAt }
+    return this.discoveryStatus()
+  }
+
+  public discoveryCandidate(): GatewayDiscoveryCandidate | undefined {
+    const state = this.discovery
+    if (state === undefined || state.expiresAt <= Date.now()) return undefined
+    return state.candidate
+  }
+
+  public clearDiscovery(): void {
+    this.discovery = undefined
+  }
+
+  private discoveryStatus(): GatewayDiscoveryStatus {
+    const state = this.discovery
+    if (state === undefined || state.expiresAt <= Date.now()) return { active: false }
+    return {
+      active: state.candidate === undefined,
+      command: state.command,
+      expiresAt: state.expiresAt,
+      ...(state.candidate === undefined ? {} : { candidate: state.candidate }),
     }
   }
 
@@ -313,6 +367,7 @@ export class BotGateway {
 
   private async acceptInbound(message: InboundMessage): Promise<void> {
     this.inboundReceived += 1
+    if (this.acceptDiscoveryMessage(message)) return
     if (!this.authorized(message)) {
       this.inboundUnauthorized += 1
       this.lastInboundDecision = this.makeInboundDiagnostic(message, 'unauthorized', 'not_in_allowlist')
@@ -335,6 +390,25 @@ export class BotGateway {
     this.inboundAccepted += 1
     this.lastInboundDecision = this.makeInboundDiagnostic(message, 'accepted', 'allowlist_passed')
     void this.queueInbound(message, accepted.item.id)
+  }
+
+  /**
+   * Capture only the message carrying the one-time challenge. It deliberately
+   * bypasses the normal allowlist and Agent path, then expires after one hit.
+   */
+  private acceptDiscoveryMessage(message: InboundMessage): boolean {
+    const state = this.discovery
+    if (state === undefined || state.candidate !== undefined || state.expiresAt <= Date.now()) return false
+    const candidate = discoveryCandidateFor(message, state.command)
+    if (candidate === undefined) return false
+    this.discovery = { ...state, candidate }
+    void this.sendText(
+      message.target,
+      '已识别你的飞书用户 ID。请回到 DSH 设置页，确认 UID 已自动填入后点击“保存并启动”。',
+      `discovery:${message.id}`,
+    ).catch(error => this.log('warn', `discovery confirmation failed: ${String(error)}`))
+    this.log('info', `Feishu user identity discovered: user=${redactId(candidate.userId)} chat=${redactId(candidate.chatId)}`)
+    return true
   }
 
   private inboundDiagnostics(): GatewayInboundDiagnostics {

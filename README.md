@@ -38,7 +38,7 @@ dsh plugin --profile web add ./dsh-hermes-bot-0.1.0.tgz --ignore-scripts
 
 ## 配置
 
-安装后打开 `dsh web`，进入设置里的“飞书机器人”。在那里填写 App ID、App Secret，以及允许使用机器人的用户 ID 或群聊 ID，最后点击“保存并启动”即可。
+安装后打开 `dsh web`，进入设置里的“飞书机器人”。首次使用只需要填写 App ID 和 App Secret，点击“一键测试并自动识别 UID”，然后按页面提示把一次性绑定口令发给机器人；页面会自动填入当前发送者的用户 ID，最后点击“保存并启动”即可。也可以直接填写用户 ID 或群聊 ID。
 
 App Secret 通过 DSH 的本机凭据库保存：页面不会回显，插件不会把它写入 settings 文件、patch 或 Git。保存后插件会自动重载飞书连接，不需要重启 DSH。
 
@@ -55,7 +55,7 @@ export DSH_HERMES_BOT_ALLOWED_USERS='123456789'
 dsh web
 ```
 
-其中用户 ID 通常是 `ou_...`，群聊 ID 通常是 `oc_...`。网页表单支持一行一个 ID 或逗号分隔；至少填写一个用户 ID 或群聊 ID，否则默认不会接受任何消息。
+其中用户 ID 通常是 `ou_...`，群聊 ID 通常是 `oc_...`。网页表单支持一行一个 ID 或逗号分隔；诊断模式会临时保持空 allowlist，只接受一次性绑定口令，不会把普通消息交给 Agent。识别到用户 ID 后再点保存；否则默认不会接受任何普通消息。
 
 完整配置示例见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 

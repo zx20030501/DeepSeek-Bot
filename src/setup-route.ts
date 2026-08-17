@@ -10,6 +10,7 @@ import {
   HermesBotSettingsSchema,
   type HermesBotSettings,
 } from './setup.js'
+import type { GatewayDiscoveryCandidate, GatewayDiscoveryStatus } from './types.js'
 
 const MAX_BODY_BYTES = 64 * 1024
 
@@ -22,6 +23,12 @@ interface SetupRouteSnapshot {
     source?: string
   }
   diagnostics: Record<string, unknown>
+}
+
+export interface SetupRouteActions {
+  beginDiscovery?: () => GatewayDiscoveryStatus
+  discoveryCandidate?: () => GatewayDiscoveryCandidate | undefined
+  clearDiscovery?: () => void
 }
 
 class SetupRequestError extends Error {
@@ -127,6 +134,7 @@ async function handleRequest(
   ctx: Context,
   source: () => HermesBotSettings,
   diagnostics: () => Record<string, unknown>,
+  actions: SetupRouteActions,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -146,6 +154,10 @@ async function handleRequest(
   }
 
   const body = await readJson(req)
+  const action = body.action === undefined ? 'save' : body.action
+  if (action !== 'save' && action !== 'diagnose') {
+    throw new SetupRequestError(400, '不认识的设置操作。')
+  }
   let settings: HermesBotSettings
   try {
     settings = HermesBotSettingsSchema(body.settings as HermesBotSettings)
@@ -156,8 +168,23 @@ async function handleRequest(
   if (settings.feishu.appId.trim() === '') {
     throw new SetupRequestError(400, '请填写飞书 App ID。')
   }
-  if (normalizedIds(settings.access.userIds).length === 0 && normalizedIds(settings.access.chatIds).length === 0) {
-    throw new SetupRequestError(400, '请至少填写一个用户 ID 或群聊 ID。')
+  const candidate = actions.discoveryCandidate?.()
+  const currentUserIds = normalizedIds(settings.access.userIds)
+  const currentChatIds = normalizedIds(settings.access.chatIds)
+  if (action === 'save' && currentUserIds.length === 0 && currentChatIds.length === 0 && candidate?.userId !== undefined) {
+    settings = {
+      ...settings,
+      access: { ...settings.access, userIds: [candidate.userId], chatIds: currentChatIds },
+    }
+  }
+  if (action === 'save' && normalizedIds(settings.access.userIds).length === 0 && normalizedIds(settings.access.chatIds).length === 0) {
+    throw new SetupRequestError(400, '请先点击“测试并自动识别 UID”，或填写一个用户 ID / 群聊 ID。')
+  }
+  if (action === 'diagnose') {
+    if (actions.beginDiscovery === undefined) throw new SetupRequestError(503, '诊断服务还没有准备好，请稍后再试。')
+    // Keep the temporary discovery configuration fail-closed: no ordinary
+    // message can reach the Agent until the one-time command identifies a user.
+    settings = { ...settings, access: { ...settings.access, userIds: [], chatIds: [] } }
   }
 
   const settingsProvider = ctx.get('settings')
@@ -184,7 +211,15 @@ async function handleRequest(
     await credentials!.set(credentialRef(HERMES_BOT_FEISHU_SECRET_REF), appSecret)
   }
   await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, settings)
-  sendJson(res, 200, await readSnapshot(ctx, source, diagnostics))
+  const discovery = action === 'diagnose' ? actions.beginDiscovery!() : undefined
+  if (action === 'save') actions.clearDiscovery?.()
+  const snapshot = await readSnapshot(ctx, source, diagnostics)
+  sendJson(res, 200, {
+    ...snapshot,
+    ...(discovery === undefined
+      ? { message: '已保存，机器人正在自动启动。' }
+      : { message: '已启动连接测试。请等待长连接显示“已连接”，再按提示给机器人发送一次性绑定口令。' }),
+  })
 }
 
 /** Mount the plugin-owned setup route when DSH is running its Web surface. */
@@ -192,13 +227,14 @@ export function installSetupRoute(
   ctx: Context,
   source: () => HermesBotSettings,
   diagnostics: () => Record<string, unknown> = () => ({}),
+  actions: SetupRouteActions = {},
 ): void {
   ctx.inject(['webServer'], (webCtx) => {
     const route: WebRoute = {
       kind: 'exact',
       path: HERMES_BOT_SETUP_ROUTE,
       handler: (req, res) => {
-        void handleRequest(ctx, source, diagnostics, req, res).catch(error => {
+        void handleRequest(ctx, source, diagnostics, actions, req, res).catch(error => {
           if (error instanceof SetupRequestError) {
             sendJson(res, error.status, { error: error.message })
             return

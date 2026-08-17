@@ -69,6 +69,22 @@ export interface GatewayInboundDiagnostics {
   readonly last: InboundDecisionDiagnostic | null
 }
 
+/** Short-lived setup-only candidate discovered by the one-time bind command. */
+export interface GatewayDiscoveryCandidate {
+  readonly receivedAt: number
+  readonly userId: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+}
+
+/** Short-lived setup-only state exposed to the local settings page. */
+export interface GatewayDiscoveryStatus {
+  readonly active: boolean
+  readonly command?: string
+  readonly expiresAt?: number
+  readonly candidate?: GatewayDiscoveryCandidate
+}
+
 export interface BotProfile {
   readonly name: string
   readonly title?: string

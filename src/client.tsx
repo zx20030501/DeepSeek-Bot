@@ -61,6 +61,17 @@ interface DiagnosticDecision {
 interface Diagnostics {
   enabled?: boolean
   accessMode?: string
+  discovery?: {
+    active?: boolean
+    command?: string
+    expiresAt?: number
+    candidate?: {
+      receivedAt?: number
+      userId?: string
+      chatId?: string
+      chatType?: string
+    }
+  }
   transports?: Record<string, {
     running?: boolean
     connected?: boolean
@@ -86,6 +97,7 @@ interface SetupState {
   readonly credential: CredentialState
   readonly diagnostics: Diagnostics
   readonly saving: boolean
+  readonly diagnosing: boolean
   readonly message?: string | undefined
   readonly error?: string | undefined
   readonly diagnosticsError?: string | undefined
@@ -138,6 +150,7 @@ class FeishuSetupController {
       credential: emptyCredential(),
       diagnostics: emptyDiagnostics(),
       saving: false,
+      diagnosing: false,
     })
     void this.refresh()
   }
@@ -189,14 +202,16 @@ class FeishuSetupController {
       return
     }
     const appId = draft.appId.trim()
+    const discoveredUserId = snapshot.diagnostics.discovery?.candidate?.userId
     const userIds = splitIds(draft.userIds)
+    if (userIds.length === 0 && discoveredUserId !== undefined) userIds.push(discoveredUserId)
     const chatIds = splitIds(draft.chatIds)
     if (appId === '') {
       this.publish({ error: '请填写飞书 App ID。' })
       return
     }
     if (userIds.length === 0 && chatIds.length === 0) {
-      this.publish({ error: '请至少填写一个用户 ID 或群聊 ID。' })
+      this.publish({ error: '请先点击“测试并自动识别 UID”，或填写一个用户 ID / 群聊 ID。' })
       return
     }
     if (draft.appSecret.trim() === '' && !snapshot.credential.configured) {
@@ -232,7 +247,7 @@ class FeishuSetupController {
         writable: data.writable,
         credential: data.credential,
         diagnostics: data.diagnostics,
-        message: '已保存，机器人正在自动启动。',
+        message: data.message ?? '已保存，机器人正在自动启动。',
         error: undefined,
         diagnosticsError: undefined,
       })
@@ -240,6 +255,68 @@ class FeishuSetupController {
       this.publish({ error: `保存失败：${String(error)}` })
     } finally {
       this.publish({ saving: false })
+    }
+  }
+
+  public async startDiscovery(draft: Draft): Promise<void> {
+    const snapshot = this.snapshot()
+    if (snapshot.status !== 'ready' || snapshot.settings === undefined) {
+      this.publish({ error: '设置服务还没有准备好，请稍后再试。' })
+      return
+    }
+    if (!snapshot.writable) {
+      this.publish({ error: '当前 DSH 设置为只读，不能保存。' })
+      return
+    }
+    const appId = draft.appId.trim()
+    if (appId === '') {
+      this.publish({ error: '请先填写飞书 App ID。' })
+      return
+    }
+    if (draft.appSecret.trim() === '' && !snapshot.credential.configured) {
+      this.publish({ error: '首次测试请填写飞书 App Secret。' })
+      return
+    }
+
+    this.publish({ diagnosing: true, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'diagnose',
+          settings: {
+            enabled: draft.enabled,
+            feishu: {
+              enabled: draft.feishuEnabled,
+              appId,
+              domain: draft.domain,
+              requireMention: draft.requireMention,
+            },
+            // The server also clears these fields. Keep the request explicit so
+            // the temporary discovery state can never authorize an old ID.
+            access: { userIds: [], chatIds: [] },
+          },
+          ...(draft.appSecret.trim() === '' ? {} : { appSecret: draft.appSecret.trim() }),
+        }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({
+        status: 'ready',
+        settings: data.settings,
+        writable: data.writable,
+        credential: data.credential,
+        diagnostics: data.diagnostics,
+        message: data.message ?? '已启动连接测试。请按诊断区提示操作。',
+        error: undefined,
+        diagnosticsError: undefined,
+      })
+    } catch (error) {
+      this.publish({ error: `连接测试失败：${String(error)}` })
+    } finally {
+      this.publish({ diagnosing: false })
     }
   }
 
@@ -261,6 +338,7 @@ interface SetupResponse {
   readonly writable: boolean
   readonly credential: CredentialState
   readonly diagnostics: Diagnostics
+  readonly message?: string
 }
 
 async function readRouteBody(response: Response): Promise<Record<string, unknown>> {
@@ -295,6 +373,7 @@ function setupResponseFromBody(body: Record<string, unknown>): SetupResponse {
       && !Array.isArray(body.diagnostics)
       ? body.diagnostics as Diagnostics
       : emptyDiagnostics(),
+    ...(typeof body.message === 'string' ? { message: body.message } : {}),
   }
 }
 
@@ -334,6 +413,8 @@ function DiagnosticPanel({
   const received = feishu?.inbound?.received ?? 0
   const accepted = diagnostics.inbound?.accepted ?? 0
   const unauthorized = diagnostics.inbound?.unauthorized ?? 0
+  const discovery = diagnostics.discovery
+  const candidate = discovery?.candidate
 
   return (
     <section className="dsh-hermes-panel dsh-hermes-diagnostic">
@@ -348,6 +429,12 @@ function DiagnosticPanel({
         <div><span>通过白名单</span><strong>{String(accepted)}</strong></div>
         <div><span>被白名单拦截</span><strong>{String(unauthorized)}</strong></div>
       </div>
+      {discovery?.active && discovery.command !== undefined ? (
+        <div className="dsh-hermes-alert dsh-hermes-notice">连接测试已启动。请确认长连接显示“已连接”，然后在飞书私聊机器人发送：<code>{discovery.command}</code></div>
+      ) : null}
+      {candidate?.userId === undefined ? null : (
+        <div className="dsh-hermes-alert dsh-hermes-success">已识别并自动填入用户 UID：<code>{candidate.userId}</code>。现在点击“保存并启动”即可。</div>
+      )}
       {event === null && decision === null ? (
         <div className="dsh-hermes-diagnostic-empty">目前还没有收到飞书事件。请先点击“刷新诊断”，再给机器人发一条新消息。</div>
       ) : (
@@ -379,6 +466,15 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
   useEffect(() => {
     if (settings !== undefined) setDraft(draftOf(settings))
   }, [settings])
+
+  const discoveredUserId = state.diagnostics.discovery?.candidate?.userId
+  useEffect(() => {
+    if (discoveredUserId === undefined) return
+    setDraft(current => {
+      if (current === undefined || splitIds(current.userIds).length > 0) return current
+      return { ...current, userIds: discoveredUserId }
+    })
+  }, [discoveredUserId])
 
   useEffect(() => {
     void controller.refreshDiagnostics()
@@ -432,8 +528,13 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         <h3>谁可以使用</h3>
         <p className="dsh-hermes-muted">每行一个，也可以用逗号分隔。至少填写用户 ID 或群聊 ID 中的一种。群聊里默认需要 @机器人。</p>
         <div className="dsh-hermes-grid">
-          <Field label="用户 ID" hint="飞书常见格式：ou_…"><textarea rows={4} value={draft.userIds} onChange={event => { update('userIds', event.target.value) }} /></Field>
+          <Field label="用户 ID" hint="推荐点击下方“一键测试并自动识别 UID”，不需要手动查 ou_…"><textarea rows={4} value={draft.userIds} onChange={event => { update('userIds', event.target.value) }} /></Field>
           <Field label="群聊 ID" hint="飞书常见格式：oc_…"><textarea rows={4} value={draft.chatIds} onChange={event => { update('chatIds', event.target.value) }} /></Field>
+        </div>
+        <div className="dsh-hermes-action-row">
+          <button type="button" className="dsh-hermes-secondary" disabled={!state.writable || state.saving || state.diagnosing} onClick={() => { void controller.startDiscovery(draft) }}>{state.diagnosing ? '正在测试连接…' : '一键测试并自动识别 UID'}</button>
+          {state.diagnostics.discovery?.candidate?.userId === undefined ? null : <button type="button" className="dsh-hermes-secondary" onClick={() => { update('userIds', state.diagnostics.discovery?.candidate?.userId ?? '') }}>再次填入检测到的 UID</button>}
+          <span className="dsh-hermes-muted">首次使用仍需填写 App ID 和 App Secret；密钥只保存在本机凭据库。</span>
         </div>
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.requireMention} onChange={event => { update('requireMention', event.target.checked) }} /><span>群聊消息必须 @机器人</span></label>
       </section>
@@ -442,7 +543,7 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
 
       <section className="dsh-hermes-panel dsh-hermes-actions">
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.enabled} onChange={event => { update('enabled', event.target.checked) }} /><span>保存后启用机器人</span></label>
-        <button type="button" className="dsh-hermes-primary" disabled={!state.writable || state.saving} onClick={save}>{state.saving ? '正在保存…' : '保存并启动'}</button>
+        <button type="button" className="dsh-hermes-primary" disabled={!state.writable || state.saving || state.diagnosing} onClick={save}>{state.saving ? '正在保存…' : '保存并启动'}</button>
       </section>
     </div>
   )
@@ -453,6 +554,7 @@ const CSS = `
 .dsh-hermes-header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:8px 2px}.dsh-hermes-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}.dsh-hermes-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}.dsh-hermes-kicker{font-size:10px;letter-spacing:.1em;color:#6758d4;font-weight:700}.dsh-hermes-badge{font-size:10px;padding:4px 8px;border-radius:999px;font-weight:650;white-space:nowrap}.dsh-hermes-badge.ok{background:rgba(48,154,100,.12);color:#267d52}.dsh-hermes-badge.missing{background:rgba(205,72,72,.1);color:#aa3939}
 .dsh-hermes-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}.dsh-hermes-notice{background:rgba(92,108,213,.09);color:#5149a6}.dsh-hermes-warning{background:rgba(224,162,55,.12);color:#986818}.dsh-hermes-error{background:rgba(205,72,72,.1);color:#aa3939}.dsh-hermes-success{background:rgba(48,154,100,.1);color:#267d52}.dsh-hermes-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
+.dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 

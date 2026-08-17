@@ -49,7 +49,11 @@ export function apply(ctx: Context, config: unknown = {}): void {
       onChange: () => { refreshGateway() },
     },
   )
-  installSetupRoute(ctx, () => settingsSource(), () => gateway.status())
+  installSetupRoute(ctx, () => settingsSource(), () => gateway.status(), {
+    beginDiscovery: () => gateway.beginDiscovery(),
+    discoveryCandidate: () => gateway.discoveryCandidate(),
+    clearDiscovery: () => gateway.clearDiscovery(),
+  })
   ctx.inject(['credentials'], (credentialsCtx) => {
     credentialsCtx.on('credentials/updated', (ref) => {
       if (String(ref) === HERMES_BOT_FEISHU_SECRET_REF) refreshGateway()
@@ -69,7 +73,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
   }, 'dsh-hermes-bot.lifecycle()')
 }
 
-export { BotGateway } from './gateway.js'
+export { BotGateway, discoveryCandidateFor } from './gateway.js'
 export { InboundWal, Outbox } from './durable.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
