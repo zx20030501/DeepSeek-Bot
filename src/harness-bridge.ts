@@ -123,7 +123,7 @@ export class HarnessBridge {
         const created = await this.agents.create({
           sessionId,
           agentOptions: options,
-          meta: { agentPreset: profile.name },
+          meta: { agentPreset: profile.name, cwd: process.cwd() },
         })
         return created.agent
       } catch (createError: unknown) {
