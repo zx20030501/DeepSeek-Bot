@@ -4,7 +4,14 @@ import {
   type LarkChannelOptions,
   type NormalizedMessage,
 } from '@larksuiteoapi/node-sdk'
-import type { BotTarget, FeishuConfig, InboundMessage, OutboundTarget, BotTransport } from './types.js'
+import type {
+  BotTarget,
+  FeishuConfig,
+  FeishuEventDiagnostic,
+  InboundMessage,
+  OutboundTarget,
+  BotTransport,
+} from './types.js'
 
 interface FeishuChannelLike {
   on(event: string, handler: (...args: unknown[]) => unknown): () => void
@@ -45,10 +52,12 @@ export function toFeishuInbound(message: NormalizedMessage): InboundMessage | un
   if (!text) return undefined
   const eventId = rawEventId(message.raw)
   const threadId = message.threadId ?? message.rootId
+  const replyToMessageId = message.replyToMessageId
   const target: BotTarget = {
     platform: 'feishu',
     chatId: message.chatId,
     ...(threadId ? { threadId } : {}),
+    ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
     userId: message.senderId,
     chatType: message.chatType === 'p2p' ? 'dm' : 'group',
   }
@@ -58,7 +67,7 @@ export function toFeishuInbound(message: NormalizedMessage): InboundMessage | un
     target,
     text,
     receivedAt: message.createTime || Date.now(),
-    ...(message.replyToMessageId === undefined ? {} : { replyToMessageId: message.replyToMessageId }),
+    ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
     raw: message.raw,
   }
 }
@@ -81,6 +90,8 @@ export class FeishuTransport implements BotTransport {
   private running = false
   private connected = false
   private lastError: string | undefined
+  private inboundEventCount = 0
+  private lastInboundEvent: FeishuEventDiagnostic | null = null
 
   public constructor(config: FeishuConfig = {}, factory: FeishuChannelFactory = defaultFactory) {
     this.appId = config.appId?.trim() ?? ''
@@ -116,7 +127,10 @@ export class FeishuTransport implements BotTransport {
     if (this.loopPromise) return this.loopPromise
     this.stopRequested = false
     this.running = true
-    this.loopPromise = this.run(handler).finally(() => {
+    this.loopPromise = this.run(handler).catch(error => {
+      this.lastError = String(error)
+      throw error
+    }).finally(() => {
       this.running = false
       this.connected = false
       this.loopPromise = undefined
@@ -150,6 +164,10 @@ export class FeishuTransport implements BotTransport {
       connected: this.connected,
       domain: this.options.domain === Domain.Lark ? 'lark' : 'feishu',
       connection: this.channel?.getConnectionStatus?.(),
+      inbound: {
+        received: this.inboundEventCount,
+        last: this.lastInboundEvent,
+      },
       ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
     }
   }
@@ -158,8 +176,15 @@ export class FeishuTransport implements BotTransport {
     const channel = this.factory(this.options)
     this.channel = channel
     channel.on('message', async (...args: unknown[]) => {
-      const message = toFeishuInbound(args[0] as NormalizedMessage)
-      if (message) await handler(message)
+      const normalized = args[0] as NormalizedMessage
+      try {
+        const message = toFeishuInbound(normalized)
+        this.recordInboundEvent(normalized, message === undefined ? 'empty_text' : 'normalized', message !== undefined)
+        if (message) await handler(message)
+      } catch (error) {
+        this.recordInboundEvent(normalized, 'processing_error', false)
+        this.lastError = `inbound message handling failed: ${String(error)}`
+      }
     })
     channel.on('error', (...args: unknown[]) => {
       this.lastError = String(args[0])
@@ -170,12 +195,39 @@ export class FeishuTransport implements BotTransport {
     channel.on('reconnected', () => {
       this.connected = true
     })
-    await channel.connect()
+    try {
+      await channel.connect()
+    } catch (error) {
+      this.lastError = String(error)
+      throw error
+    }
     this.connected = true
     await new Promise<void>(resolve => {
       this.resolveStop = resolve
       if (this.stopRequested) resolve()
     })
     await channel.disconnect()
+  }
+
+  private recordInboundEvent(
+    message: NormalizedMessage,
+    reason: string,
+    normalized: boolean,
+  ): void {
+    this.inboundEventCount += 1
+    const content = typeof message.content === 'string' ? message.content.trim() : ''
+    const resources = Array.isArray(message.resources) ? message.resources.length : 0
+    this.lastInboundEvent = {
+      receivedAt: Date.now(),
+      ...(typeof message.messageId === 'string' ? { messageId: message.messageId } : {}),
+      ...(typeof message.senderId === 'string' ? { userId: message.senderId } : {}),
+      ...(typeof message.chatId === 'string' ? { chatId: message.chatId } : {}),
+      ...(typeof message.chatType === 'string' ? { chatType: message.chatType } : {}),
+      ...(typeof message.mentionedBot === 'boolean' ? { mentionedBot: message.mentionedBot } : {}),
+      textLength: content.length,
+      resourceCount: resources,
+      normalized,
+      reason,
+    }
   }
 }

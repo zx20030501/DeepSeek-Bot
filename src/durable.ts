@@ -130,8 +130,12 @@ export class InboundWal {
     await this.transition(id, 'completed')
   }
 
-  public async fail(id: string, error: unknown): Promise<void> {
-    await this.transition(id, 'failed', String(error))
+  public async fail(id: string, error: unknown, retry = true): Promise<WalItem | undefined> {
+    await this.load()
+    const current = this.items.get(id)
+    if (!current || current.state === 'completed') return undefined
+    const state: WalState = retry && current.attempts < this.maxAttempts ? 'accepted' : 'failed'
+    return this.transition(id, state, String(error))
   }
 
   public async pending(): Promise<WalItem[]> {
@@ -151,10 +155,10 @@ export class InboundWal {
     return [...this.items.values()].map(item => ({ ...item }))
   }
 
-  private async transition(id: string, state: WalState, lastError?: string): Promise<void> {
+  private async transition(id: string, state: WalState, lastError?: string): Promise<WalItem | undefined> {
     await this.load()
     const current = this.items.get(id)
-    if (!current || current.state === 'completed') return
+    if (!current || current.state === 'completed') return undefined
     const item: WalItem = {
       ...current,
       state,
@@ -171,6 +175,7 @@ export class InboundWal {
       ...(lastError === undefined ? {} : { lastError }),
       updatedAt: item.updatedAt,
     })
+    return { ...item }
   }
 }
 

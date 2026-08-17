@@ -3,7 +3,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { BotProfile, DshAgentOptions } from './types.js'
+import type { BotProfile, DshAgentOptions, ModelOverride } from './types.js'
 
 interface AgentHandleLike {
   readonly agent: Agent
@@ -21,6 +21,10 @@ interface CommandRuntimeLike {
   execute(agent: Agent, line: string, signal: AbortSignal): Promise<{
     result: { kind: string; text?: string }
   } | undefined>
+}
+
+interface AgentDefaultModelLike {
+  currentSelection(): { provider?: unknown; model?: unknown }
 }
 
 function service<T>(ctx: Context, name: string): T | undefined {
@@ -51,12 +55,43 @@ export function stableSessionId(targetKey: string, profile: string, generation: 
   return `hermes-bot-${digest}` as SessionId
 }
 
-export function profileOptions(profile: BotProfile, modelOverride?: string): DshAgentOptions {
+export function profileOptions(profile: BotProfile, modelOverride?: ModelOverride | string): DshAgentOptions {
+  const override: ModelOverride | undefined = modelOverride === undefined
+    ? undefined
+    : typeof modelOverride === 'string'
+      ? { model: modelOverride }
+      : modelOverride
+  const provider = override?.provider ?? profile.provider
+  const model = override?.model ?? profile.model
   return {
-    ...(profile.provider === undefined ? {} : { provider: profile.provider }),
-    ...(modelOverride ?? profile.model) === undefined ? {} : { model: modelOverride ?? profile.model },
+    ...(provider === undefined ? {} : { provider }),
+    ...(model === undefined ? {} : { model }),
     ...(profile.maxTokens === undefined ? {} : { maxTokens: profile.maxTokens }),
   }
+}
+
+/**
+ * Programmatic Agent creation does not inherit the CLI's default-model
+ * selection automatically. Read the same DSH service used by native entry
+ * points, then let a bot profile or /model override take precedence.
+ */
+export function agentOptions(
+  ctx: Context,
+  profile: BotProfile,
+  modelOverride?: ModelOverride | string,
+): DshAgentOptions {
+  const defaults = service<AgentDefaultModelLike>(ctx, 'agentDefaultModel')
+  let defaultOptions: DshAgentOptions = {}
+  try {
+    const selection = defaults?.currentSelection()
+    defaultOptions = {
+      ...(typeof selection?.provider === 'string' ? { provider: selection.provider } : {}),
+      ...(typeof selection?.model === 'string' ? { model: selection.model } : {}),
+    }
+  } catch {
+    // Minimal/headless compositions may not install the default-model service.
+  }
+  return { ...defaultOptions, ...profileOptions(profile, modelOverride) }
 }
 
 /** The only module that knows how Bot messages enter DeepSeek Harness. */
@@ -73,10 +108,10 @@ export class HarnessBridge {
     return this.agents.get(sessionId)
   }
 
-  public async resumeOrCreate(sessionId: SessionId, profile: BotProfile, modelOverride?: string): Promise<Agent> {
+  public async resumeOrCreate(sessionId: SessionId, profile: BotProfile, modelOverride?: ModelOverride | string): Promise<Agent> {
     const live = this.agents.get(sessionId)
     if (live) return live
-    const options = profileOptions(profile, modelOverride)
+    const options = agentOptions(this.ctx, profile, modelOverride)
     try {
       const resumed = await this.agents.resume({
         resumeSessionId: sessionId,
@@ -88,7 +123,7 @@ export class HarnessBridge {
         const created = await this.agents.create({
           sessionId,
           agentOptions: options,
-          meta: { agentPreset: profile.name },
+          meta: { agentPreset: profile.name, cwd: process.cwd() },
         })
         return created.agent
       } catch (createError: unknown) {

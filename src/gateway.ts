@@ -1,11 +1,20 @@
+import { randomInt } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { InboundWal, Outbox } from './durable.js'
-import { parseBotCommand, formatHelp, textFromContent, redactId } from './commands.js'
+import {
+  parseBotCommand,
+  parseModelOverride,
+  formatModelOverride,
+  formatHelp,
+  textFromContent,
+  redactId,
+} from './commands.js'
 import { HarnessBridge, stableSessionId } from './harness-bridge.js'
 import { JsonState } from './state.js'
+import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import type {
@@ -15,11 +24,22 @@ import type {
   BotTarget,
   BotTransport,
   ChatBinding,
+  GatewayInboundDiagnostics,
   InboundMessage,
+  InboundDecisionDiagnostic,
+  ModelOverride,
   OutboxItem,
+  GatewayDiscoveryCandidate,
+  GatewayDiscoveryStatus,
 } from './types.js'
 
 interface SessionLike { readonly id: unknown }
+
+interface DiscoveryState {
+  readonly command: string
+  readonly expiresAt: number
+  readonly candidate?: GatewayDiscoveryCandidate
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
@@ -35,6 +55,27 @@ function targetKey(target: BotTarget): string {
 
 function sessionKey(sessionId: unknown): string {
   return String(sessionId)
+}
+
+export function discoveryCandidateFor(
+  message: InboundMessage,
+  command: string,
+): GatewayDiscoveryCandidate | undefined {
+  if (message.text.trim() !== command || message.target.userId === undefined) return undefined
+  return {
+    receivedAt: Date.now(),
+    userId: message.target.userId,
+    chatId: message.target.chatId,
+    ...(message.target.chatType === undefined ? {} : { chatType: message.target.chatType }),
+  }
+}
+
+export function nextModelOverride(
+  current: Pick<ChatBinding, 'modelOverride'>,
+  requested: ModelOverride | string | null | undefined,
+): Pick<ChatBinding, 'modelOverride'> {
+  const value = requested === null ? undefined : requested ?? current.modelOverride
+  return value === undefined ? {} : { modelOverride: value }
 }
 
 function defaultState(): BotStateFile {
@@ -70,6 +111,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       mode: access.mode === 'open' ? 'open' : 'allowlist',
       userIds: Array.isArray(access.userIds) ? access.userIds as (string | number)[] : envUsers,
       chatIds: Array.isArray(access.chatIds) ? access.chatIds as (string | number)[] : envChats,
+      pairing: access.pairing !== false,
       notifyUnauthorized: access.notifyUnauthorized === true,
     },
     telegram: {
@@ -109,17 +151,27 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
 
 /** Hermes-style message gateway implemented as a DSH plugin boundary. */
 export class BotGateway {
-  private readonly config: BotGatewayConfig
+  private config: BotGatewayConfig
   private readonly profiles: Map<string, BotProfile>
   private readonly state: JsonState<BotStateFile>
+  private readonly pairing: PairingStore
   private readonly wal: InboundWal
   private readonly outbox: Outbox
-  private readonly transports: BotTransport[]
+  private transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
   private readonly lanes = new Map<string, Promise<void>>()
+  private readonly inboundRetryTimers = new Set<ReturnType<typeof setTimeout>>()
   private bridge: HarnessBridge | undefined
   private started: Promise<void> = Promise.resolve()
   private stopped = false
+  private running = false
+  private durableLoaded = false
+  private inboundReceived = 0
+  private inboundAccepted = 0
+  private inboundUnauthorized = 0
+  private inboundDuplicate = 0
+  private lastInboundDecision: InboundDecisionDiagnostic | null = null
+  private discovery: DiscoveryState | undefined
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -133,16 +185,11 @@ export class BotGateway {
         ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'hermes-bot'),
     )
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
+    this.pairing = new PairingStore(join(stateDir, 'pairing.json'))
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
-    const transports: BotTransport[] = []
-    const token = this.config.telegram?.token
-    if (this.config.telegram?.enabled !== false && token) transports.push(new TelegramTransport(this.config.telegram))
-    const feishu = this.config.feishu
-    if (feishu && feishu.enabled !== false && feishu.appId && feishu.appSecret) {
-      transports.push(new FeishuTransport(feishu))
-    }
-    this.transports = transports
-    this.transportByPlatform = new Map(transports.map(transport => [transport.platform, transport]))
+    this.transports = []
+    this.transportByPlatform = new Map()
+    this.installTransports(this.config)
     this.outbox = new Outbox(
       join(stateDir, 'outbox.jsonl'),
       async (item: OutboxItem) => {
@@ -157,15 +204,56 @@ export class BotGateway {
   }
 
   public async start(): Promise<void> {
+    if (this.running) {
+      await this.started
+      return
+    }
+    this.running = true
+    this.stopped = false
     this.started = this.boot()
-    await this.started
+    try {
+      await this.started
+    } catch (error) {
+      this.running = false
+      throw error
+    }
   }
 
   public async stop(): Promise<void> {
     this.stopped = true
+    this.running = false
+    this.discovery = undefined
+    for (const timer of this.inboundRetryTimers) clearTimeout(timer)
+    this.inboundRetryTimers.clear()
     await this.started.catch(() => undefined)
-    await Promise.all(this.transports.map(transport => transport.stop()))
+    await this.stopTransports()
     await this.outbox.stop()
+  }
+
+  /** Apply settings changes without requiring the DSH process to restart. */
+  public async reconfigure(rawConfig: unknown = {}): Promise<void> {
+    const next = normalizeConfig(rawConfig)
+    if (!this.running || this.stopped) {
+      this.applyConfig(next)
+      this.installTransports(next)
+      return
+    }
+    await this.started.catch(() => undefined)
+    if (!this.running || this.stopped) return
+    await this.stopTransports()
+    this.applyConfig(next)
+    this.installTransports(next)
+    await this.loadDurableState()
+    await this.activateTransports(true)
+  }
+
+  private applyConfig(next: BotGatewayConfig): void {
+    this.config = next
+    this.profiles.clear()
+    for (const [name, profile] of normalizeProfiles(next)) this.profiles.set(name, profile)
+    if (!this.profiles.has(next.defaultProfile ?? 'default')) {
+      this.profiles.set('default', { name: 'default', title: 'Hermes' })
+    }
   }
 
   public onSessionEvent(session: SessionLike, event: unknown): void {
@@ -183,38 +271,156 @@ export class BotGateway {
       accessMode: config.mode ?? 'allowlist',
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
+      inbound: this.inboundDiagnostics(),
+      pairing: {
+        enabled: config.pairing !== false,
+        ...this.pairing.status(),
+      },
+      discovery: this.discoveryStatus(),
+    }
+  }
+
+  /** Start a short-lived, local-UI-driven identity discovery flow. */
+  public beginDiscovery(ttlMs = 5 * 60 * 1_000): GatewayDiscoveryStatus {
+    const expiresAt = Date.now() + Math.max(30_000, Math.min(15 * 60 * 1_000, ttlMs))
+    const code = String(randomInt(100_000, 1_000_000))
+    this.discovery = { command: `/bind ${code}`, expiresAt }
+    return this.discoveryStatus()
+  }
+
+  public discoveryCandidate(): GatewayDiscoveryCandidate | undefined {
+    const state = this.discovery
+    if (state === undefined || state.expiresAt <= Date.now()) return undefined
+    return state.candidate
+  }
+
+  public clearDiscovery(): void {
+    this.discovery = undefined
+  }
+
+  public async approvePairing(code: string): Promise<GatewayDiscoveryCandidate | undefined> {
+    if (this.config.access?.pairing === false) return undefined
+    const request = await this.pairing.approve(code)
+    if (request === undefined) return undefined
+    const target: BotTarget = {
+      platform: request.platform,
+      chatId: request.chatId,
+      userId: request.userId,
+      ...(request.chatType === undefined ? {} : { chatType: request.chatType }),
+    }
+    void this.sendText(
+      target,
+      '配对成功。请在此飞书聊天中发送 /new 开始新的会话，然后再正常使用。',
+      `pairing-approved:${request.platform}:${request.userId}:${Date.now()}`,
+    ).catch(error => this.log('warn', `pairing confirmation failed: ${String(error)}`))
+    return {
+      receivedAt: request.createdAt,
+      userId: request.userId,
+      chatId: request.chatId,
+      ...(request.chatType === undefined ? {} : { chatType: request.chatType }),
+    }
+  }
+
+  public async revokePairing(platform: string, userId: string): Promise<boolean> {
+    return this.pairing.revoke(platform, userId)
+  }
+
+  private discoveryStatus(): GatewayDiscoveryStatus {
+    const state = this.discovery
+    if (state === undefined || state.expiresAt <= Date.now()) return { active: false }
+    return {
+      active: state.candidate === undefined,
+      command: state.command,
+      expiresAt: state.expiresAt,
+      ...(state.candidate === undefined ? {} : { candidate: state.candidate }),
     }
   }
 
   private async boot(): Promise<void> {
     if (this.config.enabled === false) return
+    await this.loadDurableState()
+    await this.activateTransports(true)
+  }
+
+  private async loadDurableState(): Promise<void> {
+    if (this.durableLoaded) return
     await this.state.load()
+    await this.pairing.load()
     await this.wal.load()
     await this.outbox.load()
+    this.durableLoaded = true
+  }
+
+  private async activateTransports(recover: boolean): Promise<void> {
+    if (this.config.enabled === false) return
     if (this.transports.length === 0) {
       this.log('warn', 'no enabled Telegram or Feishu transport configured; Bot Gateway is installed but idle')
       return
     }
-    try {
-      this.bridge = new HarnessBridge(this.ctx)
-    } catch (error: unknown) {
-      this.log('warn', `DeepSeek Harness Agent service unavailable: ${String(error)}`)
-      return
+    if (!this.bridge) {
+      try {
+        this.bridge = new HarnessBridge(this.ctx)
+      } catch (error: unknown) {
+        this.log('warn', `DeepSeek Harness Agent service unavailable: ${String(error)}`)
+        return
+      }
     }
-    for (const item of await this.wal.pending()) {
-      void this.queueInbound(item.message, item.id)
+    if (recover) {
+      for (const item of await this.wal.pending()) {
+        void this.queueInbound(item.message, item.id)
+      }
+      void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
     }
-    void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
     for (const transport of this.transports) {
       void transport.start(message => this.acceptInbound(message)).catch(error => {
-        if (!this.stopped) this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+        if (!this.stopped && this.transportByPlatform.get(transport.platform) === transport) {
+          this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+        }
       })
     }
     this.log('info', `Bot Gateway started: ${this.transports.map(transport => transport.platform).join(', ')}`)
   }
 
+  private installTransports(config: BotGatewayConfig): void {
+    const transports: BotTransport[] = []
+    const token = config.telegram?.token
+    if (config.telegram?.enabled !== false && token) transports.push(new TelegramTransport(config.telegram))
+    const feishu = config.feishu
+    if (feishu && feishu.enabled !== false && feishu.appId && feishu.appSecret) {
+      transports.push(new FeishuTransport(feishu))
+    }
+    this.transports = transports
+    this.transportByPlatform.clear()
+    for (const transport of transports) this.transportByPlatform.set(transport.platform, transport)
+  }
+
+  private async stopTransports(): Promise<void> {
+    const current = this.transports
+    this.transports = []
+    this.transportByPlatform.clear()
+    await Promise.all(current.map(transport => transport.stop()))
+  }
+
   private async acceptInbound(message: InboundMessage): Promise<void> {
-    if (!this.authorized(message)) {
+    this.inboundReceived += 1
+    if (this.acceptDiscoveryMessage(message)) return
+    if (!(await this.authorized(message))) {
+      this.inboundUnauthorized += 1
+      this.lastInboundDecision = this.makeInboundDiagnostic(message, 'unauthorized', 'not_in_allowlist')
+      if (this.config.access?.pairing !== false && message.target.chatType === 'dm' && message.target.userId !== undefined) {
+        const offer = await this.pairing.request(message.target)
+        if (offer !== undefined) {
+          if (offer.shouldNotify) {
+            await this.sendText(
+              message.target,
+              `此用户还没有完成配对。请把配对码 ${offer.request.code} 提供给 Bot 管理员，在 DSH 设置页的“安全配对”中输入并确认。配对码 1 小时内有效。`,
+              `pairing:${message.target.platform}:${message.target.userId}:${offer.request.code}`,
+            )
+          }
+          this.log('info', `pairing request created for user=${redactId(message.target.userId)}`)
+          return
+        }
+      }
       if (this.config.access?.notifyUnauthorized) {
         await this.sendText(
           message.target,
@@ -226,8 +432,61 @@ export class BotGateway {
       return
     }
     const accepted = await this.wal.accept(message)
-    if (!accepted.inserted || accepted.item.state !== 'accepted') return
+    if (!accepted.inserted || accepted.item.state !== 'accepted') {
+      this.inboundDuplicate += 1
+      this.lastInboundDecision = this.makeInboundDiagnostic(message, 'duplicate', accepted.inserted ? `wal_${accepted.item.state}` : 'already_seen')
+      return
+    }
+    this.inboundAccepted += 1
+    this.lastInboundDecision = this.makeInboundDiagnostic(message, 'accepted', 'allowlist_passed')
     void this.queueInbound(message, accepted.item.id)
+  }
+
+  /**
+   * Capture only the message carrying the one-time challenge. It deliberately
+   * bypasses the normal allowlist and Agent path, then expires after one hit.
+   */
+  private acceptDiscoveryMessage(message: InboundMessage): boolean {
+    const state = this.discovery
+    if (state === undefined || state.candidate !== undefined || state.expiresAt <= Date.now()) return false
+    const candidate = discoveryCandidateFor(message, state.command)
+    if (candidate === undefined) return false
+    this.discovery = { ...state, candidate }
+    void this.sendText(
+      message.target,
+      '已识别你的飞书用户 ID。请回到 DSH 设置页，确认 UID 已自动填入后点击“保存并启动”。',
+      `discovery:${message.id}`,
+    ).catch(error => this.log('warn', `discovery confirmation failed: ${String(error)}`))
+    this.log('info', `Feishu user identity discovered: user=${redactId(candidate.userId)} chat=${redactId(candidate.chatId)}`)
+    return true
+  }
+
+  private inboundDiagnostics(): GatewayInboundDiagnostics {
+    return {
+      received: this.inboundReceived,
+      accepted: this.inboundAccepted,
+      unauthorized: this.inboundUnauthorized,
+      duplicate: this.inboundDuplicate,
+      last: this.lastInboundDecision,
+    }
+  }
+
+  private makeInboundDiagnostic(
+    message: InboundMessage,
+    decision: InboundDecisionDiagnostic['decision'],
+    reason: string,
+  ): InboundDecisionDiagnostic {
+    return {
+      receivedAt: Date.now(),
+      platform: message.target.platform,
+      messageId: message.id,
+      ...(message.target.userId === undefined ? {} : { userId: message.target.userId }),
+      chatId: message.target.chatId,
+      ...(message.target.chatType === undefined ? {} : { chatType: message.target.chatType }),
+      textLength: message.text.length,
+      decision,
+      reason,
+    }
   }
 
   private async queueInbound(message: InboundMessage, walId: string): Promise<void> {
@@ -270,9 +529,41 @@ export class BotGateway {
       }
       await this.bridge.followup(agent, message.text)
     } catch (error: unknown) {
-      await this.wal.fail(walId, error)
-      await this.sendText(message.target, `Agent 处理失败：${String(error)}`, `error:${message.id}`)
+      await this.handleInboundFailure(message, walId, error)
     }
+  }
+
+  private async handleInboundFailure(
+    message: InboundMessage,
+    walId: string,
+    error: unknown,
+    retry = true,
+    finalText = `Agent 处理失败：${String(error)}`,
+    finalKey = `error:${message.id}`,
+  ): Promise<void> {
+    const item = await this.wal.fail(walId, error, retry)
+    if (!item) return
+    if (item.state === 'failed') {
+      await this.sendText(message.target, finalText, finalKey)
+      return
+    }
+    this.scheduleInboundRetry(message, walId, item.attempts)
+  }
+
+  private scheduleInboundRetry(message: InboundMessage, walId: string, attempts: number): void {
+    if (this.stopped) return
+    const base = Math.max(0, this.config.retryBaseMs ?? 1_000)
+    const maximum = Math.max(base, this.config.retryMaxMs ?? 60_000)
+    const delay = Math.min(maximum, base * 2 ** Math.max(0, attempts - 1))
+    let timer: ReturnType<typeof setTimeout>
+    timer = setTimeout(() => {
+      this.inboundRetryTimers.delete(timer)
+      void this.queueInbound(message, walId).catch(error => {
+        this.log('warn', `inbound retry failed: ${String(error)}`)
+      })
+    }, delay)
+    timer.unref?.()
+    this.inboundRetryTimers.add(timer)
   }
 
   private async handleLocalCommand(
@@ -334,19 +625,30 @@ export class BotGateway {
       }
       const old = this.bridge?.getAgent(binding.sessionId as SessionId)
       if (old) this.bridge?.stop(old)
-      const next = await this.rotateBinding(message.target, binding, profile.name)
+      // A profile switch must start from the new profile's model settings.
+      const next = await this.rotateBinding(message.target, binding, profile.name, null)
       await this.completeWithText(message, walId, next, `已切换到 Bot：${profile.title ?? profile.name}`)
       return true
     }
     if (name === 'model') {
       if (!args) {
         const profile = this.profiles.get(binding.profile)
-        await this.completeWithText(message, walId, binding, `当前模型：${binding.modelOverride ?? profile?.model ?? '由 DSH profile 决定'}`)
+        await this.completeWithText(
+          message,
+          walId,
+          binding,
+          `当前模型：${formatModelOverride(binding.modelOverride) ?? profile?.model ?? '由 DSH profile 决定'}`,
+        )
         return true
       }
-      const modelOverride = args.includes(':') ? args.split(':').slice(1).join(':') : args
+      const modelOverride = parseModelOverride(args)
       const next = await this.rotateBinding(message.target, binding, binding.profile, modelOverride)
-      await this.completeWithText(message, walId, next, `下一回合将使用模型：${modelOverride}`)
+      await this.completeWithText(
+        message,
+        walId,
+        next,
+        `下一回合将使用模型：${formatModelOverride(modelOverride)}`,
+      )
       return true
     }
     return false
@@ -380,14 +682,21 @@ export class BotGateway {
     return binding
   }
 
-  private async rotateBinding(target: BotTarget, current: ChatBinding, profile: string, modelOverride?: string): Promise<ChatBinding> {
+  private async rotateBinding(
+    target: BotTarget,
+    current: ChatBinding,
+    profile: string,
+    modelOverride?: ModelOverride | string | null,
+  ): Promise<ChatBinding> {
+    const modelPatch = nextModelOverride(current, modelOverride)
+    const { modelOverride: _oldModelOverride, ...withoutModelOverride } = current
     const next: ChatBinding = {
-      ...current,
+      ...withoutModelOverride,
       target,
       profile,
       generation: current.generation + 1,
       sessionId: String(stableSessionId(current.key, profile, current.generation + 1)),
-      ...(modelOverride === undefined ? {} : { modelOverride }),
+      ...modelPatch,
       updatedAt: Date.now(),
     }
     await this.state.update(state => {
@@ -398,13 +707,15 @@ export class BotGateway {
     return next
   }
 
-  private authorized(message: InboundMessage): boolean {
+  private async authorized(message: InboundMessage): Promise<boolean> {
     const access = this.config.access ?? {}
     if (access.mode === 'open') return true
     const users = stringList(access.userIds)
     const chats = stringList(access.chatIds)
-    return (message.target.userId !== undefined && users.has(message.target.userId))
-      || chats.has(message.target.chatId)
+    if ((message.target.userId !== undefined && users.has(message.target.userId)) || chats.has(message.target.chatId)) return true
+    return access.pairing === true
+      && message.target.userId !== undefined
+      && await this.pairing.isApproved(message.target.platform, message.target.userId)
   }
 
   private async handleSessionEvent(session: SessionLike, event: unknown): Promise<void> {
@@ -431,8 +742,14 @@ export class BotGateway {
       const pending = await this.wal.pendingForSession(id)
       if (!pending[0]) return
       const detail = kind === 'aborted' ? 'Agent 回合已停止。' : 'Agent 回合失败。'
-      await this.sendText(target, detail, `turn-error:${id}:${String(record.seq ?? Date.now())}`)
-      await this.wal.fail(pending[0].id, detail)
+      await this.handleInboundFailure(
+        pending[0].message,
+        pending[0].id,
+        detail,
+        kind !== 'aborted',
+        detail,
+        `turn-error:${id}:${String(record.seq ?? Date.now())}`,
+      )
     }
   }
 
