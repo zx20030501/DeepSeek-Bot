@@ -47,6 +47,18 @@ export interface TelegramConfig {
   readonly maxAttempts?: number
 }
 
+export interface FeishuConfig {
+  /** Enable the Feishu/Lark transport. The transport uses the official SDK WebSocket mode. */
+  readonly enabled?: boolean
+  readonly appId?: string
+  readonly appSecret?: string
+  readonly domain?: 'feishu' | 'lark'
+  /** Group messages must mention the bot by default. */
+  readonly requireMention?: boolean
+  readonly handshakeTimeoutMs?: number
+  readonly maxMessageChars?: number
+}
+
 export interface BotAccessConfig {
   /** Secure default: an empty allowlist accepts nobody. */
   readonly mode?: 'allowlist' | 'open'
@@ -62,6 +74,7 @@ export interface BotGatewayConfig {
   readonly profiles?: Record<string, Omit<BotProfile, 'name'>>
   readonly access?: BotAccessConfig
   readonly telegram?: TelegramConfig
+  readonly feishu?: FeishuConfig
   readonly maxInboundAttempts?: number
   readonly outboxMaxAttempts?: number
   readonly retryBaseMs?: number

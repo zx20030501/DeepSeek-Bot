@@ -67,6 +67,17 @@ DSH 的官方扩展边界是：
 | [Cavan-Ou/hermes-dsh-collab](https://github.com/Cavan-Ou/hermes-dsh-collab) | Hermes 派单、DSH 执行、质量门、Git 单一写者 | Hermes 负责编排时必须有 scope、测试和单写者约束 |
 | [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) | 插件市场，含 `hermes-dsh-collab`、Telegram、飞书、消息中心等条目 | 不复制一个巨型 fork，保持标准 `dsh.bundle` 插件分发 |
 
+### 飞书官方能力约束
+
+本次接入以飞书官方文档和官方 Node SDK 为准：
+
+- [接收消息事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive)：应用机器人通过 `im.message.receive_v1` 接收单聊或群聊消息。
+- [发送消息](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/create)：应用身份通过 `tenant_access_token` 向 `chat_id` 或用户 ID 发送消息。
+- [回复消息](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/reply)：可以按 `message_id` 回复并保留消息上下文。
+- [官方 Node SDK](https://github.com/larksuite/node-sdk)：`@larksuiteoapi/node-sdk` 提供 WebSocket 长连接、事件归一化、重连、消息分片和 CardKit 能力。
+
+因此当前实现没有使用只能单向推送的群自定义机器人 Webhook，而是使用企业自建应用机器人。这样才能接收用户消息、区分发送者、响应群聊 @机器人，并为后续 Bot 协作、审批卡片和跨会话治理保留身份与事件上下文。
+
 ## 3. 比直接移植更好的方案
 
 ### 3.1 分层
@@ -92,23 +103,25 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 第一版包含：
 
 - Telegram Bot API 长轮询；
+- 飞书/Lark 应用机器人 WebSocket 长连接（使用官方 `@larksuiteoapi/node-sdk`）；
 - 每聊天/线程稳定 DSH session；
 - Inbound WAL、更新去重、Outbox、幂等键、指数退避、死信状态；
 - `/new`、`/stop`、`/status`、`/help`、`/bots`、`/bot <name>`、`/model`；
 - DSH 原生命令优先执行，未知 `/xxx` 仍交给 Agent；
 - Telegram 4096 字符切片、typing、访问 allowlist；
+- 飞书私聊、群聊 @机器人、话题/回复关系、Markdown 出站和自动重连；
 - 通过 `session/event` 把模型文本回传 Telegram；
 - crash/restart 后有限次数恢复未完成入站请求；
 - 单元测试、插件配置示例和运行手册。
 
 暂不在第一版硬塞入：
 
-- Discord Gateway、飞书长连接和 WhatsApp 多协议；
+- Discord Gateway、飞书 HTTP Webhook 和 WhatsApp 多协议；
 - 图片生成、宠物头像、桌面 Bot roster UI；
 - 自建 cron 引擎；优先复用 DSH 的 command/jobs/schedule seam；
 - 自动放开 Full Access。权限由 DSH profile 和 Bot allowlist 共同决定。
 
-这些能力会作为后续适配器或 UI 插件增加，而不是让核心可靠性代码变得不可验证。
+飞书第一版选择官方 WebSocket 长连接而非 Webhook，是因为本项目主要运行在 DSH 本地/服务器进程中，不需要额外暴露公网回调地址；Webhook 可在后续有反向代理和统一 ingress 后再补。其他能力会作为后续适配器或 UI 插件增加，而不是让核心可靠性代码变得不可验证。
 
 ### 3.3 安全默认值
 
@@ -128,7 +141,7 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 
 1. Telegram 真实 Bot token 下做端到端 smoke test。
 2. 增加 `dsh-agent-message` 风格的跨会话 mailbox 和回执。
-3. 以同一 Delivery 核心接入飞书 CardKit；复用 `dsh-lark-link` 已验证的 WAL/Outbox 经验，但不复制其业务代码。
+3. 在现有飞书通道上增加 CardKit 流式回复、按钮审批和媒体上传；复用 `dsh-lark-link` 已验证的 WAL/Outbox 经验，但不复制其业务代码。
 4. 以 DSH `ctx.jobs` / schedule seam 对接 Hermes Routine。
 5. 在 DSH Web profile 增加轻量 Bot roster UI：canonical chat、未读标记、profile 选择和 routine 列表。
 6. 所有大体积回放、诊断 ZIP、压测日志和构建归档放 Google Drive；GitHub 只保存源代码、测试、文档和小型 manifest。

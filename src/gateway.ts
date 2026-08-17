@@ -6,6 +6,7 @@ import { InboundWal, Outbox } from './durable.js'
 import { parseBotCommand, formatHelp, textFromContent, redactId } from './commands.js'
 import { HarnessBridge, stableSessionId } from './harness-bridge.js'
 import { JsonState } from './state.js'
+import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import type {
   BotGatewayConfig,
@@ -53,6 +54,7 @@ function normalizeProfiles(config: BotGatewayConfig): Map<string, BotProfile> {
 export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
   const input = asRecord(raw)
   const telegram = asRecord(input.telegram)
+  const feishu = asRecord(input.feishu)
   const access = asRecord(input.access)
   const envUsers = (process.env.DSH_HERMES_BOT_ALLOWED_USERS ?? '').split(',').map(item => item.trim()).filter(Boolean)
   const envChats = (process.env.DSH_HERMES_BOT_ALLOWED_CHATS ?? '').split(',').map(item => item.trim()).filter(Boolean)
@@ -81,6 +83,23 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       requestTimeoutMs: typeof telegram.requestTimeoutMs === 'number' ? telegram.requestTimeoutMs : 70_000,
       maxAttempts: typeof telegram.maxAttempts === 'number' ? telegram.maxAttempts : 5,
     },
+    feishu: {
+      enabled: feishu.enabled !== false,
+      ...(typeof feishu.appId === 'string'
+        ? { appId: feishu.appId }
+        : process.env.DSH_HERMES_BOT_FEISHU_APP_ID
+          ? { appId: process.env.DSH_HERMES_BOT_FEISHU_APP_ID }
+          : {}),
+      ...(typeof feishu.appSecret === 'string'
+        ? { appSecret: feishu.appSecret }
+        : process.env.DSH_HERMES_BOT_FEISHU_APP_SECRET
+          ? { appSecret: process.env.DSH_HERMES_BOT_FEISHU_APP_SECRET }
+          : {}),
+      domain: feishu.domain === 'lark' || process.env.DSH_HERMES_BOT_FEISHU_DOMAIN === 'lark' ? 'lark' : 'feishu',
+      requireMention: feishu.requireMention !== false,
+      handshakeTimeoutMs: typeof feishu.handshakeTimeoutMs === 'number' ? feishu.handshakeTimeoutMs : 15_000,
+      maxMessageChars: typeof feishu.maxMessageChars === 'number' ? feishu.maxMessageChars : 4_000,
+    },
     maxInboundAttempts: typeof input.maxInboundAttempts === 'number' ? input.maxInboundAttempts : 3,
     outboxMaxAttempts: typeof input.outboxMaxAttempts === 'number' ? input.outboxMaxAttempts : 5,
     retryBaseMs: typeof input.retryBaseMs === 'number' ? input.retryBaseMs : 1_000,
@@ -95,7 +114,8 @@ export class BotGateway {
   private readonly state: JsonState<BotStateFile>
   private readonly wal: InboundWal
   private readonly outbox: Outbox
-  private readonly transport: BotTransport | undefined
+  private readonly transports: BotTransport[]
+  private readonly transportByPlatform: Map<string, BotTransport>
   private readonly lanes = new Map<string, Promise<void>>()
   private bridge: HarnessBridge | undefined
   private started: Promise<void> = Promise.resolve()
@@ -114,15 +134,21 @@ export class BotGateway {
     )
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
+    const transports: BotTransport[] = []
     const token = this.config.telegram?.token
-    this.transport = this.config.telegram?.enabled !== false && token
-      ? new TelegramTransport(this.config.telegram)
-      : undefined
+    if (this.config.telegram?.enabled !== false && token) transports.push(new TelegramTransport(this.config.telegram))
+    const feishu = this.config.feishu
+    if (feishu && feishu.enabled !== false && feishu.appId && feishu.appSecret) {
+      transports.push(new FeishuTransport(feishu))
+    }
+    this.transports = transports
+    this.transportByPlatform = new Map(transports.map(transport => [transport.platform, transport]))
     this.outbox = new Outbox(
       join(stateDir, 'outbox.jsonl'),
       async (item: OutboxItem) => {
-        if (!this.transport) throw new Error('no enabled bot transport')
-        await this.transport.send(item.target, item.text)
+        const transport = this.transportByPlatform.get(item.target.platform)
+        if (!transport) throw new Error(`no enabled bot transport for ${item.target.platform}`)
+        await transport.send(item.target, item.text)
       },
       this.config.outboxMaxAttempts ?? 5,
       this.config.retryBaseMs ?? 1_000,
@@ -138,7 +164,7 @@ export class BotGateway {
   public async stop(): Promise<void> {
     this.stopped = true
     await this.started.catch(() => undefined)
-    await this.transport?.stop()
+    await Promise.all(this.transports.map(transport => transport.stop()))
     await this.outbox.stop()
   }
 
@@ -150,7 +176,10 @@ export class BotGateway {
     const config = this.config.access ?? {}
     return {
       enabled: this.config.enabled !== false,
-      transport: this.transport?.status?.() ?? { platform: 'none', running: false },
+      transports: Object.fromEntries(this.transports.map(transport => [
+        transport.platform,
+        transport.status?.() ?? { platform: transport.platform, running: false },
+      ])),
       accessMode: config.mode ?? 'allowlist',
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
@@ -162,8 +191,8 @@ export class BotGateway {
     await this.state.load()
     await this.wal.load()
     await this.outbox.load()
-    if (!this.transport) {
-      this.log('warn', 'no Telegram token configured; Bot Gateway is installed but idle')
+    if (this.transports.length === 0) {
+      this.log('warn', 'no enabled Telegram or Feishu transport configured; Bot Gateway is installed but idle')
       return
     }
     try {
@@ -176,10 +205,12 @@ export class BotGateway {
       void this.queueInbound(item.message, item.id)
     }
     void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
-    void this.transport.start(message => this.acceptInbound(message)).catch(error => {
-      if (!this.stopped) this.log('error', `Telegram polling stopped: ${String(error)}`)
-    })
-    this.log('info', 'Bot Gateway started')
+    for (const transport of this.transports) {
+      void transport.start(message => this.acceptInbound(message)).catch(error => {
+        if (!this.stopped) this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+      })
+    }
+    this.log('info', `Bot Gateway started: ${this.transports.map(transport => transport.platform).join(', ')}`)
   }
 
   private async acceptInbound(message: InboundMessage): Promise<void> {
@@ -220,7 +251,8 @@ export class BotGateway {
     const claimed = await this.wal.claim(walId, binding.sessionId)
     if (!claimed || !this.bridge) return
     try {
-      if (this.transport?.typing) void this.transport.typing(message.target).catch(() => undefined)
+      const transport = this.transportByPlatform.get(message.target.platform)
+      if (transport?.typing) void transport.typing(message.target).catch(() => undefined)
       const agent = await this.bridge.resumeOrCreate(
         binding.sessionId as SessionId,
         profile,
@@ -261,7 +293,7 @@ export class BotGateway {
       const live = this.bridge?.liveStatus(binding.sessionId as SessionId) ?? { live: false }
       await this.completeWithText(message, walId, binding, [
         'Bot Gateway 状态',
-        `Transport: ${JSON.stringify(this.transport?.status?.() ?? { platform: 'none', running: false })}`,
+        `Transports: ${JSON.stringify(this.status().transports)}`,
         `Profile: ${binding.profile}`,
         `Session: ${binding.sessionId}`,
         `Agent: ${JSON.stringify(live)}`,
@@ -406,6 +438,10 @@ export class BotGateway {
 
   private async sendText(target: BotTarget, text: string, key: string): Promise<void> {
     await this.outbox.enqueue({ key, target, text })
+  }
+
+  private transportFor(platform: string): BotTransport | undefined {
+    return this.transportByPlatform.get(platform)
   }
 
   private log(level: 'info' | 'warn' | 'error', message: string): void {
