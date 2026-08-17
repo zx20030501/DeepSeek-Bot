@@ -127,7 +127,10 @@ export class FeishuTransport implements BotTransport {
     if (this.loopPromise) return this.loopPromise
     this.stopRequested = false
     this.running = true
-    this.loopPromise = this.run(handler).finally(() => {
+    this.loopPromise = this.run(handler).catch(error => {
+      this.lastError = String(error)
+      throw error
+    }).finally(() => {
       this.running = false
       this.connected = false
       this.loopPromise = undefined
@@ -192,7 +195,12 @@ export class FeishuTransport implements BotTransport {
     channel.on('reconnected', () => {
       this.connected = true
     })
-    await channel.connect()
+    try {
+      await channel.connect()
+    } catch (error) {
+      this.lastError = String(error)
+      throw error
+    }
     this.connected = true
     await new Promise<void>(resolve => {
       this.resolveStop = resolve
