@@ -247,7 +247,7 @@ class FeishuSetupController {
         writable: data.writable,
         credential: data.credential,
         diagnostics: data.diagnostics,
-        message: data.message ?? '已保存，机器人正在自动启动。',
+        message: data.message ?? '已保存，机器人正在自动启动。请在飞书同一个聊天中发送 /new 开始新的会话，然后再正常使用。',
         error: undefined,
         diagnosticsError: undefined,
       })
@@ -433,7 +433,7 @@ function DiagnosticPanel({
         <div className="dsh-hermes-alert dsh-hermes-notice">连接测试已启动。请确认长连接显示“已连接”，然后在飞书私聊机器人发送：<code>{discovery.command}</code></div>
       ) : null}
       {candidate?.userId === undefined ? null : (
-        <div className="dsh-hermes-alert dsh-hermes-success">已识别并自动填入用户 UID：<code>{candidate.userId}</code>。现在点击“保存并启动”即可。</div>
+        <div className="dsh-hermes-alert dsh-hermes-success">已识别并自动填入用户 UID：<code>{candidate.userId}</code>。现在点击“保存并启动”；保存成功后，请在飞书同一个聊天中发送 <code>/new</code> 开始新的会话。</div>
       )}
       {event === null && decision === null ? (
         <div className="dsh-hermes-diagnostic-empty">目前还没有收到飞书事件。请先点击“刷新诊断”，再给机器人发一条新消息。</div>
@@ -505,7 +505,7 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
   return (
     <div className="dsh-hermes-settings">
       <header className="dsh-hermes-header">
-        <div><span className="dsh-hermes-kicker">DeepSeek Harness 插件</span><h2>飞书机器人</h2><p>填好下面的信息，点击一次“保存并启动”即可。以后不需要再手动设置环境变量。</p></div>
+        <div><span className="dsh-hermes-kicker">DeepSeek Harness 插件</span><h2>飞书机器人</h2><p>填好下面的信息，点击“保存并启动”；保存成功后，请在飞书同一个聊天中发送 <code>/new</code> 开始新的会话。</p></div>
         <span className={`dsh-hermes-badge ${state.credential.configured ? 'ok' : 'missing'}`}>{state.credential.configured ? '密钥已配置' : '等待密钥'}</span>
       </header>
       <div className="dsh-hermes-alert dsh-hermes-notice">App Secret 只保存到本机的 DSH 凭据库，页面不会回显它，也不会写进项目文件。</div>
@@ -543,6 +543,7 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
 
       <section className="dsh-hermes-panel dsh-hermes-actions">
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.enabled} onChange={event => { update('enabled', event.target.checked) }} /><span>保存后启用机器人</span></label>
+        <div className="dsh-hermes-alert dsh-hermes-notice">重要：保存成功后，请在飞书同一个聊天中发送 <code>/new</code>，新会话建立后设置才会完全生效。</div>
         <button type="button" className="dsh-hermes-primary" disabled={!state.writable || state.saving || state.diagnosing} onClick={save}>{state.saving ? '正在保存…' : '保存并启动'}</button>
       </section>
     </div>

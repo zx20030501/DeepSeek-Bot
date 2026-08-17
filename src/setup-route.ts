@@ -217,7 +217,7 @@ async function handleRequest(
   sendJson(res, 200, {
     ...snapshot,
     ...(discovery === undefined
-      ? { message: '已保存，机器人正在自动启动。' }
+      ? { message: '已保存，机器人正在自动启动。请在飞书同一个聊天中发送 /new 开始新的会话，然后再正常使用。' }
       : { message: '已启动连接测试。请等待长连接显示“已连接”，再按提示给机器人发送一次性绑定口令。' }),
   })
 }
