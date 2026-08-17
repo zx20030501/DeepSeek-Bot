@@ -19,6 +19,7 @@ export interface HermesBotSettings {
   access: {
     userIds: string[]
     chatIds: string[]
+    pairing: boolean
   }
 }
 
@@ -34,6 +35,7 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
   access: z.object({
     userIds: z.array(z.string()).default([]),
     chatIds: z.array(z.string()).default([]),
+    pairing: z.boolean().default(true),
   }),
 })
 
@@ -54,6 +56,7 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
     access: {
       userIds: listOf(config.access?.userIds),
       chatIds: listOf(config.access?.chatIds),
+      pairing: config.access?.pairing !== false,
     },
   }
 }
@@ -72,6 +75,7 @@ export function gatewayConfigFromSettings(
       mode: 'allowlist',
       userIds: settings.access.userIds,
       chatIds: settings.access.chatIds,
+      pairing: settings.access.pairing !== false,
     },
     feishu: {
       ...base.feishu,

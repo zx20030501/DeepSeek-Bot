@@ -14,6 +14,7 @@ import {
 } from './commands.js'
 import { HarnessBridge, stableSessionId } from './harness-bridge.js'
 import { JsonState } from './state.js'
+import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import type {
@@ -110,6 +111,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       mode: access.mode === 'open' ? 'open' : 'allowlist',
       userIds: Array.isArray(access.userIds) ? access.userIds as (string | number)[] : envUsers,
       chatIds: Array.isArray(access.chatIds) ? access.chatIds as (string | number)[] : envChats,
+      pairing: access.pairing !== false,
       notifyUnauthorized: access.notifyUnauthorized === true,
     },
     telegram: {
@@ -152,6 +154,7 @@ export class BotGateway {
   private config: BotGatewayConfig
   private readonly profiles: Map<string, BotProfile>
   private readonly state: JsonState<BotStateFile>
+  private readonly pairing: PairingStore
   private readonly wal: InboundWal
   private readonly outbox: Outbox
   private transports: BotTransport[]
@@ -182,6 +185,7 @@ export class BotGateway {
         ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'hermes-bot'),
     )
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
+    this.pairing = new PairingStore(join(stateDir, 'pairing.json'))
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
     this.transports = []
     this.transportByPlatform = new Map()
@@ -268,6 +272,10 @@ export class BotGateway {
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
       inbound: this.inboundDiagnostics(),
+      pairing: {
+        enabled: config.pairing !== false,
+        ...this.pairing.status(),
+      },
       discovery: this.discoveryStatus(),
     }
   }
@@ -290,6 +298,33 @@ export class BotGateway {
     this.discovery = undefined
   }
 
+  public async approvePairing(code: string): Promise<GatewayDiscoveryCandidate | undefined> {
+    if (this.config.access?.pairing === false) return undefined
+    const request = await this.pairing.approve(code)
+    if (request === undefined) return undefined
+    const target: BotTarget = {
+      platform: request.platform,
+      chatId: request.chatId,
+      userId: request.userId,
+      ...(request.chatType === undefined ? {} : { chatType: request.chatType }),
+    }
+    void this.sendText(
+      target,
+      '配对成功。请在此飞书聊天中发送 /new 开始新的会话，然后再正常使用。',
+      `pairing-approved:${request.platform}:${request.userId}:${Date.now()}`,
+    ).catch(error => this.log('warn', `pairing confirmation failed: ${String(error)}`))
+    return {
+      receivedAt: request.createdAt,
+      userId: request.userId,
+      chatId: request.chatId,
+      ...(request.chatType === undefined ? {} : { chatType: request.chatType }),
+    }
+  }
+
+  public async revokePairing(platform: string, userId: string): Promise<boolean> {
+    return this.pairing.revoke(platform, userId)
+  }
+
   private discoveryStatus(): GatewayDiscoveryStatus {
     const state = this.discovery
     if (state === undefined || state.expiresAt <= Date.now()) return { active: false }
@@ -310,6 +345,7 @@ export class BotGateway {
   private async loadDurableState(): Promise<void> {
     if (this.durableLoaded) return
     await this.state.load()
+    await this.pairing.load()
     await this.wal.load()
     await this.outbox.load()
     this.durableLoaded = true
@@ -368,9 +404,23 @@ export class BotGateway {
   private async acceptInbound(message: InboundMessage): Promise<void> {
     this.inboundReceived += 1
     if (this.acceptDiscoveryMessage(message)) return
-    if (!this.authorized(message)) {
+    if (!(await this.authorized(message))) {
       this.inboundUnauthorized += 1
       this.lastInboundDecision = this.makeInboundDiagnostic(message, 'unauthorized', 'not_in_allowlist')
+      if (this.config.access?.pairing !== false && message.target.chatType === 'dm' && message.target.userId !== undefined) {
+        const offer = await this.pairing.request(message.target)
+        if (offer !== undefined) {
+          if (offer.shouldNotify) {
+            await this.sendText(
+              message.target,
+              `此用户还没有完成配对。请把配对码 ${offer.request.code} 提供给 Bot 管理员，在 DSH 设置页的“安全配对”中输入并确认。配对码 1 小时内有效。`,
+              `pairing:${message.target.platform}:${message.target.userId}:${offer.request.code}`,
+            )
+          }
+          this.log('info', `pairing request created for user=${redactId(message.target.userId)}`)
+          return
+        }
+      }
       if (this.config.access?.notifyUnauthorized) {
         await this.sendText(
           message.target,
@@ -657,13 +707,15 @@ export class BotGateway {
     return next
   }
 
-  private authorized(message: InboundMessage): boolean {
+  private async authorized(message: InboundMessage): Promise<boolean> {
     const access = this.config.access ?? {}
     if (access.mode === 'open') return true
     const users = stringList(access.userIds)
     const chats = stringList(access.chatIds)
-    return (message.target.userId !== undefined && users.has(message.target.userId))
-      || chats.has(message.target.chatId)
+    if ((message.target.userId !== undefined && users.has(message.target.userId)) || chats.has(message.target.chatId)) return true
+    return access.pairing === true
+      && message.target.userId !== undefined
+      && await this.pairing.isApproved(message.target.platform, message.target.userId)
   }
 
   private async handleSessionEvent(session: SessionLike, event: unknown): Promise<void> {

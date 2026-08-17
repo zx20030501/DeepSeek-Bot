@@ -6,9 +6,12 @@
 
 1. 填写飞书 App ID。
 2. 填写 App Secret。
-3. 推荐点击“一键测试并自动识别 UID”，按提示把一次性绑定口令发给机器人。
-4. 页面自动填入用户 ID 后，点击“保存并启动”。
-5. 保存成功后，在飞书同一个聊天中发送 `/new` 开始新的会话。
+3. 推荐开启“未知用户私聊时自动回复一次性配对码”。
+4. 点击“保存并启动”。
+5. 未授权用户私聊机器人，机器人回复 8 位配对码；管理员把配对码填入“安全配对”区域并确认。
+6. 配对成功后，在飞书同一个聊天中发送 `/new` 开始新的会话。
+
+也可以点击“一键测试并自动识别 UID”，或直接填写用户 ID / 群聊 ID。配对码只对私聊生效，默认 1 小时过期，确认前不会把陌生用户的普通消息交给 Agent。
 
 App Secret 使用 DSH 的本机凭据库保存，只显示“已配置/未配置”，不会写入项目、settings 文件或 Git。保存后插件会自动重载连接。
 
@@ -27,6 +30,7 @@ App Secret 使用 DSH 的本机凭据库保存，只显示“已配置/未配置
           mode: allowlist
           userIds: [123456789]
           chatIds: []
+          pairing: true
           notifyUnauthorized: false
         profiles:
           default:
@@ -97,11 +101,12 @@ access:
   mode: allowlist
   userIds: [ou_xxxxxxxxxxxx]
   chatIds: [oc_xxxxxxxxxxxx]
+  pairing: true
 ```
 
 默认 `requireMention: true`，因此群聊中需要先 @机器人；单聊不受这个条件影响。Telegram 和飞书可以同时开启，二者共用同一套 DSH profile、WAL、Outbox 和会话治理，但会按 `platform:chatId:threadId` 分开保存会话。
 
-设置页底部的“收到消息诊断”会每 2 秒刷新一次本机内存状态。给机器人发一条新消息后，可以看到长连接是否在线、飞书实际传来的 `open_id` / `chat_id`、是否被群聊 @ 规则过滤，以及是否通过 allowlist。它不记录消息正文，重启 DSH 后会清零。
+设置页底部的“收到消息诊断”会每 2 秒刷新一次本机内存状态。给机器人发一条新消息后，可以看到长连接是否在线、飞书实际传来的 `open_id` / `chat_id`、是否被群聊 @ 规则过滤，以及是否通过 allowlist。它不记录消息正文，重启 DSH 后会清零。配对请求和已确认的配对用户保存在状态目录的 pairing 文件中，不会把 App Secret 写入其中。
 
 ## 状态目录
 
@@ -110,6 +115,7 @@ access:
 ```text
 ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── state.json
+├── pairing.json
 ├── inbound-wal.jsonl
 └── outbox.jsonl
 ```

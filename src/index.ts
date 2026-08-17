@@ -53,6 +53,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
     beginDiscovery: () => gateway.beginDiscovery(),
     discoveryCandidate: () => gateway.discoveryCandidate(),
     clearDiscovery: () => gateway.clearDiscovery(),
+    approvePairing: code => gateway.approvePairing(code),
+    revokePairing: (platform, userId) => gateway.revokePairing(platform, userId),
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
     credentialsCtx.on('credentials/updated', (ref) => {
@@ -75,6 +77,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
 
 export { BotGateway, discoveryCandidateFor } from './gateway.js'
 export { InboundWal, Outbox } from './durable.js'
+export { PairingStore } from './pairing.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
 export { FeishuTransport, toFeishuInbound } from './feishu.js'

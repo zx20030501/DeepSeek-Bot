@@ -57,6 +57,7 @@ test('merges saved setup values and keeps non-form gateway options', () => {
   assert.deepEqual(next.access, {
     mode: 'allowlist',
     notifyUnauthorized: true,
+    pairing: true,
     userIds: ['ou_new'],
     chatIds: ['oc_new'],
   })

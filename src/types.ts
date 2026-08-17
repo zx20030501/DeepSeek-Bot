@@ -120,6 +120,8 @@ export interface BotAccessConfig {
   readonly mode?: 'allowlist' | 'open'
   readonly userIds?: readonly (string | number)[]
   readonly chatIds?: readonly (string | number)[]
+  /** Unknown direct-message senders receive a one-time pairing code. */
+  readonly pairing?: boolean
   readonly notifyUnauthorized?: boolean
 }
 
@@ -189,4 +191,21 @@ export interface DshAgentOptions {
 export interface ModelOverride {
   readonly provider?: string
   readonly model: string
+}
+
+export interface PairingRequest {
+  readonly code: string
+  readonly platform: string
+  readonly userId: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly lastNotifiedAt: number
+}
+
+export interface PairingApproval {
+  readonly platform: string
+  readonly userId: string
+  readonly approvedAt: number
 }

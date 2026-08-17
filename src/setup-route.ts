@@ -29,6 +29,8 @@ export interface SetupRouteActions {
   beginDiscovery?: () => GatewayDiscoveryStatus
   discoveryCandidate?: () => GatewayDiscoveryCandidate | undefined
   clearDiscovery?: () => void
+  approvePairing?: (code: string) => Promise<GatewayDiscoveryCandidate | undefined>
+  revokePairing?: (platform: string, userId: string) => Promise<boolean>
 }
 
 class SetupRequestError extends Error {
@@ -155,8 +157,33 @@ async function handleRequest(
 
   const body = await readJson(req)
   const action = body.action === undefined ? 'save' : body.action
-  if (action !== 'save' && action !== 'diagnose') {
+  if (action !== 'save' && action !== 'diagnose' && action !== 'pairing_approve' && action !== 'pairing_revoke') {
     throw new SetupRequestError(400, '不认识的设置操作。')
+  }
+  if (action === 'pairing_approve') {
+    const code = typeof body.pairingCode === 'string' ? body.pairingCode.trim() : ''
+    if (code === '') throw new SetupRequestError(400, '请输入配对码。')
+    if (actions.approvePairing === undefined) throw new SetupRequestError(503, '配对服务还没有准备好，请稍后再试。')
+    const candidate = await actions.approvePairing(code)
+    if (candidate === undefined) throw new SetupRequestError(404, '配对码不存在、已使用或已过期。请让用户重新给机器人发一条私聊消息。')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, {
+      ...snapshot,
+      pairingCandidate: candidate,
+      message: '配对成功。该用户会收到提示，请在飞书同一个聊天中发送 /new 开始新的会话；如需把 UID 同步到白名单文本框，请点击“保存并启动”。',
+    })
+    return
+  }
+  if (action === 'pairing_revoke') {
+    const platform = typeof body.platform === 'string' ? body.platform.trim() : ''
+    const userId = typeof body.userId === 'string' ? body.userId.trim() : ''
+    if (platform === '' || userId === '') throw new SetupRequestError(400, '缺少要取消配对的用户信息。')
+    if (actions.revokePairing === undefined) throw new SetupRequestError(503, '配对服务还没有准备好，请稍后再试。')
+    const removed = await actions.revokePairing(platform, userId)
+    if (!removed) throw new SetupRequestError(404, '没有找到这条已确认的配对记录。')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: '已取消该用户的配对权限。' })
+    return
   }
   let settings: HermesBotSettings
   try {
@@ -177,7 +204,7 @@ async function handleRequest(
       access: { ...settings.access, userIds: [candidate.userId], chatIds: currentChatIds },
     }
   }
-  if (action === 'save' && normalizedIds(settings.access.userIds).length === 0 && normalizedIds(settings.access.chatIds).length === 0) {
+  if (action === 'save' && settings.access.pairing !== true && normalizedIds(settings.access.userIds).length === 0 && normalizedIds(settings.access.chatIds).length === 0) {
     throw new SetupRequestError(400, '请先点击“测试并自动识别 UID”，或填写一个用户 ID / 群聊 ID。')
   }
   if (action === 'diagnose') {
