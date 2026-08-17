@@ -21,6 +21,7 @@ interface SetupRouteSnapshot {
     writable: boolean
     source?: string
   }
+  diagnostics: Record<string, unknown>
 }
 
 class SetupRequestError extends Error {
@@ -100,7 +101,11 @@ function normalizedIds(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))]
 }
 
-async function readSnapshot(ctx: Context, source: () => HermesBotSettings): Promise<SetupRouteSnapshot> {
+async function readSnapshot(
+  ctx: Context,
+  source: () => HermesBotSettings,
+  diagnostics: () => Record<string, unknown>,
+): Promise<SetupRouteSnapshot> {
   const settings = ctx.get('settings')
   const credentials = ctx.get('credentials')
   const info = credentials === undefined
@@ -114,12 +119,14 @@ async function readSnapshot(ctx: Context, source: () => HermesBotSettings): Prom
       writable: info.writable,
       ...(info.source === undefined ? {} : { source: info.source }),
     },
+    diagnostics: diagnostics(),
   }
 }
 
 async function handleRequest(
   ctx: Context,
   source: () => HermesBotSettings,
+  diagnostics: () => Record<string, unknown>,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -129,7 +136,7 @@ async function handleRequest(
   }
 
   if (req.method === 'GET') {
-    sendJson(res, 200, await readSnapshot(ctx, source))
+    sendJson(res, 200, await readSnapshot(ctx, source, diagnostics))
     return
   }
   if (req.method !== 'POST') {
@@ -177,17 +184,21 @@ async function handleRequest(
     await credentials!.set(credentialRef(HERMES_BOT_FEISHU_SECRET_REF), appSecret)
   }
   await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, settings)
-  sendJson(res, 200, await readSnapshot(ctx, source))
+  sendJson(res, 200, await readSnapshot(ctx, source, diagnostics))
 }
 
 /** Mount the plugin-owned setup route when DSH is running its Web surface. */
-export function installSetupRoute(ctx: Context, source: () => HermesBotSettings): void {
+export function installSetupRoute(
+  ctx: Context,
+  source: () => HermesBotSettings,
+  diagnostics: () => Record<string, unknown> = () => ({}),
+): void {
   ctx.inject(['webServer'], (webCtx) => {
     const route: WebRoute = {
       kind: 'exact',
       path: HERMES_BOT_SETUP_ROUTE,
       handler: (req, res) => {
-        void handleRequest(ctx, source, req, res).catch(error => {
+        void handleRequest(ctx, source, diagnostics, req, res).catch(error => {
           if (error instanceof SetupRequestError) {
             sendJson(res, error.status, { error: error.message })
             return

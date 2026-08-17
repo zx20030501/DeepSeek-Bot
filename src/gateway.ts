@@ -22,7 +22,9 @@ import type {
   BotTarget,
   BotTransport,
   ChatBinding,
+  GatewayInboundDiagnostics,
   InboundMessage,
+  InboundDecisionDiagnostic,
   ModelOverride,
   OutboxItem,
 } from './types.js'
@@ -139,6 +141,11 @@ export class BotGateway {
   private stopped = false
   private running = false
   private durableLoaded = false
+  private inboundReceived = 0
+  private inboundAccepted = 0
+  private inboundUnauthorized = 0
+  private inboundDuplicate = 0
+  private lastInboundDecision: InboundDecisionDiagnostic | null = null
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -236,6 +243,7 @@ export class BotGateway {
       accessMode: config.mode ?? 'allowlist',
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
+      inbound: this.inboundDiagnostics(),
     }
   }
 
@@ -304,7 +312,10 @@ export class BotGateway {
   }
 
   private async acceptInbound(message: InboundMessage): Promise<void> {
+    this.inboundReceived += 1
     if (!this.authorized(message)) {
+      this.inboundUnauthorized += 1
+      this.lastInboundDecision = this.makeInboundDiagnostic(message, 'unauthorized', 'not_in_allowlist')
       if (this.config.access?.notifyUnauthorized) {
         await this.sendText(
           message.target,
@@ -316,8 +327,42 @@ export class BotGateway {
       return
     }
     const accepted = await this.wal.accept(message)
-    if (!accepted.inserted || accepted.item.state !== 'accepted') return
+    if (!accepted.inserted || accepted.item.state !== 'accepted') {
+      this.inboundDuplicate += 1
+      this.lastInboundDecision = this.makeInboundDiagnostic(message, 'duplicate', accepted.inserted ? `wal_${accepted.item.state}` : 'already_seen')
+      return
+    }
+    this.inboundAccepted += 1
+    this.lastInboundDecision = this.makeInboundDiagnostic(message, 'accepted', 'allowlist_passed')
     void this.queueInbound(message, accepted.item.id)
+  }
+
+  private inboundDiagnostics(): GatewayInboundDiagnostics {
+    return {
+      received: this.inboundReceived,
+      accepted: this.inboundAccepted,
+      unauthorized: this.inboundUnauthorized,
+      duplicate: this.inboundDuplicate,
+      last: this.lastInboundDecision,
+    }
+  }
+
+  private makeInboundDiagnostic(
+    message: InboundMessage,
+    decision: InboundDecisionDiagnostic['decision'],
+    reason: string,
+  ): InboundDecisionDiagnostic {
+    return {
+      receivedAt: Date.now(),
+      platform: message.target.platform,
+      messageId: message.id,
+      ...(message.target.userId === undefined ? {} : { userId: message.target.userId }),
+      chatId: message.target.chatId,
+      ...(message.target.chatType === undefined ? {} : { chatType: message.target.chatType }),
+      textLength: message.text.length,
+      decision,
+      reason,
+    }
   }
 
   private async queueInbound(message: InboundMessage, walId: string): Promise<void> {

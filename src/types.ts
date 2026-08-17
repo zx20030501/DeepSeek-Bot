@@ -31,6 +31,44 @@ export interface BotTransport {
   status?(): Record<string, unknown>
 }
 
+/**
+ * Short-lived, local-only information used by the setup page to explain why a
+ * message did or did not enter the gateway. It intentionally contains no
+ * message body and is never written to the durable state files.
+ */
+export interface FeishuEventDiagnostic {
+  readonly receivedAt: number
+  readonly messageId?: string
+  readonly userId?: string
+  readonly chatId?: string
+  readonly chatType?: string
+  readonly mentionedBot?: boolean
+  readonly textLength: number
+  readonly resourceCount: number
+  readonly normalized: boolean
+  readonly reason: string
+}
+
+export interface InboundDecisionDiagnostic {
+  readonly receivedAt: number
+  readonly platform: string
+  readonly messageId: string
+  readonly userId?: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+  readonly textLength: number
+  readonly decision: 'accepted' | 'unauthorized' | 'duplicate'
+  readonly reason: string
+}
+
+export interface GatewayInboundDiagnostics {
+  readonly received: number
+  readonly accepted: number
+  readonly unauthorized: number
+  readonly duplicate: number
+  readonly last: InboundDecisionDiagnostic | null
+}
+
 export interface BotProfile {
   readonly name: string
   readonly title?: string

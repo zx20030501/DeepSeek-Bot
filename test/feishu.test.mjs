@@ -76,6 +76,12 @@ test('Feishu transport connects, receives normalized events, and sends markdown'
     input: { markdown: '**answer**' },
     options: { replyTo: 'om_parent', replyInThread: true },
   }])
+  const diagnostics = transport.status()
+  assert.equal(diagnostics.inbound.received, 1)
+  assert.equal(diagnostics.inbound.last.userId, 'ou_test_user')
+  assert.equal(diagnostics.inbound.last.chatId, 'oc_test_chat')
+  assert.equal(diagnostics.inbound.last.normalized, true)
+  assert.equal(diagnostics.inbound.last.reason, 'normalized')
   await transport.stop()
   await loop
   assert.equal(disconnected, true)

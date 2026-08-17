@@ -100,6 +100,8 @@ access:
 
 默认 `requireMention: true`，因此群聊中需要先 @机器人；单聊不受这个条件影响。Telegram 和飞书可以同时开启，二者共用同一套 DSH profile、WAL、Outbox 和会话治理，但会按 `platform:chatId:threadId` 分开保存会话。
 
+设置页底部的“收到消息诊断”会每 2 秒刷新一次本机内存状态。给机器人发一条新消息后，可以看到长连接是否在线、飞书实际传来的 `open_id` / `chat_id`、是否被群聊 @ 规则过滤，以及是否通过 allowlist。它不记录消息正文，重启 DSH 后会清零。
+
 ## 状态目录
 
 默认：

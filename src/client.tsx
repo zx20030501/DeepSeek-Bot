@@ -33,14 +33,62 @@ interface CredentialState {
   source?: string
 }
 
+interface DiagnosticEvent {
+  receivedAt?: number
+  messageId?: string
+  userId?: string
+  chatId?: string
+  chatType?: string
+  mentionedBot?: boolean
+  textLength?: number
+  resourceCount?: number
+  normalized?: boolean
+  reason?: string
+}
+
+interface DiagnosticDecision {
+  receivedAt?: number
+  platform?: string
+  messageId?: string
+  userId?: string
+  chatId?: string
+  chatType?: string
+  textLength?: number
+  decision?: string
+  reason?: string
+}
+
+interface Diagnostics {
+  enabled?: boolean
+  accessMode?: string
+  transports?: Record<string, {
+    running?: boolean
+    connected?: boolean
+    inbound?: {
+      received?: number
+      last?: DiagnosticEvent | null
+    }
+    lastError?: string
+  }>
+  inbound?: {
+    received?: number
+    accepted?: number
+    unauthorized?: number
+    duplicate?: number
+    last?: DiagnosticDecision | null
+  }
+}
+
 interface SetupState {
   readonly status: 'loading' | 'ready' | 'unavailable'
   readonly settings?: HermesBotSettings
   readonly writable: boolean
   readonly credential: CredentialState
+  readonly diagnostics: Diagnostics
   readonly saving: boolean
   readonly message?: string | undefined
   readonly error?: string | undefined
+  readonly diagnosticsError?: string | undefined
 }
 
 interface Draft {
@@ -56,6 +104,10 @@ interface Draft {
 
 function emptyCredential(): CredentialState {
   return { configured: false, writable: false }
+}
+
+function emptyDiagnostics(): Diagnostics {
+  return {}
 }
 
 function splitIds(value: string): string[] {
@@ -84,6 +136,7 @@ class FeishuSetupController {
       status: 'loading',
       writable: false,
       credential: emptyCredential(),
+      diagnostics: emptyDiagnostics(),
       saving: false,
     })
     void this.refresh()
@@ -104,10 +157,24 @@ class FeishuSetupController {
         settings: data.settings,
         writable: data.writable,
         credential: data.credential,
+        diagnostics: data.diagnostics,
+        diagnosticsError: undefined,
         error: undefined,
       })
     } catch (error) {
       this.publish({ status: 'unavailable', error: `读取飞书机器人设置失败：${String(error)}` })
+    }
+  }
+
+  public async refreshDiagnostics(): Promise<void> {
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, { headers: { accept: 'application/json' } })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ diagnostics: data.diagnostics, diagnosticsError: undefined })
+    } catch (error) {
+      this.publish({ diagnosticsError: `读取消息诊断失败：${String(error)}` })
     }
   }
 
@@ -164,8 +231,10 @@ class FeishuSetupController {
         settings: data.settings,
         writable: data.writable,
         credential: data.credential,
+        diagnostics: data.diagnostics,
         message: '已保存，机器人正在自动启动。',
         error: undefined,
+        diagnosticsError: undefined,
       })
     } catch (error) {
       this.publish({ error: `保存失败：${String(error)}` })
@@ -191,6 +260,7 @@ interface SetupResponse {
   readonly settings: HermesBotSettings
   readonly writable: boolean
   readonly credential: CredentialState
+  readonly diagnostics: Diagnostics
 }
 
 async function readRouteBody(response: Response): Promise<Record<string, unknown>> {
@@ -220,6 +290,11 @@ function setupResponseFromBody(body: Record<string, unknown>): SetupResponse {
       writable: record.writable === true,
       ...(typeof record.source === 'string' ? { source: record.source } : {}),
     },
+    diagnostics: body.diagnostics !== null
+      && typeof body.diagnostics === 'object'
+      && !Array.isArray(body.diagnostics)
+      ? body.diagnostics as Diagnostics
+      : emptyDiagnostics(),
   }
 }
 
@@ -227,6 +302,67 @@ type SettingsProps = PropsRuntime<'settings.section'> & { controller?: FeishuSet
 
 function Field(props: { label: string; hint?: string; children: React.ReactNode }) {
   return <label className="dsh-hermes-field"><span>{props.label}</span>{props.children}{props.hint === undefined ? null : <small>{props.hint}</small>}</label>
+}
+
+function formatDiagnosticTime(value: number | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  return new Date(value).toLocaleString()
+}
+
+function diagnosticDecisionLabel(value: string | undefined): string {
+  if (value === 'accepted') return '已通过白名单'
+  if (value === 'unauthorized') return '未通过白名单'
+  if (value === 'duplicate') return '重复消息'
+  return '—'
+}
+
+function DiagnosticPanel({
+  diagnostics,
+  error,
+  onRefresh,
+}: {
+  diagnostics: Diagnostics
+  error?: string | undefined
+  onRefresh: () => void
+}) {
+  const feishu = diagnostics.transports?.feishu
+  const event = feishu?.inbound?.last ?? null
+  const decision = diagnostics.inbound?.last ?? null
+  const userId = decision?.userId ?? event?.userId
+  const chatId = decision?.chatId ?? event?.chatId
+  const connected = feishu?.connected === true
+  const received = feishu?.inbound?.received ?? 0
+  const accepted = diagnostics.inbound?.accepted ?? 0
+  const unauthorized = diagnostics.inbound?.unauthorized ?? 0
+
+  return (
+    <section className="dsh-hermes-panel dsh-hermes-diagnostic">
+      <div className="dsh-hermes-diagnostic-head">
+        <div><h3>收到消息诊断</h3><p className="dsh-hermes-muted">只保存在内存中，重启 DSH 后会清零；不会记录消息正文或 App Secret。</p></div>
+        <button type="button" className="dsh-hermes-secondary" onClick={onRefresh}>刷新诊断</button>
+      </div>
+      {error === undefined ? null : <div className="dsh-hermes-alert dsh-hermes-error">{error}</div>}
+      <div className="dsh-hermes-diagnostic-grid">
+        <div><span>长连接</span><strong>{feishu === undefined ? '未发现飞书传输' : connected ? '已连接' : feishu.running ? '正在连接' : '未连接'}</strong></div>
+        <div><span>收到事件</span><strong>{String(received)}</strong></div>
+        <div><span>通过白名单</span><strong>{String(accepted)}</strong></div>
+        <div><span>被白名单拦截</span><strong>{String(unauthorized)}</strong></div>
+      </div>
+      {event === null && decision === null ? (
+        <div className="dsh-hermes-diagnostic-empty">目前还没有收到飞书事件。请先点击“刷新诊断”，再给机器人发一条新消息。</div>
+      ) : (
+        <div className="dsh-hermes-diagnostic-details">
+          <div><span>实际收到的 user/open_id</span><code>{userId ?? '—'}</code></div>
+          <div><span>实际收到的群聊 ID</span><code>{chatId ?? '—'}</code></div>
+          <div><span>是否 @机器人</span><strong>{event?.mentionedBot === undefined ? '—' : event.mentionedBot ? '是' : '否'}</strong></div>
+          <div><span>白名单判断</span><strong>{diagnosticDecisionLabel(decision?.decision)}</strong></div>
+          <div><span>诊断原因</span><strong>{decision?.reason ?? event?.reason ?? '—'}</strong></div>
+          <div><span>最近时间</span><strong>{formatDiagnosticTime(decision?.receivedAt ?? event?.receivedAt)}</strong></div>
+        </div>
+      )}
+      {feishu?.lastError === undefined ? null : <div className="dsh-hermes-alert dsh-hermes-error">最近一次错误：{feishu.lastError}</div>}
+    </section>
+  )
 }
 
 function SettingsSection({ controller }: SettingsProps) {
@@ -243,6 +379,12 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
   useEffect(() => {
     if (settings !== undefined) setDraft(draftOf(settings))
   }, [settings])
+
+  useEffect(() => {
+    void controller.refreshDiagnostics()
+    const timer = window.setInterval(() => { void controller.refreshDiagnostics() }, 2_000)
+    return () => window.clearInterval(timer)
+  }, [controller])
 
   if (state.status === 'unavailable') {
     return <div className="dsh-hermes-settings"><div className="dsh-hermes-alert dsh-hermes-error">{state.error ?? '当前 DSH 没有提供可用的设置服务。'}</div></div>
@@ -296,6 +438,8 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.requireMention} onChange={event => { update('requireMention', event.target.checked) }} /><span>群聊消息必须 @机器人</span></label>
       </section>
 
+      <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
+
       <section className="dsh-hermes-panel dsh-hermes-actions">
         <label className="dsh-hermes-check"><input type="checkbox" checked={draft.enabled} onChange={event => { update('enabled', event.target.checked) }} /><span>保存后启用机器人</span></label>
         <button type="button" className="dsh-hermes-primary" disabled={!state.writable || state.saving} onClick={save}>{state.saving ? '正在保存…' : '保存并启动'}</button>
@@ -309,6 +453,7 @@ const CSS = `
 .dsh-hermes-header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:8px 2px}.dsh-hermes-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}.dsh-hermes-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}.dsh-hermes-kicker{font-size:10px;letter-spacing:.1em;color:#6758d4;font-weight:700}.dsh-hermes-badge{font-size:10px;padding:4px 8px;border-radius:999px;font-weight:650;white-space:nowrap}.dsh-hermes-badge.ok{background:rgba(48,154,100,.12);color:#267d52}.dsh-hermes-badge.missing{background:rgba(205,72,72,.1);color:#aa3939}
 .dsh-hermes-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}.dsh-hermes-notice{background:rgba(92,108,213,.09);color:#5149a6}.dsh-hermes-warning{background:rgba(224,162,55,.12);color:#986818}.dsh-hermes-error{background:rgba(205,72,72,.1);color:#aa3939}.dsh-hermes-success{background:rgba(48,154,100,.1);color:#267d52}.dsh-hermes-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
+.dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 
 function installStyles(): () => void {

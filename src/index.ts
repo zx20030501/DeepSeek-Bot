@@ -49,11 +49,15 @@ export function apply(ctx: Context, config: unknown = {}): void {
       onChange: () => { refreshGateway() },
     },
   )
-  installSetupRoute(ctx, () => settingsSource())
+  installSetupRoute(ctx, () => settingsSource(), () => gateway.status())
   ctx.inject(['credentials'], (credentialsCtx) => {
     credentialsCtx.on('credentials/updated', (ref) => {
       if (String(ref) === HERMES_BOT_FEISHU_SECRET_REF) refreshGateway()
     })
+    // The settings scope can attach before the credential service finishes
+    // becoming available. Re-apply once here so a saved App Secret also
+    // starts the transport after a DSH restart, not only after a form save.
+    refreshGateway()
   })
 
   ctx.on('session/event', (session, event) => gateway.onSessionEvent(session, event))
