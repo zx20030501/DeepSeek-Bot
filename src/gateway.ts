@@ -88,7 +88,7 @@ function collaborationPrompt(message: BotMessageEnvelope): string {
     message.expectReply
       ? 'Return a concise result for the requesting Bot. Do not call external messaging APIs.'
       : 'This is a report message. Summarize or use it as context; no Bot reply is required.',
-  ].join('\\n')
+  ].join('\n')
 }
 
 export function discoveryCandidateFor(
@@ -838,7 +838,7 @@ export class BotGateway {
       run.reject(error)
       return
     }
-    const text = run.parts.join('\\n').trim()
+    const text = run.parts.join('\n').trim()
     run.resolve(text ? { text } : {})
   }
 
