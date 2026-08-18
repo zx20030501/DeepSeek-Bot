@@ -87,6 +87,7 @@ test('Task/Run records and Group Room limits survive their state transitions', a
       task.id,
       ['researcher', 'writer'],
     )
+    assert.equal((await tasks.attachRoom(task.id, room.id, 'captain'))?.roomId, room.id)
     await rooms.append(room.id, 'user:feishu:ou_user', '协作')
     assert.equal((await rooms.reserveNext(room.id))?.botId, 'researcher')
     await rooms.append(room.id, 'researcher', '研究结果')
