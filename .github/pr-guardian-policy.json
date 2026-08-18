@@ -10,8 +10,9 @@
   "manualReviewPaths": [
     "^\\.github/workflows/",
     "^\\.github/actions/",
+    "^\\.github/pr-guardian\\.(mjs|json)$",
     "^(package\\.json|package-lock\\.json)$",
     "(^|/)(credential|secret|security|auth|pairing)(\\.|/|$)",
-    "^src/(feishu|telegram|gateway|harness-bridge|setup-security|setup)\\.ts$"
+    "^src/(feishu|telegram|gateway|harness-bridge|setup-security|setup|setup-route)\\.ts$"
   ]
 }
