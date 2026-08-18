@@ -1,0 +1,70 @@
+name: PR Guardian
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-guardian-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.review.outputs.verdict }}
+      autofix: ${{ steps.review.outputs.autofix }}
+      automerge: ${{ steps.review.outputs.automerge }}
+      trusted: ${{ steps.review.outputs.trusted }}
+    steps:
+      - name: Checkout the trusted base branch
+        uses: actions/checkout@v4
+      - name: Review pull request diff
+        id: review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: node .github/pr-guardian.mjs review
+
+  autofix:
+    needs: review
+    if: needs.review.outputs.autofix == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository base
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply constrained AI fix
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: node .github/pr-guardian.mjs fix
+
+  auto-merge:
+    needs: review
+    if: needs.review.outputs.automerge == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable GitHub auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge "$PR_URL" --auto --squash --delete-branch
