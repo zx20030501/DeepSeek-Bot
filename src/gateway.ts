@@ -1,4 +1,4 @@
-import { randomInt } from 'node:crypto'
+import { randomInt, randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
@@ -17,7 +17,19 @@ import { JsonState } from './state.js'
 import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
+import {
+  BotDirectory,
+  BotMailbox,
+  GroupRoomStore,
+  TaskRunStore,
+  createEnvelope,
+  parseBotMentions,
+  type MailboxLease,
+} from './collaboration.js'
 import type {
+  BotMessageEnvelope,
+  BotDescriptor,
+  BotCollaborationConfig,
   BotGatewayConfig,
   BotProfile,
   BotStateFile,
@@ -31,6 +43,8 @@ import type {
   OutboxItem,
   GatewayDiscoveryCandidate,
   GatewayDiscoveryStatus,
+  RunRecord,
+  TaskRecord,
 } from './types.js'
 
 interface SessionLike { readonly id: unknown }
@@ -39,6 +53,15 @@ interface DiscoveryState {
   readonly command: string
   readonly expiresAt: number
   readonly candidate?: GatewayDiscoveryCandidate
+}
+
+interface InternalRun {
+  readonly runId: string
+  readonly botId: string
+  readonly sessionId: string
+  readonly lease: MailboxLease
+  readonly envelope: BotMessageEnvelope
+  readonly texts: string[]
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -105,6 +128,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
   const telegram = asRecord(input.telegram)
   const feishu = asRecord(input.feishu)
   const access = asRecord(input.access)
+  const collaboration = asRecord(input.collaboration)
   const envUsers = (firstEnv('DEEPSEEK_BOT_ALLOWED_USERS', 'DSH_HERMES_BOT_ALLOWED_USERS') ?? '').split(',').map(item => item.trim()).filter(Boolean)
   const envChats = (firstEnv('DEEPSEEK_BOT_ALLOWED_CHATS', 'DSH_HERMES_BOT_ALLOWED_CHATS') ?? '').split(',').map(item => item.trim()).filter(Boolean)
   const telegramToken = typeof telegram.token === 'string'
@@ -152,6 +176,14 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
     outboxMaxAttempts: typeof input.outboxMaxAttempts === 'number' ? input.outboxMaxAttempts : 5,
     retryBaseMs: typeof input.retryBaseMs === 'number' ? input.retryBaseMs : 1_000,
     retryMaxMs: typeof input.retryMaxMs === 'number' ? input.retryMaxMs : 60_000,
+    collaboration: {
+      enabled: collaboration.enabled !== false,
+      maxGroupBots: typeof collaboration.maxGroupBots === 'number' ? collaboration.maxGroupBots : 6,
+      maxGroupTurns: typeof collaboration.maxGroupTurns === 'number' ? collaboration.maxGroupTurns : 3,
+      maxGroupMessages: typeof collaboration.maxGroupMessages === 'number' ? collaboration.maxGroupMessages : 10,
+      mailboxMaxAttempts: typeof collaboration.mailboxMaxAttempts === 'number' ? collaboration.mailboxMaxAttempts : 3,
+      mailboxLeaseMs: typeof collaboration.mailboxLeaseMs === 'number' ? collaboration.mailboxLeaseMs : 120_000,
+    },
   }
 }
 
@@ -159,10 +191,14 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
 export class BotGateway {
   private config: BotGatewayConfig
   private readonly profiles: Map<string, BotProfile>
+  private readonly directory: BotDirectory
   private readonly state: JsonState<BotStateFile>
   private readonly pairing: PairingStore
   private readonly wal: InboundWal
   private readonly outbox: Outbox
+  private readonly mailbox: BotMailbox
+  private readonly tasks: TaskRunStore
+  private readonly rooms: GroupRoomStore
   private transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
   private readonly lanes = new Map<string, Promise<void>>()
@@ -180,6 +216,12 @@ export class BotGateway {
   private discovery: DiscoveryState | undefined
   /** Latest inbound target, including reply context, for each live session. */
   private readonly sessionTargets = new Map<string, BotTarget>()
+  private readonly internalRuns = new Map<string, InternalRun>()
+  private readonly internalRunBySession = new Map<string, string>()
+  private readonly activeBotRuns = new Map<string, string>()
+  private readonly collaborationWorkerId = `mesh-${process.pid}-${randomUUID()}`
+  private collaborationDrain: Promise<void> | undefined
+  private collaborationDrainTimer: ReturnType<typeof setTimeout> | undefined
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -187,6 +229,7 @@ export class BotGateway {
     if (!this.profiles.has(this.config.defaultProfile ?? 'default')) {
       this.profiles.set('default', { name: 'default', title: 'Hermes' })
     }
+    this.directory = new BotDirectory(this.profiles.values())
     const stateDir = resolve(
       this.config.stateDir
         ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'hermes-bot'),
@@ -194,6 +237,9 @@ export class BotGateway {
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
     this.pairing = new PairingStore(join(stateDir, 'pairing.json'))
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
+    this.mailbox = new BotMailbox(join(stateDir, 'mailbox.jsonl'), this.config.collaboration)
+    this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
+    this.rooms = new GroupRoomStore(join(stateDir, 'rooms.json'), this.config.collaboration)
     this.transports = []
     this.transportByPlatform = new Map()
     this.installTransports(this.config)
@@ -233,6 +279,8 @@ export class BotGateway {
     this.discovery = undefined
     for (const timer of this.inboundRetryTimers) clearTimeout(timer)
     this.inboundRetryTimers.clear()
+    if (this.collaborationDrainTimer) clearTimeout(this.collaborationDrainTimer)
+    this.collaborationDrainTimer = undefined
     await this.started.catch(() => undefined)
     await this.stopTransports()
     await this.outbox.stop()
@@ -262,6 +310,7 @@ export class BotGateway {
     if (!this.profiles.has(next.defaultProfile ?? 'default')) {
       this.profiles.set('default', { name: 'default', title: 'Hermes' })
     }
+    this.directory.replace(this.profiles.values())
   }
 
   public onSessionEvent(session: SessionLike, event: unknown): void {
@@ -278,6 +327,18 @@ export class BotGateway {
       ])),
       accessMode: config.mode ?? 'allowlist',
       profileCount: this.profiles.size,
+      bots: this.directory.list().map(bot => ({
+        id: bot.id,
+        title: bot.title,
+        capabilities: [...bot.capabilities],
+        skills: [...bot.skills],
+        canonicalSessionId: bot.canonicalSessionId,
+      })),
+      collaboration: {
+        enabled: this.config.collaboration?.enabled !== false,
+        activeRuns: this.activeBotRuns.size,
+        workerId: this.collaborationWorkerId,
+      },
       laneCount: this.lanes.size,
       inbound: this.inboundDiagnostics(),
       pairing: {
@@ -356,6 +417,8 @@ export class BotGateway {
     await this.pairing.load()
     await this.wal.load()
     await this.outbox.load()
+    await this.mailbox.load()
+    await this.tasks.load()
     this.durableLoaded = true
   }
 
@@ -378,6 +441,7 @@ export class BotGateway {
         void this.queueInbound(item.message, item.id)
       }
       void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
+      void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration recovery failed: ${String(error)}`))
     }
     for (const transport of this.transports) {
       void transport.start(message => this.acceptInbound(message)).catch(error => {
@@ -517,6 +581,17 @@ export class BotGateway {
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)
     if (command && await this.handleLocalCommand(message, walId, binding, command.name, command.args)) return
+    if (this.config.collaboration?.enabled !== false) {
+      const mentions = parseBotMentions(
+        message.text,
+        this.directory.ids(),
+        this.config.collaboration?.maxGroupBots ?? 6,
+      )
+      if (mentions.botIds.length) {
+        await this.handleCollaborationRequest(message, walId, binding, mentions.botIds, mentions.instruction)
+        return
+      }
+    }
     const claimed = await this.wal.claim(walId, binding.sessionId)
     if (!claimed || !this.bridge) return
     try {
@@ -541,6 +616,333 @@ export class BotGateway {
     } catch (error: unknown) {
       await this.handleInboundFailure(message, walId, error)
     }
+  }
+
+  private async handleCollaborationRequest(
+    message: InboundMessage,
+    walId: string,
+    binding: ChatBinding,
+    botIds: readonly string[],
+    instruction: string,
+  ): Promise<void> {
+    const validBots = botIds.filter(botId => this.directory.get(botId)?.enabled)
+    if (!validBots.length) return
+    try {
+      const claimed = await this.wal.claim(walId, binding.sessionId)
+      if (!claimed) return
+      const from = `user:${message.target.platform}:${message.target.userId ?? message.target.chatId}`
+      const task = await this.tasks.createTask({
+        title: instruction,
+        instruction,
+        createdBy: from,
+        assignedTo: validBots[0]!,
+        acceptanceCriteria: [],
+        priority: 50,
+      })
+      let roomId: string | undefined
+      let roomEpoch: number | undefined
+      let assignedBot = validBots[0]!
+      if (validBots.length > 1) {
+        const room = await this.rooms.open(message.target, task.id, validBots)
+        roomId = room.id
+        roomEpoch = room.epoch
+        await this.rooms.append(room.id, from, instruction)
+        const first = await this.rooms.reserveNext(room.id)
+        if (!first) throw new Error('could not reserve the first Group Room turn')
+        assignedBot = first.botId
+      }
+      const run = await this.tasks.createRun(task.id, assignedBot, 1)
+      const transcript = roomId ? await this.rooms.transcript(roomId) : []
+      const envelope = createEnvelope({
+        from,
+        to: assignedBot,
+        taskId: task.id,
+        runId: run.id,
+        attemptId: run.attemptId,
+        correlationId: task.id,
+        ...(roomId === undefined ? {} : { roomId }),
+        ...(roomEpoch === undefined ? {} : { epoch: roomEpoch }),
+        payload: {
+          instruction,
+          acceptanceCriteria: [],
+          replyTarget: message.target,
+          ...(roomId === undefined ? {} : { transcript }),
+        },
+      })
+      await this.mailbox.enqueue(envelope, `task:${task.id}:run:${run.id}`)
+      await this.tasks.audit('message', envelope.id, from, 'message.queued', {
+        taskId: task.id,
+        to: assignedBot,
+        roomId: roomId ?? null,
+      }, envelope.correlationId)
+      const label = validBots.map(botId => `@${botId}`).join('、')
+      await this.sendText(
+        message.target,
+        roomId === undefined
+          ? `已将任务交给 ${label}。任务 ID：${task.id}`
+          : `已创建 ${label} 协作房间，最多进行 3 轮协作。任务 ID：${task.id}`,
+        `mesh-ack:${message.id}`,
+      )
+      await this.wal.complete(walId)
+      void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration dispatch failed: ${String(error)}`))
+    } catch (error: unknown) {
+      await this.handleInboundFailure(
+        message,
+        walId,
+        error,
+        false,
+        `Bot 协作任务创建失败：${String(error)}`,
+        `mesh-error:${message.id}`,
+      )
+    }
+  }
+
+  private async drainCollaboration(): Promise<void> {
+    if (this.config.collaboration?.enabled === false || this.stopped || !this.running) return
+    if (this.collaborationDrain) return this.collaborationDrain
+    const drain = this.runCollaborationLoop().finally(() => {
+      if (this.collaborationDrain === drain) this.collaborationDrain = undefined
+    })
+    this.collaborationDrain = drain
+    return drain
+  }
+
+  private async runCollaborationLoop(): Promise<void> {
+    if (!this.bridge) return
+    while (!this.stopped && this.running) {
+      const lease = await this.mailbox.claim(
+        this.directory.ids(),
+        this.collaborationWorkerId,
+        new Set(this.activeBotRuns.keys()),
+      )
+      if (!lease) return
+      const bot = this.directory.get(lease.item.envelope.to)
+      if (!bot) {
+        await this.mailbox.fail(lease, `unknown Bot: ${lease.item.envelope.to}`, false)
+        continue
+      }
+      const acknowledged = await this.mailbox.acknowledge(lease)
+      if (!acknowledged) continue
+      const runningItem = await this.mailbox.start({ ...lease, item: acknowledged })
+      if (!runningItem) continue
+      const runningLease: MailboxLease = { ...lease, item: runningItem }
+      const task = await this.tasks.task(lease.item.envelope.taskId)
+      const run = await this.tasks.startRun(lease.item.envelope.runId) ?? await this.tasks.run(lease.item.envelope.runId)
+      if (!task || !run || !['queued', 'running'].includes(run.status)) {
+        await this.mailbox.fail(runningLease, 'task or run is unavailable', false)
+        continue
+      }
+      const profile = this.profiles.get(bot.profile)
+      if (!profile) {
+        await this.mailbox.fail(runningLease, `profile unavailable: ${bot.profile}`, false)
+        await this.tasks.failRun(run.id, `profile unavailable: ${bot.profile}`)
+        continue
+      }
+      const internal: InternalRun = {
+        runId: run.id,
+        botId: bot.id,
+        sessionId: bot.canonicalSessionId,
+        lease: runningLease,
+        envelope: lease.item.envelope,
+        texts: [],
+      }
+      this.internalRuns.set(run.id, internal)
+      this.internalRunBySession.set(internal.sessionId, run.id)
+      this.activeBotRuns.set(bot.id, run.id)
+      try {
+        const agent = await this.bridge.resumeOrCreate(
+          bot.canonicalSessionId as SessionId,
+          profile,
+        )
+        await this.bridge.followup(agent, this.buildInternalPrompt(bot, task, internal.envelope))
+      } catch (error: unknown) {
+        await this.finishInternalRun(run.id, undefined, error)
+      }
+    }
+  }
+
+  private buildInternalPrompt(bot: BotDescriptor, task: TaskRecord, envelope: BotMessageEnvelope): string {
+    const payload = envelope.payload
+    const instruction = typeof payload.instruction === 'string' ? payload.instruction : task.instruction
+    const criteria = Array.isArray(payload.acceptanceCriteria)
+      ? payload.acceptanceCriteria.filter((item): item is string => typeof item === 'string')
+      : task.acceptanceCriteria
+    const transcript = Array.isArray(payload.transcript)
+      ? payload.transcript
+        .filter((item): item is { from: string; text: string } => (
+          Boolean(item) && typeof item === 'object' &&
+          typeof (item as { from?: unknown }).from === 'string' &&
+          typeof (item as { text?: unknown }).text === 'string'
+        ))
+        .map(item => `${item.from}: ${item.text}`)
+      : []
+    return [
+      bot.soul ? `[SOUL]\n${bot.soul}` : '',
+      '[BotMesh structured task]',
+      `botId: ${bot.id}`,
+      `taskId: ${task.id}`,
+      `runId: ${envelope.runId}`,
+      `attemptId: ${envelope.attemptId}`,
+      `instruction: ${instruction}`,
+      criteria.length ? `acceptanceCriteria:\n${criteria.map(item => '- ' + item).join('\n')}` : '',
+      transcript.length ? `roomTranscript:\n${transcript.join('\n')}` : '',
+      'Return a useful result for the requester. Do not dispatch another Bot through free-form shell commands; structured handoff is managed by the BotMesh runtime.',
+    ].filter(Boolean).join('\n\n')
+  }
+
+  private async handleInternalSessionEvent(session: SessionLike, event: unknown, runId: string): Promise<void> {
+    const internal = this.internalRuns.get(runId)
+    if (!internal) return
+    const record = asRecord(event)
+    const data = asRecord(record.data)
+    if (record.type === 'assistant/message') {
+      const message = asRecord(data.message)
+      const text = textFromContent(message.content)
+      if (text) internal.texts.push(text)
+      return
+    }
+    if (record.type !== 'turn/end') return
+    const reason = asRecord(data.reason)
+    const kind = String(reason.kind ?? '')
+    if (kind === 'error' || kind === 'aborted') {
+      await this.finishInternalRun(runId, undefined, kind === 'aborted' ? 'Bot 回合已停止。' : 'Bot 回合失败。')
+      return
+    }
+    await this.finishInternalRun(runId, internal.texts.join('\n').trim() || 'Bot 没有返回文本结果。')
+  }
+
+  private async finishInternalRun(runId: string, output?: string, error?: unknown): Promise<void> {
+    const internal = this.internalRuns.get(runId)
+    if (!internal) return
+    const cleanup = (): void => {
+      this.internalRuns.delete(runId)
+      if (this.internalRunBySession.get(internal.sessionId) === runId) this.internalRunBySession.delete(internal.sessionId)
+      if (this.activeBotRuns.get(internal.botId) === runId) this.activeBotRuns.delete(internal.botId)
+    }
+    if (error !== undefined) {
+      const failed = await this.mailbox.fail(internal.lease, error, true)
+      if (!failed) {
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.stale_failure', {
+          taskId: internal.envelope.taskId,
+        }, internal.envelope.correlationId)
+        cleanup()
+        return
+      }
+      const retrying = failed?.state === 'queued'
+      await this.tasks.failRun(runId, error, !retrying)
+      cleanup()
+      if (!retrying) {
+        const target = this.replyTarget(internal.envelope)
+        if (target) await this.sendText(target, `@${internal.botId} 处理失败：${String(error)}`, `mesh-failed:${internal.envelope.taskId}:${runId}`)
+      } else {
+        this.scheduleCollaborationDrain()
+      }
+      return
+    }
+    const completed = await this.mailbox.complete(internal.lease)
+    if (!completed) {
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.stale_result', {}, internal.envelope.correlationId)
+      cleanup()
+      return
+    }
+    const roomId = internal.envelope.roomId
+    const room = roomId === undefined ? undefined : await this.rooms.get(roomId)
+    if (roomId !== undefined && (!room || room.closed || (internal.envelope.epoch !== undefined && internal.envelope.epoch !== room.epoch))) {
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.stale_room_result', {
+        taskId: internal.envelope.taskId,
+        roomId,
+        envelopeEpoch: internal.envelope.epoch ?? null,
+        roomEpoch: room?.epoch ?? null,
+        closed: room?.closed ?? null,
+      }, internal.envelope.correlationId)
+      await this.tasks.failRun(runId, 'room is closed or the result epoch is stale')
+      cleanup()
+      return
+    }
+    const result = (output ?? '').trim() || 'Bot 没有返回文本结果。'
+    const target = this.replyTarget(internal.envelope)
+    if (target) await this.sendText(target, `@${internal.botId}：\n${result}`, `mesh-response:${internal.envelope.taskId}:${runId}`)
+    if (roomId) {
+      await this.rooms.append(roomId, internal.botId, result)
+      const next = await this.rooms.reserveNext(roomId)
+      const currentRun = await this.tasks.run(runId)
+      if (next && currentRun) {
+        await this.tasks.completeRun(runId, result, false)
+        await this.tasks.reassignTask(internal.envelope.taskId, next.botId)
+        try {
+          await this.enqueueRoomTurn(internal, next.botId, currentRun.attempt + 1)
+        } catch (nextError: unknown) {
+          await this.rooms.close(roomId)
+          await this.tasks.audit('room', roomId, internal.botId, 'room.continuation_failed', { error: String(nextError) }, internal.envelope.correlationId)
+        }
+      } else {
+        await this.rooms.close(roomId)
+        await this.tasks.completeRun(runId, result, true)
+      }
+    } else {
+      await this.tasks.completeRun(runId, result, true)
+    }
+    await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.completed', {
+      taskId: internal.envelope.taskId,
+      roomId: roomId ?? null,
+    }, internal.envelope.correlationId)
+    cleanup()
+    void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration continuation failed: ${String(error)}`))
+  }
+
+  private async enqueueRoomTurn(internal: InternalRun, botId: string, attempt: number): Promise<void> {
+    const task = await this.tasks.task(internal.envelope.taskId)
+    if (!task) throw new Error('room task disappeared: ' + internal.envelope.taskId)
+    const run = await this.tasks.createRun(task.id, botId, attempt)
+    const transcript = internal.envelope.roomId === undefined
+      ? []
+      : await this.rooms.transcript(internal.envelope.roomId)
+    const room = internal.envelope.roomId === undefined
+      ? undefined
+      : await this.rooms.get(internal.envelope.roomId)
+    if (internal.envelope.roomId !== undefined && (!room || room.closed || (internal.envelope.epoch !== undefined && internal.envelope.epoch !== room.epoch))) {
+      throw new Error('room is closed or stale: ' + internal.envelope.roomId)
+    }
+    const envelope = createEnvelope({
+      from: internal.botId,
+      to: botId,
+      taskId: task.id,
+      runId: run.id,
+      attemptId: run.attemptId,
+      correlationId: internal.envelope.correlationId,
+      ...(internal.envelope.roomId === undefined ? {} : { roomId: internal.envelope.roomId }),
+      ...(room === undefined ? {} : { epoch: room.epoch }),
+      payload: {
+        instruction: task.instruction,
+        acceptanceCriteria: task.acceptanceCriteria,
+        replyTarget: this.replyTarget(internal.envelope),
+        transcript,
+      },
+    })
+    await this.mailbox.enqueue(envelope, `task:${task.id}:run:${run.id}`)
+    await this.tasks.audit('message', envelope.id, internal.botId, 'message.queued', {
+      taskId: task.id,
+      to: botId,
+      roomId: internal.envelope.roomId ?? null,
+    }, envelope.correlationId)
+    void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration room dispatch failed: ${String(error)}`))
+  }
+
+  private replyTarget(envelope: BotMessageEnvelope): BotTarget | undefined {
+    const value = envelope.payload.replyTarget
+    if (value === null || typeof value !== 'object') return undefined
+    const target = value as Partial<BotTarget>
+    if (typeof target.platform !== 'string' || typeof target.chatId !== 'string') return undefined
+    return target as BotTarget
+  }
+
+  private scheduleCollaborationDrain(): void {
+    if (this.collaborationDrainTimer || this.stopped) return
+    this.collaborationDrainTimer = setTimeout(() => {
+      this.collaborationDrainTimer = undefined
+      void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration retry failed: ${String(error)}`))
+    }, 1_500)
+    this.collaborationDrainTimer.unref?.()
   }
 
   private async handleInboundFailure(
@@ -583,7 +985,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -604,10 +1006,26 @@ export class BotGateway {
       return true
     }
     if (name === 'bots') {
-      const rows = [...this.profiles.values()]
-        .filter(profile => profile.enabled !== false)
-        .map(profile => `${profile.name}${profile.title ? ` — ${profile.title}` : ''}`)
-      await this.completeWithText(message, walId, binding, `可用 Bot profiles：\n${rows.join('\n')}`)
+      const rows = this.directory.list().map(bot => {
+        const capabilityText = bot.capabilities.length ? ` [${bot.capabilities.join(', ')}]` : ''
+        return `@${bot.id} — ${bot.title}${capabilityText}`
+      })
+      await this.completeWithText(message, walId, binding, `可用 Bot roster：\n${rows.join('\n')}\n\n使用 @bot-name <任务> 发起协作。`)
+      return true
+    }
+    if (name === 'mesh') {
+      const mailbox = await this.mailbox.snapshot()
+      const taskSnapshot = await this.tasks.snapshot()
+      const active = mailbox.filter(item => item.state === 'queued' || item.state === 'claimed' || item.state === 'acknowledged' || item.state === 'running').length
+      await this.completeWithText(message, walId, binding, [
+        'BotMesh 状态',
+        `Bots: ${this.directory.list().length}`,
+        `Mailbox active: ${active}`,
+        `Tasks: ${taskSnapshot.tasks.length}`,
+        `Runs: ${taskSnapshot.runs.length}`,
+        `Handoffs: ${taskSnapshot.handoffs.length}`,
+        `Active runs: ${this.activeBotRuns.size}`,
+      ].join('\n'))
       return true
     }
     if (name === 'stop') {
@@ -745,6 +1163,11 @@ export class BotGateway {
     const record = asRecord(event)
     const data = asRecord(record.data)
     const id = sessionKey(session.id)
+    const internalRunId = this.internalRunBySession.get(id)
+    if (internalRunId) {
+      await this.handleInternalSessionEvent(session, event, internalRunId)
+      return
+    }
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
     if (!target) return
