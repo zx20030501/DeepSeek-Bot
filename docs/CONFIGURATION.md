@@ -25,6 +25,12 @@
             provider: deepseek
             model: deepseek-v4-flash
             maxTokens: 8192
+            capabilities: [research, source-review]
+            skills: [web-research]
+            soul: "先给证据，再给结论；不把未验证推测当成事实。"
+          writer:
+            title: Writer Bot
+            capabilities: [writing, synthesis]
         telegram:
           enabled: true
           pollTimeoutSeconds: 30
@@ -39,6 +45,13 @@
         outboxMaxAttempts: 5
         retryBaseMs: 1000
         retryMaxMs: 60000
+        collaboration:
+          enabled: true
+          maxGroupBots: 6
+          maxGroupTurns: 3
+          maxGroupMessages: 10
+          mailboxMaxAttempts: 3
+          mailboxLeaseMs: 120000
 ```
 
 `DEEPSEEK_BOT_*` 是推荐前缀；旧的 `DSH_HERMES_BOT_*` 仍可用：
@@ -128,7 +141,10 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── state.json
 ├── pairing.json
 ├── inbound-wal.jsonl
-└── outbox.jsonl
+├── outbox.jsonl
+├── mailbox.jsonl
+├── tasks.jsonl
+└── rooms.json
 ```
 
 状态文件可能包含聊天消息和模型回复，不要提交到 GitHub。大体积回放、诊断归档和压测日志放到项目指定的 Google Drive 目录；本仓库只保存代码、测试、文档和小型 manifest。
@@ -140,10 +156,26 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 - `/new`、`/reset`：新建会话；
 - `/stop`：停止当前 Agent 回合；
 - `/status`：查看网关、Transport、WAL 和 Outbox 状态；
-- `/bots`、`/bot <name>`：查看和切换 profile；
+- `/bots`、`/bot <name>`：查看和切换 profile/Bot roster；
+- `/mesh`：查看 mailbox、Task、Run、Handoff 和正在执行的 Bot 数量；
 - `/model`：查看当前模型；
 - `/model provider:model`：设置当前聊天下一回合的 provider/model；
 - `/help`：查看帮助。
 
 已安装的 DSH 原生命令优先执行；未知的 `/xxx` 仍会作为普通 Agent prompt 发送。
 
+## 6. BotMesh 协作
+
+在已经通过 allowlist 或配对授权的聊天中，可以直接提及已配置的 Bot：
+
+```text
+@research 请比较 Hermes Bot Mode 与当前项目的差异
+```
+
+同时提及两个或更多已知 Bot 会创建一个有界 Group Room：
+
+```text
+@research @writer 先研究，再把结果整理成实施方案
+```
+
+BotMesh 会为请求写入结构化 Message Envelope、Task、Run 和审计记录；Bot 之间不通过自由文本 shell 调用。单 Bot 请求使用该 Bot 的长期 Canonical Session，Group Room 默认最多 3 轮、10 条消息。跨机器 Transport、自动 Routine 和完整 Web roster UI 尚未在这一阶段启用。
