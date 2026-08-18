@@ -250,7 +250,7 @@ access:
 
 ### 自动识别 UID
 
-设置页可以启动一次性诊断。插件会临时等待飞书私聊中的精确命令 `/bind <code>)，捕获发送者的 `open_id` 和 `chat_id)，只向本机页面返回元数据，不保存消息正文。Telegram 或飞书群聊不会被当作 UID 发现结果。
+设置页可以启动一次性诊断。插件会临时等待飞书私聊中的精确命令 `/bind <code>`，捕获发送者的 `open_id` 和 `chat_id`，只向本机页面返回元数据，不保存消息正文。Telegram 或飞书群聊不会被当作 UID 发现结果。
 
 ## 3. DSH Web 设置页
 
@@ -272,7 +272,7 @@ dsh web
 - 查看长连接状态、实际收到的 user/chat ID、@状态和 allowlist 决策；
 - 修改后热重载 Telegram/飞书 Transport，不需要重启 DSH。
 
-设置 API 是插件自带的本机接口 `/api/dsh-hermes-bot/setup)，会检查 loopback Host、Origin、Fetch Metadata 和 socket 对端地址。
+设置 API 是插件自带的本机接口 `/api/dsh-hermes-bot/setup`，会检查 loopback Host、Origin、Fetch Metadata 和 socket 对端地址。
 
 ## 4. 状态目录
 
