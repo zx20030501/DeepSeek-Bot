@@ -1,6 +1,6 @@
 # DeepSeek-Bot：Hermes Bot 能力调研与改进设计
 
-更新时间：2026-08-17
+更新时间：2026-08-18
 
 ## 1. 结论先行
 
@@ -127,7 +127,20 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 
 飞书第一版选择官方 WebSocket 长连接而非 Webhook，是因为本项目主要运行在 DSH 本地/服务器进程中，不需要额外暴露公网回调地址；Webhook 可在后续有反向代理和统一 ingress 后再补。其他能力会作为后续适配器或 UI 插件增加，而不是让核心可靠性代码变得不可验证。
 
-### 3.3 安全默认值
+### 3.3 V0.1 协作核心（已落地）
+
+在已有 Inbound WAL、Outbox 和稳定 session 绑定之上，本分支加入 `src/collaboration.ts`，形成可替换的 Bot-to-Bot mailbox：
+
+- `BotMessageEnvelope` 统一描述发送方、接收方、任务/运行关联、幂等键、TTL、回执关系和结构化 payload；
+- `CollaborationStore` 使用本地 JSONL snapshot journal，保证进程崩溃后能够恢复消息状态；
+- `CollaborationHub` 负责按接收 Bot 串行派发、claim/ack/start/complete、失败重试和 dead-letter；
+- `BotGateway.sendBotMessage()` 是当前内部调用边界，未来可由任务编排器、Web UI 或 DSH command 接入；
+- 发送方要求回执时，接收 Bot 的模型输出会自动包装为 report 消息并按 `correlationId` 回投；
+- 用户运行时数据只保存在本机状态目录；Google Drive 仅用于调研文档、压测归档等开发材料，不参与线上 mailbox。
+
+这一版明确把“通信”和“规划”分开：mailbox 负责可靠传递与治理，后续 Task/Run 控制平面负责 DAG、依赖、预算、审批和质量门，避免把临时的 Bot prompt 误当成调度系统。
+
+### 3.4 安全默认值
 
 - 默认 `allowlist`，没有明确的用户/聊天白名单时不处理普通消息；飞书私聊可选择一次性配对，不会直接进入 Agent；
 - Token 只从环境变量读取，不写入日志、不写入 Git；
@@ -145,7 +158,7 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 ## 5. 后续路线
 
 1. Telegram 和飞书真实凭证下做端到端 smoke test。
-2. 增加 `dsh-agent-message` 风格的跨会话 mailbox 和回执。
+2. 在 V0.1 mailbox 之上增加 Task/Run 控制平面：依赖 DAG、预算、超时、审批、取消和质量门。
 3. 在现有飞书通道上增加 CardKit 流式回复、按钮审批和媒体上传；复用 `dsh-lark-link` 已验证的 WAL/Outbox 经验，但不复制其业务代码。
 4. 以 DSH `ctx.jobs` / schedule seam 对接 Hermes Routine。
 5. 在当前设置页基础上增加轻量 Bot roster UI：canonical chat、未读标记、profile 选择和 routine 列表。
