@@ -88,6 +88,12 @@ export interface BotProfile {
   readonly model?: string
   readonly maxTokens?: number
   readonly enabled?: boolean
+  /** Capability labels used by the internal Bot Directory and future planner. */
+  readonly capabilities?: readonly string[]
+  /** Skill names exposed in roster/status output; execution remains DSH-owned. */
+  readonly skills?: readonly string[]
+  /** Optional short SOUL-style identity prompt for the canonical Bot Chat. */
+  readonly soul?: string
 }
 
 export interface TelegramConfig {
@@ -132,6 +138,28 @@ export interface BotGatewayConfig {
   readonly outboxMaxAttempts?: number
   readonly retryBaseMs?: number
   readonly retryMaxMs?: number
+  readonly collaboration?: BotCollaborationConfig
+}
+
+export interface BotCollaborationConfig {
+  readonly enabled?: boolean
+  readonly maxGroupBots?: number
+  readonly maxGroupTurns?: number
+  readonly maxGroupMessages?: number
+  readonly mailboxMaxAttempts?: number
+  readonly mailboxLeaseMs?: number
+}
+
+export interface BotDescriptor {
+  readonly id: string
+  readonly profile: string
+  readonly title: string
+  readonly description?: string
+  readonly capabilities: readonly string[]
+  readonly skills: readonly string[]
+  readonly soul?: string
+  readonly canonicalSessionId: string
+  readonly enabled: boolean
 }
 
 export type WalState = 'accepted' | 'dispatched' | 'completed' | 'failed'
@@ -203,4 +231,123 @@ export interface PairingApproval {
   readonly platform: string
   readonly userId: string
   readonly approvedAt: number
+}
+
+export type BotMessageKind = 'request' | 'response' | 'handoff' | 'event'
+
+export interface BotMessageEnvelope {
+  readonly id: string
+  readonly kind: BotMessageKind
+  readonly from: string
+  readonly to: string
+  readonly taskId: string
+  readonly runId: string
+  readonly attemptId: string
+  readonly correlationId: string
+  readonly roomId?: string
+  /** Room generation used to reject results from a closed or superseded room. */
+  readonly epoch?: number
+  readonly payload: Record<string, unknown>
+  readonly createdAt: number
+  readonly expiresAt?: number
+}
+
+export type MailboxState = 'queued' | 'claimed' | 'acknowledged' | 'running' | 'completed' | 'failed' | 'dead-letter'
+
+export interface MailboxItem {
+  readonly id: string
+  readonly idempotencyKey: string
+  readonly envelope: BotMessageEnvelope
+  readonly state: MailboxState
+  readonly attempts: number
+  readonly fencingToken: number
+  readonly leaseId?: string
+  readonly leaseExpiresAt?: number
+  readonly lastError?: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly nextAttemptAt: number
+}
+
+export type TaskStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
+
+export interface TaskRecord {
+  readonly id: string
+  readonly title: string
+  readonly instruction: string
+  readonly createdBy: string
+  readonly assignedTo: string
+  readonly acceptanceCriteria: readonly string[]
+  readonly priority: number
+  readonly roomId?: string
+  readonly status: TaskStatus
+  readonly currentRunId?: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly result?: string
+  readonly error?: string
+}
+
+export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface RunRecord {
+  readonly id: string
+  readonly taskId: string
+  readonly botId: string
+  readonly attemptId: string
+  readonly attempt: number
+  readonly status: RunStatus
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly output?: string
+  readonly error?: string
+}
+
+export type HandoffStatus = 'requested' | 'accepted' | 'completed' | 'rejected'
+
+export interface HandoffRecord {
+  readonly id: string
+  readonly taskId: string
+  readonly runId: string
+  readonly fromBot: string
+  readonly toBot: string
+  readonly reason: string
+  readonly status: HandoffStatus
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export interface AuditRecord {
+  readonly id: string
+  readonly at: number
+  readonly actor: string
+  readonly action: string
+  readonly entityType: 'message' | 'task' | 'run' | 'handoff' | 'room'
+  readonly entityId: string
+  readonly correlationId?: string
+  readonly data?: Record<string, unknown>
+}
+
+export interface GroupRoomMessage {
+  readonly id: string
+  readonly from: string
+  readonly text: string
+  readonly at: number
+}
+
+export interface GroupRoomRecord {
+  readonly id: string
+  readonly target: BotTarget
+  readonly participants: readonly string[]
+  readonly taskId: string
+  readonly epoch: number
+  readonly nextParticipantIndex: number
+  readonly turnCount: number
+  readonly messageCount: number
+  readonly maxTurns: number
+  readonly maxMessages: number
+  readonly messages: readonly GroupRoomMessage[]
+  readonly closed: boolean
+  readonly createdAt: number
+  readonly updatedAt: number
 }
