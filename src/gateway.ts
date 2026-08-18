@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { InboundWal, Outbox } from './durable.js'
+import { CollaborationHub, CollaborationStore, type BotMessageEnvelope, type BotMessageResult, type SendBotMessageInput } from './collaboration.js'
 import {
   parseBotCommand,
   parseModelOverride,
@@ -35,6 +36,13 @@ import type {
 
 interface SessionLike { readonly id: unknown }
 
+interface CollaborationRun {
+  readonly parts: string[]
+  readonly resolve: (result: BotMessageResult) => void
+  readonly reject: (error: unknown) => void
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
 interface DiscoveryState {
   readonly command: string
   readonly expiresAt: number
@@ -63,6 +71,24 @@ function targetKey(target: BotTarget): string {
 
 function sessionKey(sessionId: unknown): string {
   return String(sessionId)
+}
+
+function collaborationPrompt(message: BotMessageEnvelope): string {
+  return [
+    'Internal Bot-to-Bot collaboration message.',
+    'Message ID: ' + message.id,
+    'Kind: ' + message.kind,
+    'From Bot: ' + message.from.bot,
+    'To Bot: ' + message.to.bot,
+    'Task ID: ' + (message.taskId ?? 'none'),
+    'Run ID: ' + (message.runId ?? 'none'),
+    'Correlation ID: ' + message.correlationId,
+    'Reply To: ' + (message.replyTo ?? 'none'),
+    'Payload JSON: ' + JSON.stringify(message.payload),
+    message.expectReply
+      ? 'Return a concise result for the requesting Bot. Do not call external messaging APIs.'
+      : 'This is a report message. Summarize or use it as context; no Bot reply is required.',
+  ].join('\n')
 }
 
 export function discoveryCandidateFor(
@@ -180,6 +206,8 @@ export class BotGateway {
   private discovery: DiscoveryState | undefined
   /** Latest inbound target, including reply context, for each live session. */
   private readonly sessionTargets = new Map<string, BotTarget>()
+  private readonly collaboration: CollaborationHub
+  private readonly collaborationRuns = new Map<string, CollaborationRun>()
 
   public constructor(private readonly ctx: Context, rawConfig: unknown = {}) {
     this.config = normalizeConfig(rawConfig)
@@ -194,6 +222,18 @@ export class BotGateway {
     this.state = new JsonState<BotStateFile>(join(stateDir, 'state.json'), defaultState())
     this.pairing = new PairingStore(join(stateDir, 'pairing.json'))
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
+    const collaborationStore = new CollaborationStore(
+      join(stateDir, 'collaboration.jsonl'),
+      this.config.maxInboundAttempts ?? 3,
+    )
+    this.collaboration = new CollaborationHub(
+      collaborationStore,
+      message => this.executeBotMessage(message),
+      {
+        retryBaseMs: this.config.retryBaseMs ?? 1_000,
+        retryMaxMs: this.config.retryMaxMs ?? 60_000,
+      },
+    )
     this.transports = []
     this.transportByPlatform = new Map()
     this.installTransports(this.config)
@@ -279,6 +319,9 @@ export class BotGateway {
       accessMode: config.mode ?? 'allowlist',
       profileCount: this.profiles.size,
       laneCount: this.lanes.size,
+      collaboration: {
+        activeRuns: this.collaborationRuns.size,
+      },
       inbound: this.inboundDiagnostics(),
       pairing: {
         enabled: config.pairing !== false,
@@ -286,6 +329,15 @@ export class BotGateway {
       },
       discovery: this.discoveryStatus(),
     }
+  }
+
+  /** Send a typed message to another configured Bot profile. */
+  public async sendBotMessage(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
+    const sender = this.profiles.get(input.from.bot)
+    const recipient = this.profiles.get(input.to.bot)
+    if (!sender || sender.enabled === false) throw new Error('unknown or disabled sender Bot profile: ' + input.from.bot)
+    if (!recipient || recipient.enabled === false) throw new Error('unknown or disabled recipient Bot profile: ' + input.to.bot)
+    return this.collaboration.send(input)
   }
 
   /** Start a short-lived, local-UI-driven identity discovery flow. */
@@ -356,6 +408,7 @@ export class BotGateway {
     await this.pairing.load()
     await this.wal.load()
     await this.outbox.load()
+    await this.collaboration.load()
     this.durableLoaded = true
   }
 
@@ -363,7 +416,6 @@ export class BotGateway {
     if (this.config.enabled === false) return
     if (this.transports.length === 0) {
       this.log('warn', 'no enabled Telegram or Feishu transport configured; Bot Gateway is installed but idle')
-      return
     }
     if (!this.bridge) {
       try {
@@ -378,7 +430,9 @@ export class BotGateway {
         void this.queueInbound(item.message, item.id)
       }
       void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
+      void this.collaboration.dispatchPending().catch(error => this.log('warn', `collaboration recovery failed: ${String(error)}`))
     }
+    if (this.transports.length === 0) return
     for (const transport of this.transports) {
       void transport.start(message => this.acceptInbound(message)).catch(error => {
         if (!this.stopped && this.transportByPlatform.get(transport.platform) === transport) {
@@ -741,12 +795,88 @@ export class BotGateway {
       && await this.pairing.isApproved(message.target.platform, message.target.userId)
   }
 
+  private async executeBotMessage(message: BotMessageEnvelope): Promise<BotMessageResult> {
+    const profile = this.profiles.get(message.to.bot)
+    if (!profile || profile.enabled === false) {
+      throw new Error('unknown or disabled recipient Bot profile: ' + message.to.bot)
+    }
+    const bridge = this.bridge
+    if (!bridge) throw new Error('DeepSeek Harness Agent service is not available')
+    const sessionId = (message.to.sessionId ?? String(stableSessionId(
+      'bot-collab:' + message.to.bot,
+      message.to.bot,
+      0,
+    ))) as SessionId
+    const id = sessionKey(sessionId)
+    const agent = await bridge.resumeOrCreate(sessionId, profile)
+    return new Promise<BotMessageResult>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        const current = this.collaborationRuns.get(id)
+        if (!current) return
+        if (current.parts.length > 0) this.finishCollaborationRun(id)
+        else this.finishCollaborationRun(id, new Error('Bot collaboration timed out without a response'))
+      }, 120_000)
+      timer.unref?.()
+      this.collaborationRuns.set(id, {
+        parts: [],
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        timer,
+      })
+      void bridge.followup(agent, collaborationPrompt(message)).catch(error => {
+        this.finishCollaborationRun(id, error)
+      })
+    })
+  }
+
+  private finishCollaborationRun(id: string, error?: unknown): void {
+    const run = this.collaborationRuns.get(id)
+    if (!run) return
+    this.collaborationRuns.delete(id)
+    clearTimeout(run.timer)
+    if (error !== undefined) {
+      run.reject(error)
+      return
+    }
+    const text = run.parts.join('\n').trim()
+    run.resolve(text ? { text } : {})
+  }
+
+  private handleCollaborationSessionEvent(
+    id: string,
+    run: CollaborationRun,
+    record: Record<string, unknown>,
+  ): void {
+    if (record.type === 'assistant/message') {
+      const data = asRecord(record.data)
+      const message = asRecord(data.message)
+      const text = textFromContent(message.content)
+      if (text) run.parts.push(text)
+      return
+    }
+    if (record.type !== 'turn/end') return
+    const reason = asRecord(asRecord(record.data).reason)
+    const kind = String(reason.kind ?? '')
+    if (kind === 'error' || kind === 'aborted') {
+      this.finishCollaborationRun(id, new Error(kind === 'aborted'
+        ? 'Bot collaboration Agent turn was aborted'
+        : 'Bot collaboration Agent turn failed'))
+      return
+    }
+    this.finishCollaborationRun(id)
+  }
+
   private async handleSessionEvent(session: SessionLike, event: unknown): Promise<void> {
     const record = asRecord(event)
     const data = asRecord(record.data)
     const id = sessionKey(session.id)
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
+    const collaborationRun = this.collaborationRuns.get(id)
+    if (collaborationRun !== undefined) {
+      this.handleCollaborationSessionEvent(id, collaborationRun, record)
+      return
+    }
     if (!target) return
     if (record.type === 'assistant/message') {
       const message = asRecord(data.message)

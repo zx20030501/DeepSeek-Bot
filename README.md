@@ -37,6 +37,19 @@ session/event → Outbox → 原平台回复
 
 平台适配、可靠投递、会话路由和 Harness 调用彼此分离。新增平台时主要扩展 Transport，不需要重新实现 WAL、Outbox 和 Agent 会话逻辑。
 
+## Bot-to-Bot 协作核心（V0.1）
+
+当前版本已经把多个 Bot 的协作从“切换 profile”推进到可恢复的内部消息平面：
+
+- 类型化消息 envelope：request、report、question、handoff、approval；
+- 本地 JSONL mailbox：queued → claimed → acknowledged → running → completed/failed/dead-letter；
+- 幂等键、有限重试、指数退避和重启恢复；
+- 通过 `BotGateway.sendBotMessage()` 把一个 profile 的任务投递给另一个 profile；
+- 被调用 Bot 的回复会生成带 `correlationId`、`replyTo` 的 report，并回投发送方的内部协作会话；
+- 运行时数据仍保存在用户本机的 `DSH_HOME` 状态目录，不上传 Google Drive。
+
+这一版先解决可靠通信和状态治理，不把任务 DAG、审批 UI、群组房间或外部消息 Broker 混入核心；它们将在 mailbox 契约稳定后作为上层能力接入。
+
 ## 安装和构建
 
 在已经安装 DeepSeek Harness 的环境中：
@@ -95,7 +108,8 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── state.json
 ├── pairing.json
 ├── inbound-wal.jsonl
-└── outbox.jsonl
+├── outbox.jsonl
+└── collaboration.jsonl
 ```
 
 该目录可能包含聊天消息和模型回复，不应提交到 GitHub。大体积回放、诊断压缩包、压测日志和构建归档不进入仓库；本次实现没有生成需要上传 Google Drive 的大文件。
@@ -108,11 +122,11 @@ npm test
 npm run pack:check
 ```
 
-测试覆盖命令解析、模型覆盖、WAL 恢复和重试、Outbox、Telegram 切片、飞书归一化和连接生命周期、配对状态、Harness 默认模型、UID 发现以及设置接口本机安全边界。
+测试覆盖命令解析、模型覆盖、WAL 恢复和重试、Outbox、Telegram 切片、飞书归一化和连接生命周期、配对状态、Harness 默认模型、UID 发现、Bot 协作 mailbox 以及设置接口本机安全边界。
 
 ## 当前边界
 
-飞书 CardKit 流式卡片、真实文件/图片/语音转发、HTTP Webhook、Discord/Slack 等其他平台仍未实现；它们可以在现有 Transport、Delivery 和 Harness Adapter 分层上继续扩展。
+飞书 CardKit 流式卡片、真实文件/图片/语音转发、HTTP Webhook、Discord/Slack 等其他平台仍未实现；Bot-to-Bot 协作的 mailbox 核心已加入，但任务 DAG、审批面板和 Hermes 风格 canonical group room 仍属于后续阶段。它们可以在现有 Transport、Delivery、Routing 和 Harness Adapter 分层上继续扩展。
 
 ## 项目链接
 

@@ -5,3 +5,12 @@ dist/
 .env
 .env.*
 coverage/
+
+# Local runtime state; may contain user messages, model output, or Bot-to-Bot payloads
+.dsh/
+hermes-bot/
+**/state.json
+**/pairing.json
+**/inbound-wal.jsonl
+**/outbox.jsonl
+**/collaboration.jsonl
