@@ -13,6 +13,7 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - Outbox：幂等键、按聊天串行发送、重试、指数退避和 dead 状态；
 - 平台事件去重，平台/聊天/线程到 DSH session 的稳定绑定；
 - `/new`、`/reset`、`/stop`、`/status`、`/help`、`/bots`、`/bot`、`/model`；
+- BotMesh：Bot roster、Canonical Session、结构化 Mailbox、Task/Run/Handoff 审计、`@bot` 路由和有界 Group Room；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
@@ -29,13 +30,15 @@ Telegram / 飞书事件
 平台消息归一化 → 访问控制 → 去重 → Inbound WAL
         │
         ▼
-按聊天/线程串行处理 → DeepSeek Harness Agent
+外部聊天 → Task/Run → BotMesh Mailbox → Bot Canonical Session
         │
         ▼
-session/event → Outbox → 原平台回复
+session/event → Audit/Group Room → Outbox → 原平台回复
 ```
 
 平台适配、可靠投递、会话路由和 Harness 调用彼此分离。新增平台时主要扩展 Transport，不需要重新实现 WAL、Outbox 和 Agent 会话逻辑。
+
+BotMesh 的详细协议、状态机、恢复边界和迁移说明见 [docs/BOTMESH.md](docs/BOTMESH.md)。
 
 ## 安装和构建
 
@@ -95,7 +98,10 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── state.json
 ├── pairing.json
 ├── inbound-wal.jsonl
-└── outbox.jsonl
+├── outbox.jsonl
+├── mailbox.jsonl
+├── tasks.jsonl
+└── rooms.json
 ```
 
 该目录可能包含聊天消息和模型回复，不应提交到 GitHub。大体积回放、诊断压缩包、压测日志和构建归档不进入仓库；本次实现没有生成需要上传 Google Drive 的大文件。
@@ -108,11 +114,11 @@ npm test
 npm run pack:check
 ```
 
-测试覆盖命令解析、模型覆盖、WAL 恢复和重试、Outbox、Telegram 切片、飞书归一化和连接生命周期、配对状态、Harness 默认模型、UID 发现以及设置接口本机安全边界。
+测试覆盖命令解析、模型覆盖、WAL 恢复和重试、Outbox、Telegram 切片、飞书归一化和连接生命周期、配对状态、Harness 默认模型、UID 发现、设置接口本机安全边界，以及 BotMesh 的 mention 解析、Mailbox fencing、Task/Run 和 Group Room 限制。
 
 ## 当前边界
 
-飞书 CardKit 流式卡片、真实文件/图片/语音转发、HTTP Webhook、Discord/Slack 等其他平台仍未实现；它们可以在现有 Transport、Delivery 和 Harness Adapter 分层上继续扩展。
+飞书 CardKit 流式卡片、真实文件/图片/语音转发、HTTP Webhook、跨机器 BotMesh Transport、自动 routines、自动 planner 和完整 Web roster UI 仍未实现；它们可以在现有 Transport、Mailbox、Task/Run 和 Harness Adapter 分层上继续扩展。
 
 ## 项目链接
 
@@ -120,4 +126,3 @@ npm run pack:check
 - DeepSeek Harness：<https://github.com/deepseek-ai/deepseek-harness>
 - Hermes Agent：<https://github.com/NousResearch/hermes-agent>
 - 飞书官方 Node SDK：<https://github.com/larksuite/node-sdk>
-
