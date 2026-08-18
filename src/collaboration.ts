@@ -247,7 +247,7 @@ export class CollaborationStore {
     })
   }
 
-  public async complete(id: string, bot: string, result?: BotMessageResult): Promise<BotMessageEnvelope | undefined> {
+  public async complete(id: string, bot: string, result?: BotMessageResult | void): Promise<BotMessageEnvelope | undefined> {
     return this.withMutation(async () => {
       const current = this.items.get(id)
       if (current === undefined || isTerminal(current.state) || current.claimedBy !== bot) return undefined
@@ -311,6 +311,10 @@ export class CollaborationHub {
     this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs ?? 60_000)
     this.autoRetry = options.autoRetry !== false
     this.deliverReplies = options.deliverReplies !== false
+  }
+
+  public async load(): Promise<void> {
+    await this.store.load()
   }
 
   public async send(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
