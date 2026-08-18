@@ -472,3 +472,31 @@ export interface HandoffRequestInput {
   readonly replyTarget: BotTarget
   readonly requireApproval?: boolean
 }
+
+/** Bounded on-demand projection; unlike the polling dashboard this may contain task bodies. */
+export interface FleetTaskDetail {
+  readonly task: TaskRecord
+  readonly workflow?: FleetWorkflowRecord
+  readonly runs: readonly RunRecord[]
+  readonly handoffs: readonly HandoffRecord[]
+  readonly audits: readonly AuditRecord[]
+  readonly deliveries: ReadonlyArray<Pick<MailboxItem, 'id' | 'state' | 'attempts' | 'fencingToken' | 'lastError' | 'createdAt' | 'updatedAt'> & {
+    readonly botId: string
+    readonly runId: string
+  }>
+}
+
+export interface FleetReplayResult {
+  readonly sourceTaskId: string
+  readonly taskId: string
+  readonly workflowId?: string
+  readonly approvalCode?: string
+  readonly status: 'pending-approval' | 'started'
+}
+
+export interface FleetHandoffToolResult {
+  readonly status: 'accepted' | 'pending-approval'
+  readonly handoffId: string
+  readonly toBot: string
+  readonly message: string
+}

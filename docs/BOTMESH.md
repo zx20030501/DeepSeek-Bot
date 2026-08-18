@@ -113,9 +113,13 @@ Bot 会话默认 `requester`：稳定但按使用者隔离。还可配置 `chat`
 
 ## Handoff 与审批
 
-`BotGateway.requestHandoff()` 是结构化公开 API。Handoff 有 requested、accepted、completed、rejected 状态；需要审批时，批准后才取消并 fence 源 Run、再创建目标 Run。accepted Handoff 可在重启后幂等恢复，不会同时保留一个可继续执行的旧源投递。模型直接调用的 DSH Tool 尚未注册，因此当前 Handoff 由插件/API 发起，不解析任意自由文本 shell 指令。
+`BotGateway.requestHandoff()` 是结构化公开 API。Handoff 有 requested、accepted、completed、rejected 状态；需要审批时，批准后才取消并 fence 源 Run、再创建目标 Run。accepted Handoff 可在重启后幂等恢复，不会同时保留一个可继续执行的旧源投递，也不会因重复恢复而创建多个目标 Run。
 
-Workflow 和 Handoff 审批保存在 `approvals.json`。聊天审批仅允许原请求者；本机受信设置页是管理员入口。过期审批会自动取消 pending Workflow 或拒绝 pending Handoff。
+BotMesh 拥有的内部 Agent Session 会注册 `bot_fleet_handoff` DSH Tool。模型参数只包含 `toBot`、`reason` 和可选 `requireApproval`；Gateway 从当前 Session/Run 推导 Task、请求者和回复目标，因此模型不能跨任务或替别人构造 Handoff。工具结束源回合；等待人工审批时源 Run 先进入 fenced/cancelled，批准后再派发目标。普通聊天 Agent 不安装此工具。当前只允许直接 Task 使用，固定 Workflow 和 Group Room 不接受动态改图。
+
+Workflow 和 Handoff 审批保存在 `approvals.json`。聊天审批仅允许原请求者；本机受信设置页是管理员入口。过期审批会自动取消 pending Workflow 或拒绝 pending Handoff。所有非 pending 决定都会在启动恢复中重新对账，因此“决定已落盘、业务副作用未完成”的崩溃窗口可以安全补做。
+
+Task 控制同样走 Gateway 的所有权边界：聊天中的详情、取消和重放只对原请求者开放，本机设置页可作为管理员操作。取消会关闭 Workflow/Room、拒绝待审批项、取消 Mailbox/Run，并丢弃迟到结果；重放总是创建新的 Task、Run、attempt 和 Workflow 身份。
 
 ## 配置
 
@@ -168,4 +172,4 @@ approvals.json  # 审批状态
 
 ## 边界
 
-BotMesh 当前是单机、单 Node.js 进程的控制平面。没有跨机器共识、远程 worker transport、任意 DAG、Routine/cron 或数百代理弹性 fan-out。Web 控制台提供 roster、状态、审批和 dead-letter 摘要，但还没有 transcript/audit 搜索、取消、重放和 DAG 编辑。
+BotMesh 当前是单机、单 Node.js 进程的控制平面。没有跨机器共识、远程 worker transport、任意 DAG、Routine/cron 或数百代理弹性 fan-out。Web 控制台提供 roster、状态、审批、dead-letter、Task 详情、取消和重放，但还没有 transcript/audit 搜索或 DAG 编辑。

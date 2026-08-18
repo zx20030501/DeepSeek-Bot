@@ -1051,6 +1051,18 @@ export class TaskRunStore {
     return workflow && this.cloneWorkflow(workflow)
   }
 
+  public async workflowForTask(taskId: string): Promise<FleetWorkflowRecord | undefined> {
+    await this.load()
+    const workflow = [...this.workflows.values()].find(candidate => candidate.taskId === taskId)
+    return workflow && this.cloneWorkflow(workflow)
+  }
+
+  public async handoff(id: string): Promise<HandoffRecord | undefined> {
+    await this.load()
+    const handoff = this.handoffs.get(id)
+    return handoff && { ...handoff, replyTarget: { ...handoff.replyTarget } }
+  }
+
   public async workflowForRun(runId: string): Promise<FleetWorkflowRecord | undefined> {
     await this.load()
     const run = this.runs.get(runId)
@@ -1270,6 +1282,26 @@ export class FleetApprovalStore {
     return Object.values((await this.state.load()).approvals)
       .map(item => ({ ...item }))
       .sort((a, b) => b.createdAt - a.createdAt)
+  }
+
+  /** Resolve every still-pending gate for one entity without invoking gateway side effects. */
+  public async rejectEntity(entityId: string, actor: string, at = now()): Promise<FleetApprovalRecord[]> {
+    const rejected: FleetApprovalRecord[] = []
+    await this.state.update(current => {
+      for (const [id, approval] of Object.entries(current.approvals)) {
+        if (approval.entityId !== entityId || approval.status !== 'pending') continue
+        const next: FleetApprovalRecord = {
+          ...approval,
+          status: approval.expiresAt <= at ? 'expired' : 'rejected',
+          resolvedAt: at,
+          resolvedBy: approval.expiresAt <= at ? 'system' : actor,
+        }
+        current.approvals[id] = next
+        rejected.push(next)
+      }
+      return current
+    })
+    return rejected.map(record => ({ ...record }))
   }
 
   public async expire(at = now()): Promise<number> {

@@ -169,6 +169,29 @@ interface Diagnostics {
   }
 }
 
+interface FleetTaskDetailView {
+  readonly task: {
+    id: string
+    title: string
+    instruction: string
+    status: string
+    assignedTo: string
+    result?: string
+    error?: string
+    createdAt: number
+    updatedAt: number
+  }
+  readonly workflow?: {
+    id: string
+    status: string
+    outputs?: Array<{ runId?: string; botId?: string; phase?: string; text?: string; at?: number }>
+  }
+  readonly runs: Array<{ id: string; botId: string; attempt: number; phase?: string; status: string; output?: string; error?: string; updatedAt: number }>
+  readonly handoffs: Array<{ id: string; fromBot: string; toBot: string; reason: string; status: string }>
+  readonly audits: Array<{ id: string; at: number; actor: string; action: string }>
+  readonly deliveries: Array<{ id: string; state: string; attempts: number; botId: string; runId: string; lastError?: string }>
+}
+
 interface SetupState {
   readonly status: 'loading' | 'ready' | 'unavailable'
   readonly settings?: HermesBotSettings
@@ -179,6 +202,8 @@ interface SetupState {
   readonly diagnosing: boolean
   readonly pairingApproving: boolean
   readonly fleetApproving: boolean
+  readonly fleetTaskAction?: string | undefined
+  readonly fleetTaskDetail?: FleetTaskDetailView | undefined
   readonly message?: string | undefined
   readonly error?: string | undefined
   readonly diagnosticsError?: string | undefined
@@ -600,6 +625,73 @@ class FeishuSetupController {
     }
   }
 
+  public async loadFleetTask(taskId: string): Promise<void> {
+    this.publish({ fleetTaskAction: `detail:${taskId}`, error: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'fleet_task_detail', taskId }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      if (body.taskDetail === null || typeof body.taskDetail !== 'object' || Array.isArray(body.taskDetail)) {
+        throw new Error('服务器返回的任务详情格式不正确。')
+      }
+      this.publish({ fleetTaskDetail: body.taskDetail as FleetTaskDetailView })
+    } catch (error) {
+      this.publish({ error: `读取任务详情失败：${String(error)}` })
+    } finally {
+      this.publish({ fleetTaskAction: undefined })
+    }
+  }
+
+  public clearFleetTaskDetail(): void {
+    this.publish({ fleetTaskDetail: undefined })
+  }
+
+  public async cancelFleetTask(taskId: string): Promise<boolean> {
+    this.publish({ fleetTaskAction: `cancel:${taskId}`, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'fleet_task_cancel', taskId }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ diagnostics: data.diagnostics, message: data.message ?? `已取消任务 ${taskId}。`, fleetTaskDetail: undefined })
+      return true
+    } catch (error) {
+      this.publish({ error: `取消任务失败：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ fleetTaskAction: undefined })
+    }
+  }
+
+  public async replayFleetTask(taskId: string): Promise<boolean> {
+    this.publish({ fleetTaskAction: `replay:${taskId}`, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'fleet_task_replay', taskId }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ diagnostics: data.diagnostics, message: data.message ?? '已创建新的重放任务。', fleetTaskDetail: undefined })
+      return true
+    } catch (error) {
+      this.publish({ error: `重放任务失败：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ fleetTaskAction: undefined })
+    }
+  }
+
   public dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -785,13 +877,25 @@ function FleetProfileEditor({
 function FleetStatusPanel({
   diagnostics,
   approving,
+  taskAction,
+  taskDetail,
   onResolve,
   onRefresh,
+  onDetail,
+  onCancel,
+  onReplay,
+  onCloseDetail,
 }: {
   diagnostics: Diagnostics
   approving: boolean
+  taskAction?: string | undefined
+  taskDetail?: FleetTaskDetailView | undefined
   onResolve: (code: string, decision: 'approved' | 'rejected') => void
   onRefresh: () => void
+  onDetail: (taskId: string) => void
+  onCancel: (taskId: string) => void
+  onReplay: (taskId: string) => void
+  onCloseDetail: () => void
 }) {
   const fleet = diagnostics.fleet
   const approvals = (fleet?.approvals ?? []).filter(approval => approval.status === 'pending')
@@ -813,9 +917,23 @@ function FleetStatusPanel({
       <div className="dsh-hermes-fleet-columns">
         <div><strong>待审批</strong>{approvals.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : approvals.map(approval => <div className="dsh-hermes-fleet-row" key={approval.id}><div><code>{approval.code}</code><span>{approval.summary ?? approval.kind}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'approved') }}>批准</button><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'rejected') }}>拒绝</button></div></div>)}</div>
         <div><strong>最近工作流</strong>{workflows.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : workflows.slice(0, 6).map(workflow => <div className="dsh-hermes-fleet-row" key={workflow.id}><div><code>{workflow.id}</code><span>{workflow.status} · {(workflow.workerBotIds ?? []).map(id => '@' + id).join('、')}</span></div></div>)}</div>
-        <div><strong>最近任务</strong>{tasks.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : tasks.slice(0, 6).map(task => <div className="dsh-hermes-fleet-row" key={task.id}><div><code>{task.id}</code><span>{task.status} · {task.title}</span></div></div>)}</div>
+        <div><strong>最近任务</strong>{tasks.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : tasks.slice(0, 10).map(task => {
+          const taskId = task.id ?? ''
+          const terminal = task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
+          return <div className="dsh-hermes-fleet-row" key={taskId}><div><code>{taskId}</code><span>{task.status} · {task.title}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={taskId === '' || taskAction !== undefined} onClick={() => { onDetail(taskId) }}>详情</button>{terminal ? <button type="button" className="dsh-hermes-secondary" disabled={taskId === '' || taskAction !== undefined} onClick={() => { onReplay(taskId) }}>重放</button> : <button type="button" className="dsh-hermes-danger" disabled={taskId === '' || taskAction !== undefined} onClick={() => { if (window.confirm(`确定取消任务 ${taskId}？正在运行的 Bot 会立即停止。`)) onCancel(taskId) }}>取消</button>}</div></div>
+        })}</div>
         <div><strong>死信</strong>{deadLetters.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : deadLetters.slice(0, 6).map(item => <div className="dsh-hermes-fleet-row" key={item.id}><div><code>{item.envelope?.taskId ?? item.id}</code><span>@{item.envelope?.to} · {item.lastError}</span></div></div>)}</div>
       </div>
+      {taskDetail === undefined ? null : <div className="dsh-hermes-task-detail">
+        <div className="dsh-hermes-diagnostic-head"><div><h4>任务详情</h4><code>{taskDetail.task.id}</code></div><button type="button" className="dsh-hermes-secondary" onClick={onCloseDetail}>关闭</button></div>
+        <div className="dsh-hermes-task-meta"><span>状态：{taskDetail.task.status}</span><span>当前 Bot：@{taskDetail.task.assignedTo}</span><span>Runs：{taskDetail.runs.length}</span><span>Handoffs：{taskDetail.handoffs.length}</span></div>
+        <strong>{taskDetail.task.title}</strong>
+        <div><small>原始任务</small><pre>{taskDetail.task.instruction}</pre></div>
+        {taskDetail.task.result === undefined ? null : <div><small>最终结果</small><pre>{taskDetail.task.result}</pre></div>}
+        {taskDetail.task.error === undefined ? null : <div><small>错误</small><pre>{taskDetail.task.error}</pre></div>}
+        <div><small>运行记录</small>{taskDetail.runs.map(run => <div className="dsh-hermes-task-run" key={run.id}><code>{run.id}</code><span>@{run.botId} · {run.phase ?? 'direct'} · 第 {run.attempt} 次 · {run.status}</span>{run.error === undefined ? null : <em>{run.error}</em>}</div>)}</div>
+        <div><small>最近审计</small>{taskDetail.audits.slice(-20).reverse().map(audit => <div className="dsh-hermes-task-run" key={audit.id}><span>{new Date(audit.at).toLocaleString()} · {audit.action} · {audit.actor}</span></div>)}</div>
+      </div>}
     </section>
   )
 }
@@ -1055,7 +1173,18 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         <FleetProfileEditor profiles={draft.profiles} onChange={profiles => { update('profiles', profiles) }} />
       </section>
 
-      <FleetStatusPanel diagnostics={state.diagnostics} approving={state.fleetApproving} onResolve={(code, decision) => { void controller.resolveFleetApproval(code, decision) }} onRefresh={() => { void controller.refreshDiagnostics() }} />
+      <FleetStatusPanel
+        diagnostics={state.diagnostics}
+        approving={state.fleetApproving}
+        taskAction={state.fleetTaskAction}
+        taskDetail={state.fleetTaskDetail}
+        onResolve={(code, decision) => { void controller.resolveFleetApproval(code, decision) }}
+        onRefresh={() => { void controller.refreshDiagnostics() }}
+        onDetail={taskId => { void controller.loadFleetTask(taskId) }}
+        onCancel={taskId => { void controller.cancelFleetTask(taskId) }}
+        onReplay={taskId => { void controller.replayFleetTask(taskId) }}
+        onCloseDetail={() => { controller.clearFleetTaskDetail() }}
+      />
 
       <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
 
@@ -1073,9 +1202,9 @@ const CSS = `
 .dsh-hermes-header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:8px 2px}.dsh-hermes-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}.dsh-hermes-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}.dsh-hermes-kicker{font-size:10px;letter-spacing:.1em;color:#6758d4;font-weight:700}.dsh-hermes-badge{font-size:10px;padding:4px 8px;border-radius:999px;font-weight:650;white-space:nowrap}.dsh-hermes-badge.ok{background:rgba(48,154,100,.12);color:#267d52}.dsh-hermes-badge.missing{background:rgba(205,72,72,.1);color:#aa3939}
 .dsh-hermes-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}.dsh-hermes-notice{background:rgba(92,108,213,.09);color:#5149a6}.dsh-hermes-warning{background:rgba(224,162,55,.12);color:#986818}.dsh-hermes-error{background:rgba(205,72,72,.1);color:#aa3939}.dsh-hermes-success{background:rgba(48,154,100,.1);color:#267d52}.dsh-hermes-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
- .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}
+ .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-danger{border:1px solid rgba(190,60,60,.35);border-radius:999px;background:rgba(205,72,72,.08);color:#aa3939;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-secondary:disabled,.dsh-hermes-danger:disabled{opacity:.5;cursor:not-allowed}
  .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-authorized-user{display:grid;gap:3px;min-width:0}.dsh-hermes-authorized-user code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-authorized-user span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
- .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}}
+  .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}.dsh-hermes-task-detail{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-task-detail h4{margin:0 0 3px;font-size:13px}.dsh-hermes-task-detail small{display:block;margin-bottom:5px;font-size:10px;font-weight:650;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-task-detail pre{max-height:260px;margin:0;padding:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.dsh-hermes-task-meta{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-task-meta span{padding:4px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10px}.dsh-hermes-task-run{display:grid;gap:3px;padding:7px 0;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-task-run code,.dsh-hermes-task-run span,.dsh-hermes-task-run em{font-size:10px;overflow-wrap:anywhere}.dsh-hermes-task-run em{color:#aa3939;font-style:normal}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 

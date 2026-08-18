@@ -274,9 +274,13 @@ test('workflow, handoff, audit, and approval records persist across reloads', as
     assert.equal((await approvals.resolveByCode(approval.code, 'approved', 'user'))?.status, 'approved')
     const expiring = await approvals.create({ kind: 'handoff', requestedBy: 'user', summary: 'expires', entityId: handoff.id })
     assert.equal((await approvals.resolveByCode(expiring.code, 'approved', 'another-user', expiring.expiresAt + 1))?.status, 'expired')
+    const cancellable = await approvals.create({ kind: 'workflow', requestedBy: 'user', summary: 'cancel', entityId: workflow.id })
+    assert.equal((await approvals.rejectEntity(workflow.id, 'local-dashboard')).find(item => item.id === cancellable.id)?.status, 'rejected')
 
     const reloadedTasks = new TaskRunStore(taskFile)
     assert.equal((await reloadedTasks.workflow(workflow.id))?.outputs[0]?.text, 'evidence')
+    assert.equal((await reloadedTasks.workflowForTask(task.id))?.id, workflow.id)
+    assert.equal((await reloadedTasks.handoff(handoff.id))?.toBot, 'writer')
     assert.equal((await reloadedTasks.snapshot()).handoffs[0]?.status, 'accepted')
     const reloadedApprovals = new FleetApprovalStore(approvalsFile)
     assert.equal((await reloadedApprovals.get(approval.id))?.status, 'approved')

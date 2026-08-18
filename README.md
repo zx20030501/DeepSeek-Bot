@@ -16,7 +16,8 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - Bot Fleet：可编辑 roster、能力/SOUL/模型/角色、每 Bot ACL，以及默认按使用者隔离的稳定会话；
 - 结构化 Mailbox、Task/Run/Handoff/Audit、租约续期、fencing、真实退避重试、重启恢复和 dead-letter；
 - `@bot` 路由、2–6 Bot 顺序 Group Room，以及 `/fleet` 并行“执行 → 验证 → 汇总”工作流；
-- `/tasks`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
+- `/tasks`、`/task`、`/cancel`、`/replay`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
+- 仅在内部 Bot Session 注册的结构化 Handoff Tool，Gateway 推导任务身份并支持审批后恢复；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
@@ -119,11 +120,11 @@ npm test
 npm run pack:check
 ```
 
-测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批、Handoff、并行 Task 状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。
+测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批崩溃恢复、模型 Handoff、Task 详情/取消/重放、并行状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。
 
 ## 当前边界
 
-这是单机 DeepSeek Harness 内的 Fleet v1，不是 xAI 内部系统的复制品。当前 Planner 是可审计的确定性能力匹配，工作流采用固定的“执行 → 验证 → 汇总”阶段，最多 6 个不同 Bot；尚未实现 Grok Build 的数百代理弹性 fan-out、可保存任意工作流脚本、跨机器 Transport、定时 Routine、文件/媒体完整转发和通用 Task DAG 编辑器。结构化 Handoff 已有公开 API 和审批状态机，但还没有注册成可由模型直接调用的 DSH Tool。
+这是单机 DeepSeek Harness 内的 Fleet v1，不是 xAI 内部系统的复制品。当前 Planner 是可审计的确定性能力匹配，工作流采用固定的“执行 → 验证 → 汇总”阶段，最多 6 个不同 Bot；结构化 Handoff 已有公开 API、受限模型 Tool 和审批恢复。尚未实现 Grok Build 的数百代理弹性 fan-out、可保存任意工作流脚本、跨机器 Transport、定时 Routine、文件/媒体完整转发、通用 Task DAG 编辑器，以及 Workflow/Group Room 中途动态改图。
 
 ## 项目链接
 

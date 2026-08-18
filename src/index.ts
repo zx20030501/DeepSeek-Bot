@@ -57,6 +57,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
     approvePairing: code => gateway.approvePairing(code),
     revokePairing: (platform, userId) => gateway.revokePairing(platform, userId),
     resolveFleetApproval: (code, decision) => gateway.resolveApproval(code, decision),
+    fleetTaskDetail: taskId => gateway.fleetTaskDetail(taskId),
+    cancelFleetTask: taskId => gateway.cancelFleetTask(taskId),
+    replayFleetTask: taskId => gateway.replayFleetTask(taskId),
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
     const credentialEvents = credentialsCtx as unknown as {

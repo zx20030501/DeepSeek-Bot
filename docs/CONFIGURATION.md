@@ -147,7 +147,7 @@ dsh web
 - 查看长连接状态、实际收到的 user/chat ID、@状态和 allowlist 决策；
 - 可视化增删 Bot，设置角色、模型、能力、技能、SOUL、会话隔离和每 Bot ACL；
 - 设置 Planner、审批策略、并行数、完整轮次和失败重试次数；
-- 查看 Task、Workflow、Run、审批和 dead-letter，并在本机批准/拒绝；
+- 查看 Task、Workflow、Run、审批和 dead-letter，并在本机查看详情、取消、重放、批准或拒绝；
 - 修改后热重载 Telegram/飞书 Transport，不需要重启 DSH。
 
 设置 API 是插件自带的本机接口 `/api/dsh-hermes-bot/setup`，会检查 loopback Host、Origin、Fetch Metadata 和 socket 对端地址。
@@ -181,6 +181,9 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 - `/mesh`：查看当前请求者自己的 mailbox、Task、Run、Handoff 和正在执行的 Bot 数量；
 - `/fleet <任务>`：按能力生成并执行“并行执行 → 验证 → 汇总”计划；
 - `/tasks`：查看当前请求者最近的 Fleet Task；
+- `/task <id>`：按需查看当前请求者自己的 Task 详情；
+- `/cancel <id>`：取消当前请求者自己的活动 Task；
+- `/replay <id>`：以全新的 Task/Run 身份重放当前请求者自己的历史 Task；
 - `/approvals`：查看当前请求者自己的待审批操作；
 - `/approve <code>`、`/reject <code>`：由原请求者批准或拒绝；
 - `/model`：查看当前模型；
@@ -211,6 +214,6 @@ BotMesh 会为请求写入结构化 Message Envelope、Task、Run 和审计记�
 /fleet 调研方案、独立验证风险并给出最终建议
 ```
 
-默认先返回计划和审批码。批准后 worker 并行执行，可选 verifier 独立检查，最后由 synthesizer 返回一个结果。更完整的说明见 `docs/FLEET.md`。
+默认先返回计划和审批码。批准后 worker 并行执行，可选 verifier 独立检查，最后由 synthesizer 返回一个结果。审批决定和业务副作用会在重启后对账恢复。内部 Bot 还可以通过受限的 `bot_fleet_handoff` Tool 把直接 Task 转交给另一个有权限的 Bot；身份字段由 Gateway 推导，不能由模型填写。更完整的说明见 `docs/FLEET.md`。
 
-当前仍是单机最多 6 Bot 的 Fleet；跨机器 Transport、Routine/cron、任意 DAG 和模型可直接调用的 Handoff Tool 尚未实现。
+当前仍是单机最多 6 Bot 的 Fleet；跨机器 Transport、Routine/cron、任意 DAG，以及 Workflow/Group Room 运行中的动态改图尚未实现。
