@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatHelp, parseBotCommand, splitText, textFromContent } from '../dist/commands.js'
+import { formatHelp, formatModelOverride, parseBotCommand, parseModelOverride, splitText, textFromContent } from '../dist/commands.js'
 
 test('parses local commands without consuming normal prompts', () => {
   assert.deepEqual(parseBotCommand('  /MODEL provider:model  '), {
@@ -9,6 +9,15 @@ test('parses local commands without consuming normal prompts', () => {
   })
   assert.equal(parseBotCommand('please /help me'), undefined)
   assert.equal(parseBotCommand('/'), undefined)
+})
+
+test('parses and formats provider:model overrides without losing colons in model names', () => {
+  assert.deepEqual(parseModelOverride('deepseek:deepseek-v4:flash'), {
+    provider: 'deepseek',
+    model: 'deepseek-v4:flash',
+  })
+  assert.deepEqual(parseModelOverride('deepseek-v4-flash'), { model: 'deepseek-v4-flash' })
+  assert.equal(formatModelOverride({ provider: 'deepseek', model: 'deepseek-v4-flash' }), 'deepseek:deepseek-v4-flash')
 })
 
 test('splits by Unicode code points for platform message limits', () => {

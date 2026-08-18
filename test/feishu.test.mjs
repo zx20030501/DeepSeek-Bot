@@ -32,6 +32,7 @@ test('normalizes Feishu messages into stable gateway targets', () => {
     platform: 'feishu',
     chatId: 'oc_test_chat',
     threadId: 'omt_thread',
+    replyToMessageId: 'om_parent',
     userId: 'ou_test_user',
     chatType: 'group',
   })

@@ -2,6 +2,8 @@ export interface BotTarget {
   readonly platform: string
   readonly chatId: string
   readonly threadId?: string
+  /** The platform message to reply to, when the transport supports it. */
+  readonly replyToMessageId?: string
   readonly userId?: string
   readonly chatType?: 'dm' | 'group' | 'channel' | 'thread'
 }
@@ -27,6 +29,55 @@ export interface BotTransport {
   send(target: OutboundTarget, text: string): Promise<void>
   typing?(target: BotTarget): Promise<void>
   status?(): Record<string, unknown>
+}
+
+/** Short-lived, UI-only diagnostic data. Message bodies are never stored here. */
+export interface FeishuEventDiagnostic {
+  readonly receivedAt: number
+  readonly messageId?: string
+  readonly userId?: string
+  readonly chatId?: string
+  readonly chatType?: string
+  readonly mentionedBot?: boolean
+  readonly textLength: number
+  readonly resourceCount: number
+  readonly normalized: boolean
+  readonly reason: string
+}
+
+export interface InboundDecisionDiagnostic {
+  readonly receivedAt: number
+  readonly platform: string
+  readonly messageId: string
+  readonly userId?: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+  readonly textLength: number
+  readonly decision: 'accepted' | 'unauthorized' | 'duplicate'
+  readonly reason: string
+}
+
+export interface GatewayInboundDiagnostics {
+  readonly received: number
+  readonly accepted: number
+  readonly unauthorized: number
+  readonly duplicate: number
+  readonly last: InboundDecisionDiagnostic | null
+}
+
+/** Short-lived identity candidate discovered by the one-time bind command. */
+export interface GatewayDiscoveryCandidate {
+  readonly receivedAt: number
+  readonly userId: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+}
+
+export interface GatewayDiscoveryStatus {
+  readonly active: boolean
+  readonly command?: string
+  readonly expiresAt?: number
+  readonly candidate?: GatewayDiscoveryCandidate
 }
 
 export interface BotProfile {
@@ -64,6 +115,8 @@ export interface BotAccessConfig {
   readonly mode?: 'allowlist' | 'open'
   readonly userIds?: readonly (string | number)[]
   readonly chatIds?: readonly (string | number)[]
+  /** Unknown direct-message senders receive a one-time pairing code. */
+  readonly pairing?: boolean
   readonly notifyUnauthorized?: boolean
 }
 
@@ -114,7 +167,7 @@ export interface ChatBinding {
   readonly profile: string
   readonly generation: number
   readonly sessionId: string
-  readonly modelOverride?: string
+  readonly modelOverride?: ModelOverride | string
   readonly updatedAt: number
 }
 
@@ -128,4 +181,26 @@ export interface DshAgentOptions {
   readonly provider?: string
   readonly model?: string
   readonly maxTokens?: number
+}
+
+export interface ModelOverride {
+  readonly provider?: string
+  readonly model: string
+}
+
+export interface PairingRequest {
+  readonly code: string
+  readonly platform: string
+  readonly userId: string
+  readonly chatId: string
+  readonly chatType?: BotTarget['chatType']
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly lastNotifiedAt: number
+}
+
+export interface PairingApproval {
+  readonly platform: string
+  readonly userId: string
+  readonly approvedAt: number
 }
