@@ -1,6 +1,23 @@
+import type { ModelOverride } from './types.js'
+
 export interface ParsedBotCommand {
   readonly name: string
   readonly args: string
+}
+
+/** Parse the optional provider:model form accepted by /model. */
+export function parseModelOverride(value: string): ModelOverride {
+  const separator = value.indexOf(':')
+  if (separator <= 0) return { model: value }
+  const provider = value.slice(0, separator).trim()
+  const model = value.slice(separator + 1).trim()
+  return provider && model ? { provider, model } : { model: value }
+}
+
+export function formatModelOverride(value: ModelOverride | string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'string') return value
+  return value.provider === undefined ? value.model : `${value.provider}:${value.model}`
 }
 
 const COMMAND_RE = /^\s*\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?\s*$/iu

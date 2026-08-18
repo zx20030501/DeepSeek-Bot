@@ -4,7 +4,7 @@
 
 ## 1. 结论先行
 
-`DeepSeek-Bot` 当前是空仓库，因此本项目第一版不修改 DeepSeek Harness 上游源码，而是实现一个可通过 `dsh plugin` 安装的 Cordis 插件：
+`DeepSeek-Bot` 当前是一个可通过 `dsh plugin` 安装的 Cordis 插件。本项目不修改 DeepSeek Harness 上游源码，而是在公开服务边界上实现消息接入、可靠投递和会话治理：
 
 ```text
 Telegram / 其他平台适配器
@@ -98,7 +98,7 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 
 每层都能单独测试。新增平台时只需实现 Transport，不需要复制会话、重试和安全逻辑。
 
-### 3.2 第一版实施范围
+### 3.2 当前实施范围
 
 第一版包含：
 
@@ -112,12 +112,16 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 - 飞书私聊、群聊 @机器人、话题/回复关系、Markdown 出站和自动重连；
 - 通过 `session/event` 把模型文本回传 Telegram；
 - crash/restart 后有限次数恢复未完成入站请求；
+- 入站失败的有限次数退避重试，Telegram 仅在 WAL 接收成功后推进 offset；
+- 飞书未知私聊用户的一次性配对码、过期、平台隔离和撤销；
+- 飞书连接、open_id/chat_id、@状态和 allowlist 决策的短期诊断；
+- DSH Web 设置页、凭据库 App Secret 保存、本机设置接口和运行时热重载；
 - 单元测试、插件配置示例和运行手册。
 
 暂不在第一版硬塞入：
 
 - Discord Gateway、飞书 HTTP Webhook 和 WhatsApp 多协议；
-- 图片生成、宠物头像、桌面 Bot roster UI；
+- 图片生成、宠物头像、完整 Bot roster UI；
 - 自建 cron 引擎；优先复用 DSH 的 command/jobs/schedule seam；
 - 自动放开 Full Access。权限由 DSH profile 和 Bot allowlist 共同决定。
 
@@ -125,23 +129,24 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 
 ### 3.3 安全默认值
 
-- Telegram 默认 `allowlist`，没有明确的用户/聊天白名单时不处理普通消息；
+- 默认 `allowlist`，没有明确的用户/聊天白名单时不处理普通消息；飞书私聊可选择一次性配对，不会直接进入 Agent；
 - Token 只从环境变量读取，不写入日志、不写入 Git；
-- 状态目录默认位于 `DSH_HOME` 下，可单独用 `DSH_HERMES_BOT_HOME` 指定；
+- 状态目录默认位于 `DSH_HOME` 下，可用 `DEEPSEEK_BOT_HOME` 或兼容的 `DSH_HERMES_BOT_HOME` 指定；
 - Outbox 只记录目标和文本，不记录 Bot Token；
 - 日志中的用户 ID、聊天 ID 支持脱敏；
 - 不把未知 `/xxx` 静默丢掉；它会进入 DSH Agent，或由 DSH command registry 接管；
 - 失败重试有次数和退避上限，避免断网时无限打 API。
+- Web 设置接口额外检查 loopback Host、Origin、Fetch Metadata 和 socket 对端地址；诊断不记录消息正文。
 
 ## 4. 已知边界
 
-`DeepSeek-Bot` 是新建插件仓库，不是 DeepSeek Harness 的源码副本。安装时需要一个已安装并启用了 Agent Loop、Session Persistence 和对应工具的 DSH profile。插件只依赖公开的 DSH service contract；如果未来 DSH 的 developer preview 改变 API，适配集中在 `src/harness-bridge.ts`。
+`DeepSeek-Bot` 不是 DeepSeek Harness 的源码副本。安装时需要一个已安装并启用了 Agent Loop、Session Persistence 和对应工具的 DSH profile；Web 设置页还需要 DSH Web 的 client、settings、credentials 和 webserver peer 组件。插件只依赖公开的 DSH service contract；如果未来 DSH 的 developer preview 改变 API，适配集中在 `src/harness-bridge.ts` 和设置适配层。
 
 ## 5. 后续路线
 
-1. Telegram 真实 Bot token 下做端到端 smoke test。
+1. Telegram 和飞书真实凭证下做端到端 smoke test。
 2. 增加 `dsh-agent-message` 风格的跨会话 mailbox 和回执。
 3. 在现有飞书通道上增加 CardKit 流式回复、按钮审批和媒体上传；复用 `dsh-lark-link` 已验证的 WAL/Outbox 经验，但不复制其业务代码。
 4. 以 DSH `ctx.jobs` / schedule seam 对接 Hermes Routine。
-5. 在 DSH Web profile 增加轻量 Bot roster UI：canonical chat、未读标记、profile 选择和 routine 列表。
+5. 在当前设置页基础上增加轻量 Bot roster UI：canonical chat、未读标记、profile 选择和 routine 列表。
 6. 所有大体积回放、诊断 ZIP、压测日志和构建归档放 Google Drive；GitHub 只保存源代码、测试、文档和小型 manifest。
