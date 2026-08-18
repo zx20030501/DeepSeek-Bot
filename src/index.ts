@@ -81,6 +81,14 @@ export function apply(ctx: Context, config: unknown = {}): void {
 
 export { BotGateway, discoveryCandidateFor } from './gateway.js'
 export { InboundWal, Outbox } from './durable.js'
+export {
+  BotDirectory,
+  BotMailbox,
+  GroupRoomStore,
+  TaskRunStore,
+  createEnvelope,
+  parseBotMentions,
+} from './collaboration.js'
 export { PairingStore } from './pairing.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
