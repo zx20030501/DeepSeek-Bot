@@ -1,5 +1,134 @@
 # DeepSeek-Bot
 
+## English
+
+A Telegram and Feishu/Lark message-ingestion plugin for DeepSeek Harness.
+
+DeepSeek-Bot connects external chat platforms through DeepSeek Harness's public Cordis plugin boundary. It does not modify the Harness core or replace the Harness Agent Loop. The repository keeps `dsh-hermes-bot` as the DSH plugin ID and legacy environment-variable prefix so already-installed profiles remain compatible; the project name and new configuration prefix use `DeepSeek-Bot`.
+
+### Current Features
+
+- Telegram Bot API long polling and the official Feishu/Lark SDK WebSocket long connection;
+- Feishu direct messages, group-chat `@bot` handling, topic/reply context, and Markdown replies;
+- Inbound WAL: persist messages before handing them to the Agent, retry failures with bounded backoff, and recover after restart;
+- Advance the Telegram polling offset only after the message has been accepted by the WAL, avoiding message loss when processing fails;
+- Outbox delivery with idempotency keys, per-chat serialization, retries, exponential backoff, and a dead-letter state;
+- Platform-event deduplication and stable bindings from platform/chat/thread targets to DSH sessions;
+- `/new`, `/reset`, `/stop`, `/status`, `/help`, `/bots`, `/bot`, and `/model` commands;
+- `/model provider:model` overrides and inheritance from the DSH default model;
+- Allowlist access control by user ID or chat ID;
+- One-time pairing codes for unauthorized Feishu direct messages, with platform isolation, expiration, quotas, and revocation;
+- Feishu message-reception diagnostics covering connection state, `open_id`, `chat_id`, mention state, and rejection reasons without recording message bodies;
+- An optional DSH Web settings page for App ID/Secret, allowlists, automatic UID discovery, pairing, and diagnostics;
+- TypeScript strict checking, Node unit tests, and the standard `dsh.bundle` distribution format.
+
+### How It Works
+
+```text
+Telegram / Feishu events
+        │
+        ▼
+Normalize platform message → access control → deduplication → Inbound WAL
+        │
+        ▼
+Serialize processing by chat/thread → DeepSeek Harness Agent
+        │
+        ▼
+session/event → Outbox → reply on the original platform
+```
+
+Platform adapters, reliable delivery, session routing, and Harness calls are separated. When adding a platform, you mainly extend the Transport layer; the WAL, Outbox, and Agent-session logic do not need to be reimplemented.
+
+### Installation and Build
+
+In an environment where DeepSeek Harness is already installed:
+
+```bash
+npm ci
+npm run build
+# If you use the DSH Web settings page, also build the client module:
+npm run build:client
+
+dsh plugin --profile web add . --ignore-scripts
+dsh web
+```
+
+If you only use backend environment variables, `npm run build` is sufficient. The Web settings page requires the DSH Web client peer component.
+
+### Configuration
+
+The new configuration prefix is `DEEPSEEK_BOT_`; the legacy `DSH_HERMES_BOT_` variables remain supported:
+
+```bash
+export DEEPSEEK_BOT_TELEGRAM_TOKEN='your Telegram Bot Token'
+export DEEPSEEK_BOT_FEISHU_APP_ID='cli_xxxxxxxxxxxx'
+export DEEPSEEK_BOT_FEISHU_APP_SECRET='your Feishu App Secret'
+export DEEPSEEK_BOT_ALLOWED_USERS='ou_xxxxxxxxxxxx'
+# Or authorize by chat:
+# export DEEPSEEK_BOT_ALLOWED_CHATS='oc_xxxxxxxxxxxx'
+```
+
+The Feishu App Secret can also be saved to the local credential store through the DSH Web settings page. It is not written to settings, state files, the README, or Git. Group chats require an `@bot` mention by default; direct messages do not.
+
+If you only use Feishu, Telegram can be disabled in the profile overlay:
+
+```yaml
+telegram:
+  enabled: false
+feishu:
+  enabled: true
+  domain: feishu # Use lark for overseas Lark
+  requireMention: true
+access:
+  mode: allowlist
+  pairing: true
+```
+
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete configuration reference and Feishu Open Platform setup steps.
+
+### Security and State
+
+The default access mode is `allowlist`. When no user or chat allowlist is configured, ordinary messages are not passed to the Agent. One-time pairing accepts direct messages only, isolates requests by `platform + userId`, expires after one hour by default, and limits the number of pending confirmations.
+
+The settings endpoint accepts loopback requests only and checks the Host, Origin, Fetch Metadata, and peer socket address. Diagnostics retain only short-lived counters and ID metadata; message bodies are not stored. Runtime state is located at:
+
+```text
+${DSH_HOME:-~/.dsh}/hermes-bot/
+├── state.json
+├── pairing.json
+├── inbound-wal.jsonl
+└── outbox.jsonl
+```
+
+This directory may contain chat messages and model replies and must not be committed to GitHub. Large replays, diagnostic archives, load-test logs, and build archives are kept out of the repository; this implementation did not generate any large files that need to be uploaded to Google Drive.
+
+### Tests
+
+```bash
+npm run check
+npm test
+npm run pack:check
+```
+
+Tests cover command parsing, model overrides, WAL recovery and retries, Outbox delivery, Telegram chunking, Feishu normalization and connection lifecycle, pairing state, the Harness default model, UID discovery, and the loopback security boundary of the settings endpoint.
+
+### Current Limitations
+
+Feishu CardKit streaming cards, real file/image/voice forwarding, HTTP Webhooks, and other platforms such as Discord and Slack are not implemented yet. They can be added on top of the existing Transport, Delivery, and Harness Adapter layers.
+
+### Project Links
+
+- GitHub: <https://github.com/zx20030501/DeepSeek-Bot>
+- DeepSeek Harness: <https://github.com/deepseek-ai/deepseek-harness>
+- Hermes Agent: <https://github.com/NousResearch/hermes-agent>
+- Official Feishu Node SDK: <https://github.com/larksuite/node-sdk>
+
+---
+
+## 中文
+
+# DeepSeek-Bot
+
 面向 DeepSeek Harness 的 Telegram 与飞书/Lark 消息接入插件。
 
 DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部聊天平台，不修改 Harness 核心，也不替代 Harness 的 Agent Loop。仓库保留 `dsh-hermes-bot` 作为 DSH 插件 ID 和旧环境变量前缀，以兼容已经安装的 profile；项目名称和新配置前缀统一使用 DeepSeek-Bot。
@@ -120,4 +249,3 @@ npm run pack:check
 - DeepSeek Harness：<https://github.com/deepseek-ai/deepseek-harness>
 - Hermes Agent：<https://github.com/NousResearch/hermes-agent>
 - 飞书官方 Node SDK：<https://github.com/larksuite/node-sdk>
-

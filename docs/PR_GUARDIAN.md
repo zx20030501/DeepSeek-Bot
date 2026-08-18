@@ -1,5 +1,143 @@
 # DeepSeek-Bot PR Guardian
 
+## English
+
+## Purpose
+
+PR Guardian is this repository's GitHub Actions automation reviewer. Its workflow is designed to:
+
+1. Run deterministic CI first to validate TypeScript, tests, the client build, and npm packaging;
+2. Have DeepSeek perform a structured review of the PR diff and publish a GitHub Check named `AI Review`;
+3. Attempt a bounded number of low-risk automatic fixes only for repository-owned `agent/` branches;
+4. Automatically rerun CI and AI Review after a fix commit;
+5. Request GitHub Auto-merge only when the change is low risk, AI Review passes, and the PR is not a Draft;
+6. Send workflows, dependency manifests, credentials, authentication, pairing, gateway, Transport, and security-boundary changes to human review by default.
+
+AI Review is an automated gate, not a human GitHub approval. The repository Ruleset and required status checks still make the final merge decision.
+
+## Enable AI Review
+
+Open the following page in the repository:
+
+~~~text
+Settings → Secrets and variables → Actions → New repository secret
+~~~
+
+Create this repository secret:
+
+~~~text
+DEEPSEEK_API_KEY=your DeepSeek API key
+~~~
+
+Do not paste the key into source code, Issues, PRs, logs, or chat. The workflow reads the GitHub Actions Secret only and never writes the key to the repository.
+
+Optional repository variables:
+
+~~~text
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat
+~~~
+
+If these variables are not set, the defaults above are used. If `DEEPSEEK_API_KEY` is missing, AI Review fails with a configuration message and deterministic CI continues, but the system will not auto-fix or auto-merge.
+
+## Ruleset Configuration
+
+The current `Protect main` ruleset already requires:
+
+~~~text
+test (22)
+~~~
+
+After PR Guardian has completed one successful run, add the following to the Required status checks in the same ruleset:
+
+~~~text
+AI Review
+~~~
+
+This prevents `main` from merging when AI Review fails even if someone attempts to invoke Auto-merge through another path. Configure `DEEPSEEK_API_KEY` first and let the workflow complete at least once before adding this check.
+
+Also enable **Allow auto-merge** under Settings → General → Pull Requests. If it is disabled, the Auto-merge job stops and does not bypass the Ruleset.
+
+The following settings are also recommended:
+
+- Disable force pushes;
+- Disable deletion of `main`;
+- Require pull requests;
+- Keep both `test (22)` and `AI Review` as required checks;
+- Keep human review for high-risk files.
+
+## Automatic-Fix Boundary
+
+Automatic fixes run only when all of the following conditions are satisfied:
+
+- The PR's head repository is this repository;
+- The PR branch starts with `agent/`, for example `agent/feishu-card`;
+- AI classifies the result as `fail` and every finding is marked fixable;
+- The diff does not touch human-review paths;
+- The automatic-fix count is below 2;
+- The model-generated Git diff modifies only files already modified by the PR;
+- `git apply`, `git diff --check`, `npm ci --ignore-scripts`, and `npm test` all pass.
+
+Fix failures, out-of-scope patches, test failures, and the retry limit stop the workflow and leave an explanation in the PR conversation. External fork PRs can be read and commented on by AI, but this workflow never writes code to them.
+
+## Auto-Merge Boundary
+
+The first version enables GitHub Auto-merge only for low-risk, same-repository `agent/` branches on non-Draft PRs. It does not bypass the Ruleset or replace human review. GitHub waits until `test (22)`, `AI Review`, and every other required Ruleset condition has passed before merging.
+
+High-risk paths include:
+
+~~~text
+.github/workflows/
+.github/actions/
+.github/pr-guardian.mjs
+.github/pr-guardian-policy.json
+package.json
+package-lock.json
+Any path containing credential, secret, security, auth, or pairing
+src/feishu.ts
+src/telegram.ts
+src/gateway.ts
+src/harness-bridge.ts
+src/setup-security.ts
+src/setup.ts
+src/setup-route.ts
+~~~
+
+To adjust the scope, edit `.github/pr-guardian-policy.json` through a PR. Do not change the security policy while a workflow is running.
+
+## Security Design
+
+The review workflow uses `pull_request_target`, checks out only the trusted base branch, and reads external PRs as diff data without executing their code. The automatic-fix job checks out and tests a PR branch only when it belongs to this repository and starts with `agent/`.
+
+Workflow permissions are separated by job: review receives permissions to read code and write Checks/comments; automatic fixing and Auto-merge request `contents: write`. All commits are created by the GitHub Actions bot identity and include a `[pr-guardian-fix: n/2]` marker to limit loops.
+
+## Daily Use
+
+Recommended branch naming:
+
+~~~bash
+git switch -c agent/my-change
+git push -u origin agent/my-change
+~~~
+
+After opening a PR, the system triggers automatically. If you want human handling only, use a normal branch name; it will not receive automatic-fix or auto-merge permissions.
+
+To disable the automation urgently:
+
+1. Delete or rotate `DEEPSEEK_API_KEY`;
+2. Temporarily disable the PR Guardian workflow;
+3. Keep the `Protect main` Ruleset and the `test (22)` check.
+
+## Large Data
+
+PR Guardian writes only bounded diff summaries and review results to GitHub Checks/comments. It does not commit replays, diagnostic archives, load-test logs, or build archives to the repository. Large runtime artifacts remain in the project's designated Google Drive directory; this implementation did not generate any files that need to be uploaded.
+
+---
+
+## 中文
+
+# DeepSeek-Bot PR Guardian
+
 ## 目的
 
 PR Guardian 是本仓库自己的 GitHub Actions 自动化审核器，目标是把流程固定为：

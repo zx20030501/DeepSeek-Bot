@@ -1,3 +1,158 @@
+# DeepSeek-Bot Configuration
+
+## English
+
+### 1. Profile Configuration
+
+The plugin ID remains `dsh-hermes-bot` for compatibility with existing DSH profiles. The project name is DeepSeek-Bot.
+
+```yaml
+- insert:
+    - id: dsh-hermes-bot
+      name: dsh-hermes-bot
+      config:
+        enabled: true
+        defaultProfile: default
+        access:
+          mode: allowlist
+          userIds: []
+          chatIds: []
+          pairing: true
+          notifyUnauthorized: false
+        profiles:
+          default:
+            title: DeepSeek Bot
+          research:
+            title: Research Bot
+            provider: deepseek
+            model: deepseek-v4-flash
+            maxTokens: 8192
+        telegram:
+          enabled: true
+          pollTimeoutSeconds: 30
+          requestTimeoutMs: 70000
+        feishu:
+          enabled: true
+          domain: feishu
+          requireMention: true
+          handshakeTimeoutMs: 15000
+          maxMessageChars: 4000
+        maxInboundAttempts: 3
+        outboxMaxAttempts: 5
+        retryBaseMs: 1000
+        retryMaxMs: 60000
+```
+
+`DEEPSEEK_BOT_*` is the recommended prefix; the legacy `DSH_HERMES_BOT_*` prefix is still supported:
+
+```bash
+export DEEPSEEK_BOT_TELEGRAM_TOKEN='...'
+export DEEPSEEK_BOT_FEISHU_APP_ID='cli_xxxxxxxxxxxx'
+export DEEPSEEK_BOT_FEISHU_APP_SECRET='...'
+export DEEPSEEK_BOT_ALLOWED_USERS='123456789,ou_xxxxxxxxxxxx'
+export DEEPSEEK_BOT_HOME='/path/to/persistent/state'
+```
+
+Do not put Tokens or App Secrets in YAML, source code, logs, or commits. The Web settings page uses the DSH credential service to store the Feishu App Secret.
+
+### 2. Feishu / Lark
+
+The Feishu adapter uses the official `@larksuiteoapi/node-sdk` WebSocket long connection and does not require a public HTTP Webhook.
+
+Complete these steps in the Feishu Open Platform:
+
+1. Create an enterprise self-built application and enable bot capabilities;
+2. Under “Events and Callbacks”, choose “Receive events through a long connection”;
+3. Subscribe to `im.message.receive_v1`;
+4. Enable the permissions required to receive and send messages;
+5. Create and publish an application version;
+6. Add the bot to the target direct message or group chat.
+
+Recommended configuration:
+
+```yaml
+telegram:
+  enabled: false
+feishu:
+  enabled: true
+  domain: feishu       # Use lark for overseas Lark
+  requireMention: true # Group chats require an @bot mention by default
+access:
+  mode: allowlist
+  pairing: true
+```
+
+Use the Feishu `open_id` (normally `ou_...`) for the user allowlist and the `chat_id` (normally `oc_...`) for the group-chat allowlist.
+
+#### One-Time Pairing
+
+When `access.pairing: true` is enabled, a Feishu direct message from an unknown user is not passed to the Agent. The user receives an 8-character pairing code. An administrator enters and confirms that code in the local DSH Web settings page:
+
+- Pairing codes are generated only for direct messages;
+- They expire after one hour by default;
+- Only a small number of pending requests are retained per platform;
+- Approval is isolated by `platform:userId`;
+- Pairings can be revoked from the settings page;
+- After confirmation, the user should send `/new` in the same chat.
+
+#### Automatic UID Discovery
+
+The settings page can start a one-time diagnostic. The plugin temporarily waits for the exact `/bind <code>` command in a Feishu direct message, captures the sender's `open_id` and `chat_id`, and returns metadata only to the local page without storing the message body. Telegram messages and Feishu group chats are not treated as UID-discovery results.
+
+### 3. DSH Web Settings Page
+
+After installing the DSH Web client peer dependency, run:
+
+```bash
+npm run build
+npm run build:client
+dsh web
+```
+
+In the “Feishu Bot” settings area, you can:
+
+- Set the App ID, platform, and group-chat mention rule;
+- Save or update the App Secret; the page never displays it again;
+- Add or remove user IDs and group-chat IDs;
+- Enable one-time pairing;
+- Test the connection and discover a UID automatically;
+- View long-connection state, the actual received user/chat IDs, mention state, and allowlist decisions;
+- Hot-reload the Telegram/Feishu Transport after changes without restarting DSH.
+
+The settings API is the plugin's local endpoint `/api/dsh-hermes-bot/setup`. It checks the loopback Host, Origin, Fetch Metadata, and peer socket address.
+
+### 4. State Directory
+
+Default location:
+
+```text
+${DSH_HOME:-~/.dsh}/hermes-bot/
+├── state.json
+├── pairing.json
+├── inbound-wal.jsonl
+└── outbox.jsonl
+```
+
+State files may contain chat messages and model replies; do not commit them to GitHub. Store large replays, diagnostic archives, and load-test logs in the project's designated Google Drive directory. This repository stores only source code, tests, documentation, and small manifests.
+
+### 5. Commands
+
+The plugin handles these commands locally:
+
+- `/new`, `/reset`: start a new session;
+- `/stop`: stop the current Agent turn;
+- `/status`: view gateway, Transport, WAL, and Outbox status;
+- `/bots`, `/bot <name>`: list and switch profiles;
+- `/model`: view the current model;
+- `/model provider:model`: set the provider/model for the next turn in the current chat;
+- `/help`: show help.
+
+Installed native DSH commands take priority. Unknown `/xxx` commands are still sent as ordinary Agent prompts.
+
+---
+
+## 中文
+
 # DeepSeek-Bot 配置
 
 ## 1. Profile 配置
@@ -146,4 +301,3 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 - `/help`：查看帮助。
 
 已安装的 DSH 原生命令优先执行；未知的 `/xxx` 仍会作为普通 Agent prompt 发送。
-

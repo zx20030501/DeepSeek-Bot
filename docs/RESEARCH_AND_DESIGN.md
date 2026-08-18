@@ -1,3 +1,162 @@
+# DeepSeek-Bot: Hermes Bot Capability Research and Improvement Design
+
+## English
+
+Updated: 2026-08-17
+
+## 1. Executive Summary
+
+`DeepSeek-Bot` is a Cordis plugin that can be installed with `dsh plugin`. It does not modify the DeepSeek Harness upstream source; instead, it implements message ingress, reliable delivery, and session governance at the public service boundary:
+
+```text
+Telegram / other platform adapters
+          │
+          ▼
+Inbound deduplication → Inbound WAL → per-session serial queue → ctx.agents
+                                                               │
+                                                               ▼
+                                                    session/event listeners
+                                                               │
+                                                               ▼
+                                                    Outbox → platform send
+```
+
+This provides the Hermes-style Bot experience together with DSH's native sessions, Agents, tools, and event model, without maintaining a forked Agent Loop alongside the DSH core.
+
+## 2. Research Findings
+
+### Hermes Agent
+
+Upstream repository: <https://github.com/NousResearch/hermes-agent>
+
+Hermes Bot capabilities can be divided into two layers:
+
+1. **Message gateway layer**: Telegram, Discord, Slack, WhatsApp, Signal, and other channels; session continuity, media, commands, cron delivery, access control, reconnection, and multi-platform routing.
+2. **Bot Mode / Agent roster layer**: one Bot per profile, a fixed canonical chat, unread activity, Bot-to-Bot `@mention`, group-chat rooms, Routines, avatars/pets, MCP/Skill configuration, and multi-gateway rosters.
+
+The most valuable things to migrate are not Hermes's Python platform classes, but these reliability invariants:
+
+- Persist inbound requests before handing them to the Agent so they can be retried a bounded number of times after a crash.
+- Use a persistent Outbox for outbound sends and acknowledge only after a successful send. This supports at-least-once delivery instead of assuming that a network call always succeeds.
+- Deduplicate update IDs, event sequence numbers, and outbound idempotency keys.
+- Bind each chat target to a stable session; never write multiple messages concurrently to the same Agent.
+- Route commands, ordinary messages, and native DSH commands separately; unknown commands must not be silently discarded.
+- Enforce access control at the inbound boundary. By default, a Bot must not become an open relay.
+
+### DeepSeek Harness
+
+Upstream repository: <https://github.com/deepseek-ai/deepseek-harness>
+
+The official DSH extension boundary is:
+
+- A Cordis plugin exports `name` and `apply(ctx)`.
+- Use `ctx.agents` to create, restore, and find Agents.
+- Use `agent.followup()` to pass an external user's message to the Agent as a new turn.
+- Listen to `session/event` and read model output from `assistant/message`.
+- Reuse installed native DSH commands through `ctx.commands.execute(agent, line, signal)`.
+- Use `ctx.jobs` for background work instead of creating a parallel Agent Loop.
+
+The project therefore keeps platform adapters behind independent interfaces and treats DSH as a replaceable Agent Runtime.
+
+### Existing Community Implementations
+
+| Project | Problems solved | Implications for this project |
+| --- | --- | --- |
+| [amlyczz/dsh-lark-link](https://github.com/amlyczz/dsh-lark-link) | Feishu bidirectional bridge, Inbound WAL, persistent Outbox, idempotency, media, confirmation cards, diagnostic ZIPs, and session recovery | Reliability needs both inbound and outbound ledgers, and diagnostics must be built in |
+| [hi-wenw/dsh-telegram-channel](https://github.com/hi-wenw/dsh-telegram-channel) | Telegram long polling, per-chat sessions, history reads, and model-selection buttons | The Telegram adapter can start with zero native dependencies; platform logic must not contaminate the Agent layer |
+| [NanmiCoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | Persistent sub-Agents, dependent tasks, direct messages, state recovery, and a Web UI | Bot-to-Bot communication should use the native DSH Agent/message boundary rather than shared global variables |
+| [GengDaPeng/dsh-agent-message](https://github.com/GengDaPeng/dsh-agent-message) | Cross-session discovery, offline delivery, acknowledgements, and sender navigation | Bot targets and DSH session targets can later be unified as receipt-aware mailboxes |
+| [Cavan-Ou/hermes-dsh-collab](https://github.com/Cavan-Ou/hermes-dsh-collab) | Hermes dispatch, DSH execution, quality gates, and a single Git writer | When Hermes orchestrates work, scope, tests, and single-writer constraints are required |
+| [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) | A plugin marketplace containing entries for `hermes-dsh-collab`, Telegram, Feishu, message centers, and more | Keep the standard `dsh.bundle` plugin distribution instead of copying a giant fork |
+
+### Feishu Official Capability Constraints
+
+This integration follows the Feishu official documentation and official Node SDK:
+
+- [Receive message events](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive): an application bot receives direct or group-chat messages through `im.message.receive_v1`.
+- [Send messages](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/create): the application identity sends messages to a `chat_id` or user ID using a `tenant_access_token`.
+- [Reply to messages](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/reply): replies can target a `message_id` and preserve message context.
+- [Official Node SDK](https://github.com/larksuite/node-sdk): `@larksuiteoapi/node-sdk` provides WebSocket long connections, event normalization, reconnection, message chunking, and CardKit capabilities.
+
+The current implementation therefore uses an enterprise self-built application bot rather than a group custom-bot Webhook that can only push messages in one direction. This is necessary to receive user messages, distinguish senders, respond to group-chat `@bot` mentions, and preserve identity and event context for future Bot collaboration, approval cards, and cross-session governance.
+
+## 3. A Better Approach Than Direct Porting
+
+### 3.1 Layering
+
+```text
+Transport        Telegram, Feishu, Discord, Webhook
+                 Only handles platform send/receive and limits
+
+Delivery         Dedupe, Inbound WAL, Outbox, retries, lane serialization
+                 Only handles reliable message delivery
+
+Routing          chat → profile → stable session id
+                 Only handles binding and permissions
+
+Harness Adapter  ctx.agents, agent.followup, session/event, DSH commands
+                 Only handles calls into DeepSeek Harness
+```
+
+Each layer can be tested independently. Adding a platform only requires a Transport implementation; session, retry, and security logic do not need to be copied.
+
+### 3.2 Current Implementation Scope
+
+The first version includes:
+
+- Telegram Bot API long polling;
+- Feishu/Lark application-bot WebSocket long connection using the official `@larksuiteoapi/node-sdk`;
+- Stable DSH sessions per chat/thread;
+- Inbound WAL, update deduplication, Outbox, idempotency keys, exponential backoff, and dead-letter state;
+- `/new`, `/stop`, `/status`, `/help`, `/bots`, `/bot <name>`, and `/model`;
+- Native DSH commands take priority; unknown `/xxx` commands are still passed to the Agent;
+- Telegram 4096-character chunking, typing indicators, and access allowlists;
+- Feishu direct messages, group-chat `@bot`, topic/reply relationships, Markdown outbound messages, and automatic reconnection;
+- Model text returned to Telegram through `session/event`;
+- Bounded recovery of incomplete inbound requests after a crash or restart;
+- Bounded backoff retries for inbound failures; Telegram advances its offset only after WAL acceptance;
+- One-time pairing codes for unknown Feishu direct-message users, with expiration, platform isolation, and revocation;
+- Short-lived diagnostics for Feishu connections, `open_id`/`chat_id`, mention state, and allowlist decisions;
+- DSH Web settings page, credential-store App Secret persistence, local settings API, and runtime hot reload;
+- Unit tests, plugin configuration examples, and an operations guide.
+
+The first version deliberately does not include:
+
+- Discord Gateway, Feishu HTTP Webhooks, or WhatsApp multi-protocol support;
+- Image generation, pet avatars, or a complete Bot roster UI;
+- A custom cron engine; the project should first reuse the DSH command/jobs/schedule seams;
+- Automatic Full Access. Permissions are jointly determined by the DSH profile and the Bot allowlist.
+
+The first Feishu version uses an official WebSocket long connection rather than a Webhook because the project primarily runs inside a local/server DSH process and does not need to expose a public callback address. A Webhook can be added later when a reverse proxy and unified ingress are available. Other capabilities should be added as adapters or UI plugins rather than making the core reliability code difficult to verify.
+
+### 3.3 Secure Defaults
+
+- Default to `allowlist`. Without an explicit user or chat allowlist, ordinary messages are not processed; Feishu direct messages can use one-time pairing instead of entering the Agent directly.
+- Read Tokens only from environment variables; do not write them to logs or Git.
+- Put the default state directory under `DSH_HOME`; `DEEPSEEK_BOT_HOME` or the compatible `DSH_HERMES_BOT_HOME` can override it.
+- Record only targets and text in the Outbox; never record Bot Tokens.
+- Support redaction of user IDs and chat IDs in logs.
+- Do not silently discard unknown `/xxx`; pass them to the DSH Agent or let the DSH command registry handle them.
+- Bound retry counts and backoff to avoid calling the API forever during an outage.
+- The Web settings API additionally checks the loopback Host, Origin, Fetch Metadata, and peer socket address; diagnostics do not record message bodies.
+
+## 4. Known Boundaries
+
+`DeepSeek-Bot` is not a copy of the DeepSeek Harness source. Installation requires a DSH profile with the Agent Loop, Session Persistence, and the relevant tools installed and enabled. The Web settings page also requires the DSH Web client, settings, credentials, and webserver peer components. The plugin depends only on the public DSH service contract; if a future DSH developer preview changes the API, compatibility work is concentrated in `src/harness-bridge.ts` and the settings adapter layer.
+
+## 5. Roadmap
+
+1. Run end-to-end smoke tests with real Telegram and Feishu credentials.
+2. Add a `dsh-agent-message`-style cross-session mailbox and acknowledgements.
+3. Add CardKit streaming replies, button approvals, and media uploads to the existing Feishu channel. Reuse the WAL/Outbox lessons validated by `dsh-lark-link` without copying its business code.
+4. Connect Hermes Routines through the DSH `ctx.jobs` / schedule seam.
+5. Extend the current settings page with a lightweight Bot roster UI: canonical chat, unread markers, profile selection, and a Routine list.
+6. Keep large replays, diagnostic ZIPs, load-test logs, and build archives in Google Drive; GitHub stores only source code, tests, documentation, and small manifests.
+
+---
+
+## 中文
+
 # DeepSeek-Bot：Hermes Bot 能力调研与改进设计
 
 更新时间：2026-08-17
