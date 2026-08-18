@@ -1,0 +1,17 @@
+{
+  "maxDiffChars": 80000,
+  "maxFixAttempts": 2,
+  "trustedBranchPrefixes": [
+    "agent/"
+  ],
+  "autoMergeRisk": [
+    "low"
+  ],
+  "manualReviewPaths": [
+    "^\\.github/workflows/",
+    "^\\.github/actions/",
+    "^(package\\.json|package-lock\\.json)$",
+    "(^|/)(credential|secret|security|auth|pairing)(\\.|/|$)",
+    "^src/(feishu|telegram|gateway|harness-bridge|setup-security|setup)\\.ts$"
+  ]
+}
