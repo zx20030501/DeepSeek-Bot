@@ -50,12 +50,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
       onChange: () => { refreshGateway() },
     },
   )
-  installSetupRoute(ctx, () => settingsSource(), () => gateway.status(), {
+  installSetupRoute(ctx, () => settingsSource(), () => gateway.fleetStatus(), {
     beginDiscovery: () => gateway.beginDiscovery(),
     discoveryCandidate: () => gateway.discoveryCandidate(),
     clearDiscovery: () => gateway.clearDiscovery(),
     approvePairing: code => gateway.approvePairing(code),
     revokePairing: (platform, userId) => gateway.revokePairing(platform, userId),
+    resolveFleetApproval: (code, decision) => gateway.resolveApproval(code, decision),
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
     const credentialEvents = credentialsCtx as unknown as {
@@ -84,6 +85,8 @@ export { InboundWal, Outbox } from './durable.js'
 export {
   BotDirectory,
   BotMailbox,
+  FleetApprovalStore,
+  FleetPlanner,
   GroupRoomStore,
   TaskRunStore,
   createEnvelope,

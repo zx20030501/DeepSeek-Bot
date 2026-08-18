@@ -13,12 +13,15 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - Outbox：幂等键、按聊天串行发送、重试、指数退避和 dead 状态；
 - 平台事件去重，平台/聊天/线程到 DSH session 的稳定绑定；
 - `/new`、`/reset`、`/stop`、`/status`、`/help`、`/bots`、`/bot`、`/model`；
-- BotMesh：Bot roster、Canonical Session、结构化 Mailbox、Task/Run/Handoff 审计、`@bot` 路由和有界 Group Room；
+- Bot Fleet：可编辑 roster、能力/SOUL/模型/角色、每 Bot ACL，以及默认按使用者隔离的稳定会话；
+- 结构化 Mailbox、Task/Run/Handoff/Audit、租约续期、fencing、真实退避重试、重启恢复和 dead-letter；
+- `@bot` 路由、2–6 Bot 顺序 Group Room，以及 `/fleet` 并行“执行 → 验证 → 汇总”工作流；
+- `/tasks`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
 - 飞书消息接收诊断：连接状态、open_id、chat_id、@状态和拒绝原因，不记录正文；
-- 可选的 DSH Web 设置页：App ID/Secret、白名单、UID 自动识别、配对和诊断；
+- 可选的 DSH Web 设置页：App ID/Secret、白名单、UID 自动识别、配对、Bot roster、Fleet 参数、审批和运行诊断；
 - TypeScript 严格检查、Node 单元测试和标准 `dsh.bundle` 分发格式。
 
 ## 工作方式
@@ -30,7 +33,8 @@ Telegram / 飞书事件
 平台消息归一化 → 访问控制 → 去重 → Inbound WAL
         │
         ▼
-外部聊天 → Task/Run → BotMesh Mailbox → Bot Canonical Session
+普通消息 ─────────────────────────────→ 当前聊天 DSH Session
+@bot / /fleet → Task/Workflow/Run → Typed Mailbox → 隔离的 Bot Session
         │
         ▼
 session/event → Audit/Group Room → Outbox → 原平台回复
@@ -38,7 +42,7 @@ session/event → Audit/Group Room → Outbox → 原平台回复
 
 平台适配、可靠投递、会话路由和 Harness 调用彼此分离。新增平台时主要扩展 Transport，不需要重新实现 WAL、Outbox 和 Agent 会话逻辑。
 
-BotMesh 的详细协议、状态机、恢复边界和迁移说明见 [docs/BOTMESH.md](docs/BOTMESH.md)。
+Fleet 使用方式和与 Hermes/Grok 的对应关系见 [docs/FLEET.md](docs/FLEET.md)；底层协议见 [docs/BOTMESH.md](docs/BOTMESH.md)。
 
 ## 安装和构建
 
@@ -101,7 +105,8 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── outbox.jsonl
 ├── mailbox.jsonl
 ├── tasks.jsonl
-└── rooms.json
+├── rooms.json
+└── approvals.json
 ```
 
 该目录可能包含聊天消息和模型回复，不应提交到 GitHub。大体积回放、诊断压缩包、压测日志和构建归档不进入仓库；本次实现没有生成需要上传 Google Drive 的大文件。
@@ -114,11 +119,11 @@ npm test
 npm run pack:check
 ```
 
-测试覆盖命令解析、模型覆盖、WAL 恢复和重试、Outbox、Telegram 切片、飞书归一化和连接生命周期、配对状态、Harness 默认模型、UID 发现、设置接口本机安全边界，以及 BotMesh 的 mention 解析、Mailbox fencing、Task/Run 和 Group Room 限制。
+测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批、Handoff、并行 Task 状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。
 
 ## 当前边界
 
-飞书 CardKit 流式卡片、真实文件/图片/语音转发、HTTP Webhook、跨机器 BotMesh Transport、自动 routines、自动 planner 和完整 Web roster UI 仍未实现；它们可以在现有 Transport、Mailbox、Task/Run 和 Harness Adapter 分层上继续扩展。
+这是单机 DeepSeek Harness 内的 Fleet v1，不是 xAI 内部系统的复制品。当前 Planner 是可审计的确定性能力匹配，工作流采用固定的“执行 → 验证 → 汇总”阶段，最多 6 个不同 Bot；尚未实现 Grok Build 的数百代理弹性 fan-out、可保存任意工作流脚本、跨机器 Transport、定时 Routine、文件/媒体完整转发和通用 Task DAG 编辑器。结构化 Handoff 已有公开 API 和审批状态机，但还没有注册成可由模型直接调用的 DSH Tool。
 
 ## 项目链接
 

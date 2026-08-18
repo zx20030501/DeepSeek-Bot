@@ -62,3 +62,29 @@ test('merges saved setup values and keeps non-form gateway options', () => {
     chatIds: [],
   })
 })
+
+test('Fleet roster settings round-trip roles, ACLs, session isolation, and limits', () => {
+  const base = {
+    profiles: {
+      researcher: {
+        title: 'Researcher',
+        model: 'deepseek-reasoner',
+        capabilities: ['research'],
+        allowedUserIds: ['ou_a'],
+        fleetRole: 'worker',
+        sessionScope: 'requester',
+      },
+    },
+    collaboration: { approvalMode: 'auto-planned', maxGroupRounds: 3 },
+  }
+  const settings = settingsFromGatewayConfig(base)
+  assert.equal(settings.profiles[0]?.id, 'researcher')
+  assert.deepEqual(settings.profiles[0]?.allowedUserIds, ['ou_a'])
+  settings.profiles[0].approvalRequired = true
+  settings.collaboration.maxParallelRuns = 4
+  const next = gatewayConfigFromSettings(base, settings)
+  assert.equal(next.profiles?.researcher?.approvalRequired, true)
+  assert.equal(next.profiles?.researcher?.sessionScope, 'requester')
+  assert.equal(next.collaboration?.maxParallelRuns, 4)
+  assert.equal(next.collaboration?.maxGroupRounds, 3)
+})

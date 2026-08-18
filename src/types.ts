@@ -94,6 +94,15 @@ export interface BotProfile {
   readonly skills?: readonly string[]
   /** Optional short SOUL-style identity prompt for the canonical Bot Chat. */
   readonly soul?: string
+  /** Fleet responsibility used by the deterministic planner. */
+  readonly fleetRole?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  /** Safe default isolates long-term Bot context by requester. */
+  readonly sessionScope?: 'requester' | 'chat' | 'shared' | 'task'
+  /** Optional Bot-level ACL applied after the gateway allowlist/pairing check. */
+  readonly allowedUserIds?: readonly (string | number)[]
+  readonly allowedChatIds?: readonly (string | number)[]
+  /** Require an explicit Fleet approval even when the requester names this Bot. */
+  readonly approvalRequired?: boolean
 }
 
 export interface TelegramConfig {
@@ -144,10 +153,21 @@ export interface BotGatewayConfig {
 export interface BotCollaborationConfig {
   readonly enabled?: boolean
   readonly maxGroupBots?: number
+  /** Number of complete participant cycles in a sequential Group Room. */
+  readonly maxGroupRounds?: number
+  /** @deprecated Alias retained for existing PR #8 configurations. */
   readonly maxGroupTurns?: number
   readonly maxGroupMessages?: number
   readonly mailboxMaxAttempts?: number
   readonly mailboxLeaseMs?: number
+  readonly mailboxRetryBaseMs?: number
+  readonly mailboxRetryMaxMs?: number
+  readonly botRunMaxAttempts?: number
+  readonly maxParallelRuns?: number
+  readonly defaultSessionScope?: 'requester' | 'chat' | 'shared' | 'task'
+  readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
+  readonly approvalTtlMs?: number
+  readonly autoPlanner?: boolean
 }
 
 export interface BotDescriptor {
@@ -158,6 +178,11 @@ export interface BotDescriptor {
   readonly capabilities: readonly string[]
   readonly skills: readonly string[]
   readonly soul?: string
+  readonly fleetRole: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  readonly sessionScope: 'requester' | 'chat' | 'shared' | 'task'
+  readonly allowedUserIds: readonly string[]
+  readonly allowedChatIds: readonly string[]
+  readonly approvalRequired: boolean
   readonly canonicalSessionId: string
   readonly enabled: boolean
 }
@@ -296,6 +321,9 @@ export interface RunRecord {
   readonly botId: string
   readonly attemptId: string
   readonly attempt: number
+  readonly workflowId?: string
+  readonly phase?: FleetWorkflowPhase
+  readonly parentRunId?: string
   readonly status: RunStatus
   readonly createdAt: number
   readonly updatedAt: number
@@ -312,6 +340,8 @@ export interface HandoffRecord {
   readonly fromBot: string
   readonly toBot: string
   readonly reason: string
+  readonly replyTarget: BotTarget
+  readonly approvalId?: string
   readonly status: HandoffStatus
   readonly createdAt: number
   readonly updatedAt: number
@@ -322,7 +352,7 @@ export interface AuditRecord {
   readonly at: number
   readonly actor: string
   readonly action: string
-  readonly entityType: 'message' | 'task' | 'run' | 'handoff' | 'room'
+  readonly entityType: 'message' | 'task' | 'run' | 'handoff' | 'room' | 'workflow' | 'approval'
   readonly entityId: string
   readonly correlationId?: string
   readonly data?: Record<string, unknown>
@@ -342,12 +372,103 @@ export interface GroupRoomRecord {
   readonly taskId: string
   readonly epoch: number
   readonly nextParticipantIndex: number
-  readonly turnCount: number
+  /** Number of individual Bot turns already reserved. */
+  readonly botTurnCount: number
+  /** Number of complete participant cycles already finished. */
+  readonly roundCount: number
   readonly messageCount: number
-  readonly maxTurns: number
+  readonly maxRounds: number
+  /** Legacy PR #8 fields accepted while reading an existing rooms.json. */
+  readonly turnCount?: number
+  readonly maxTurns?: number
   readonly maxMessages: number
   readonly messages: readonly GroupRoomMessage[]
   readonly closed: boolean
   readonly createdAt: number
   readonly updatedAt: number
+}
+
+export type FleetWorkflowPhase = 'execute' | 'verify' | 'synthesize'
+export type FleetWorkflowStatus =
+  | 'pending-approval'
+  | 'running'
+  | 'verifying'
+  | 'synthesizing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export interface FleetWorkflowOutput {
+  readonly runId: string
+  readonly botId: string
+  readonly phase: FleetWorkflowPhase
+  readonly text: string
+  readonly at: number
+}
+
+export interface FleetWorkflowRecord {
+  readonly id: string
+  readonly taskId: string
+  readonly createdBy: string
+  readonly instruction: string
+  readonly replyTarget: BotTarget
+  readonly workerBotIds: readonly string[]
+  readonly verifierBotId?: string
+  readonly synthesizerBotId: string
+  readonly planReasons: Readonly<Record<string, readonly string[]>>
+  readonly status: FleetWorkflowStatus
+  readonly runIds: readonly string[]
+  readonly outputs: readonly FleetWorkflowOutput[]
+  readonly approvalId?: string
+  readonly result?: string
+  readonly error?: string
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export type FleetApprovalKind = 'workflow' | 'handoff' | 'bot-invocation'
+export type FleetApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired'
+
+export interface FleetApprovalRecord {
+  readonly id: string
+  /** Short code suitable for chat commands; the full UUID remains the durable identity. */
+  readonly code: string
+  readonly kind: FleetApprovalKind
+  readonly requestedBy: string
+  readonly summary: string
+  readonly entityId: string
+  readonly status: FleetApprovalStatus
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly resolvedAt?: number
+  readonly resolvedBy?: string
+}
+
+export interface FleetPlan {
+  readonly workerBotIds: readonly string[]
+  readonly verifierBotId?: string
+  readonly synthesizerBotId: string
+  readonly reasons: Readonly<Record<string, readonly string[]>>
+}
+
+export interface SendBotMessageInput {
+  readonly from: string
+  readonly to: string
+  readonly instruction: string
+  readonly replyTarget: BotTarget
+  readonly title?: string
+  readonly acceptanceCriteria?: readonly string[]
+  readonly correlationId?: string
+  readonly expiresAt?: number
+}
+
+export interface HandoffRequestInput {
+  readonly taskId: string
+  readonly runId: string
+  readonly fromBot: string
+  readonly toBot: string
+  readonly reason: string
+  readonly requestedBy: string
+  readonly replyTarget: BotTarget
+  readonly requireApproval?: boolean
 }

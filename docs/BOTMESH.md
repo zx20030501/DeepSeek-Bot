@@ -1,40 +1,44 @@
-# DeepSeek-Bot BotMesh
+# DeepSeek-Bot BotMesh 协议
 
-BotMesh 是 DeepSeek-Bot 的内部协作控制平面。它借鉴 Hermes Bot Mode 的 roster、Canonical Bot Chat、`@mention` 和 Group Room 体验，但把任务状态、可靠投递和审计放在结构化协议中，而不是依赖 Bot 之间的自由文本转发。
+BotMesh 是 Bot Fleet 的本机可靠执行层。它不修改 DeepSeek Harness Agent Loop；它负责目录、任务状态、投递、租约、审批、协作房间和审计。
 
-## 目标和边界
+面向使用者的配置和命令见 `docs/FLEET.md`。
 
-当前分层如下：
+## 分层
 
 ```text
 Telegram / 飞书
        │
        ▼
-Inbound WAL + chat lane
+访问控制 + Inbound WAL + chat lane
        │
-       ▼
-BotDirectory → Task/Run → Typed Mailbox
-       │                         │
-       │                         ▼
-       │                 DSH Agent Canonical Session
-       │                         │
-       └────────────── Audit ← session events
-                         │
-                         ▼
-               Group Room / Outbox / 原平台回复
+       ├── 普通消息 ──────────────────────────────→ 当前聊天 Session
+       │
+       └── @bot / /fleet
+                │
+                ▼
+       BotDirectory + FleetPlanner + Approval
+                │
+                ▼
+       Task / Workflow / Run / Handoff / Audit
+                │
+                ▼
+       Typed Mailbox ──lease/fencing──→ DSH Bot Session
+                │                              │
+                └──── Group Room / Outbox ←───┘
 ```
 
-- `BotDirectory` 描述可用 Bot、profile、能力、技能、SOUL 和长期 Canonical Session。
-- `TaskRunStore` 是任务、运行和 handoff 的持久化真相，并追加审计记录。
-- `BotMailbox` 负责结构化消息的入队、租约、ack、重试、dead-letter 和 fencing。
-- `GroupRoomStore` 保存有界协作房间的参与者、轮次、epoch 和短 transcript。
-- DSH Agent Session 是执行层；BotMesh 不修改 DeepSeek Harness 的 Agent Loop。
+- `BotDirectory`：profile、能力、技能、SOUL、Fleet 角色、会话范围和每 Bot ACL；
+- `FleetPlanner`：确定性能力匹配，选择 worker、verifier 和 synthesizer；
+- `FleetApprovalStore`：短码、过期、批准和拒绝；
+- `TaskRunStore`：Task、Workflow、Run、Handoff 和 Audit 的 append-only 真相；
+- `BotMailbox`：幂等入队、TTL、lease、续租、ack、重试唤醒、dead-letter 和 fencing；
+- `GroupRoomStore`：2–6 Bot 顺序协作、完整轮次、消息上限和 epoch；
+- DSH Agent Session：真正执行模型回合。
 
-BotMesh 目前是本机单进程控制平面。跨机器 transport、自动 planner、routines、审批 UI 和完整 Web roster 会在后续阶段建立在这些接口之上。
+## Message Envelope
 
-## 结构化消息
-
-每个内部请求都是 `BotMessageEnvelope`：
+内部请求使用 `BotMessageEnvelope`：
 
 ```json
 {
@@ -45,97 +49,123 @@ BotMesh 目前是本机单进程控制平面。跨机器 transport、自动 plan
   "taskId": "task_xxx",
   "runId": "run_xxx",
   "attemptId": "attempt_xxx",
-  "correlationId": "task_xxx",
+  "correlationId": "workflow_xxx",
   "roomId": "room_xxx",
   "epoch": 1,
   "payload": {
-    "instruction": "研究 Hermes Bot Mode",
-    "acceptanceCriteria": [],
+    "instruction": "研究并验证这个方案",
+    "requester": "user:feishu:ou_xxx",
     "replyTarget": { "platform": "feishu", "chatId": "oc_xxx" },
-    "transcript": []
+    "workflowPhase": "execute"
   },
-  "createdAt": 0
+  "createdAt": 0,
+  "expiresAt": 0
 }
 ```
 
-`taskId` 标识业务任务，`runId` 标识一次执行，`attemptId` 标识该次尝试，`correlationId` 把消息、审计和回复串起来。`epoch` 是 Group Room 的代际标记；房间关闭或代际不一致时，迟到结果会被记录为 stale，不再发给用户或继续驱动下一轮。
+`taskId` 是业务任务；每次真正的模型尝试都有新的 `runId` 和 `attemptId`。`correlationId` 连接 Workflow、Message 和 Audit。`epoch` 防止关闭或 supersede 后的房间迟到结果继续驱动状态。
 
-已知的 Bot ID 才会被 `@mention` 路由。未知的 `@name` 保留在原始任务文本中，避免把平台用户 mention 误判为内部 Bot。
+## Mailbox 与重试
 
-## Mailbox 状态机
+单条投递的正常状态：
 
 ```text
 queued → claimed → acknowledged → running → completed
-                           │           └── failed → queued
-                           └──────────────────────→ dead-letter
+                                      ├── failed
+                                      └── dead-letter
 ```
 
-每次 claim 都生成 lease ID 和递增 fencing token。worker 重启、租约过期或旧 worker 晚到时，旧 token 不能再改变当前消息状态。失败消息按退避重试，超过 `mailboxMaxAttempts` 后进入 `dead-letter`，不会无限循环。
+模型调用失败时，当前 Message/Run 终止；如果仍可重试，系统创建新的 Run、attempt 和 Message，并设置 `nextAttemptAt`。这样第二次会真正再次调用模型，不会尝试启动一个已经 failed 的旧 Run。
 
-Mailbox 使用 JSONL append-only journal，启动时重放最后状态。它与外部消息的 Inbound WAL 分开：Inbound WAL 保证平台消息不丢，Mailbox 保证 Bot 协作消息可恢复。
+进程崩溃或 worker 消失时，lease 到期的 Message 可以重新排队；单机进程重启还会立即识别并回收上一 worker ID 的租约，不必空等完整 lease 时长。超过 delivery 上限后进入 dead-letter。每次 claim 都有随机 lease ID 和递增 fencing token，并且所有状态变更还会检查 `leaseExpiresAt`。旧 worker 在租约过期或被重启恢复后不能提交结果。运行中的长回合按租约时长的约三分之一自动续租。
 
-## Task、Run 和 Group Room
+调度器计算最早的 `nextAttemptAt`、`leaseExpiresAt` 和 `expiresAt`，按该时间唤醒。不存在固定 1.5 秒唤醒后错过长退避的问题。
 
-一个 `@bot` 请求创建一个 Task、一个初始 Run 和一条 Mailbox 消息。Bot 运行结束后：
+Mailbox 是 `mailbox.jsonl` append-only journal；平台 Inbound WAL 是另一条独立恢复链。如果进程在 Mailbox 完成与 Run 输出落盘之间退出，启动恢复会把该不完整提交转换为新的 Run/Message 尝试，避免 Task 永久卡住。
 
-1. 成功结果写入 Run、Task 和 Audit；
-2. 结果通过 Outbox 发回原聊天；
-3. 多 Bot 请求追加到 Group Room transcript；
-4. Room 仍未达到限制时，按参与者顺序创建下一个 Run；
-5. 达到限制、失败或出现 stale epoch 时停止继续派发。
+## Workflow
 
-默认限制来自 Hermes Bot Mode 的有界协作原则：最多 6 个 Bot、3 轮、10 条房间消息。配置可以收紧限制，但实现会将它们限制在安全上界内。每个 Bot 使用稳定的 Canonical Session，不会为每一条内部消息创建新的长期会话。
+`/fleet` 创建固定三阶段 Workflow：
 
-当前 Group Room 是串行协作：同一时间一个 Bot 占用一个 Bot lane。这样可以保留可预测的 transcript 顺序，也避免一个 Bot 的旧结果覆盖后续轮次。
+```text
+execute (1–4 workers in parallel)
+              ↓
+verify (optional verifier)
+              ↓
+synthesize (one final answer)
+```
 
-## 配置和状态
+不同 Bot 可以并行，同一个 Bot 同时只运行一个 Run，避免同一稳定 Session 被并发写入。每个阶段结果作为不受信报告传给后续 Bot，不能覆盖原始任务指令。并发 worker 的 Workflow 更新按 workflow ID 串行提交；选中的 verifier 如果最终失败，Workflow 不会静默跳过验证。
 
-Bot 能力在 profile 中声明：
+Workflow、每个 phase 的 Run、Planner 选择依据、输出和最终结果都写入 `tasks.jsonl`。进程重启后，未完成 Workflow 会从持久化 Run/Mailbox 状态继续。
+
+## Group Room
+
+显式同时 mention 多个 Bot 时使用顺序 Group Room。`maxGroupRounds: 3` 表示每个参与 Bot 最多各执行三次，而不是全房间只执行三次。房间仍受 `maxGroupMessages` 的独立上限约束，哪个限制先到就停止。
+
+`supersede()` 会递增 epoch、清空短 transcript 并重置轮次。旧 epoch 的结果只写 stale audit，不再回复或派发下一轮。
+
+## 会话与 ACL
+
+Bot 会话默认 `requester`：稳定但按使用者隔离。还可配置 `chat`、`task` 或显式高风险的 `shared`。`canonicalSessionId` 只表示 Bot 的共享基准 ID；真正执行时由 session scope、请求者、聊天或 Task 解析 scoped session ID。
+
+平台 allowlist/配对先执行；每 Bot `allowedUserIds` / `allowedChatIds` 再收紧。Planner 在选 Bot 前执行同一 ACL，不会通过自动路由绕过权限。
+
+## Handoff 与审批
+
+`BotGateway.requestHandoff()` 是结构化公开 API。Handoff 有 requested、accepted、completed、rejected 状态；需要审批时，批准后才取消并 fence 源 Run、再创建目标 Run。accepted Handoff 可在重启后幂等恢复，不会同时保留一个可继续执行的旧源投递。模型直接调用的 DSH Tool 尚未注册，因此当前 Handoff 由插件/API 发起，不解析任意自由文本 shell 指令。
+
+Workflow 和 Handoff 审批保存在 `approvals.json`。聊天审批仅允许原请求者；本机受信设置页是管理员入口。过期审批会自动取消 pending Workflow 或拒绝 pending Handoff。
+
+## 配置
 
 ```yaml
 profiles:
-  research:
+  researcher:
     title: Research Bot
+    fleetRole: worker
     capabilities: [research, source-review]
     skills: [web-research]
     soul: "先给证据，再给结论。"
+    sessionScope: requester
+    allowedUserIds: []
+    allowedChatIds: []
+    approvalRequired: false
+  reviewer:
+    fleetRole: verifier
+    capabilities: [verify, audit]
+  writer:
+    fleetRole: synthesizer
+    capabilities: [synthesis, writing]
 collaboration:
   enabled: true
+  autoPlanner: true
+  approvalMode: auto-planned
+  defaultSessionScope: requester
   maxGroupBots: 6
-  maxGroupTurns: 3
+  maxGroupRounds: 3
   maxGroupMessages: 10
+  maxParallelRuns: 6
+  botRunMaxAttempts: 3
   mailboxMaxAttempts: 3
   mailboxLeaseMs: 120000
+  mailboxRetryBaseMs: 1000
+  mailboxRetryMaxMs: 60000
 ```
 
-默认运行状态目录为 `${DSH_HOME:-~/.dsh}/hermes-bot/`，新增：
+旧 `maxGroupTurns` 仍作为 `maxGroupRounds` 的兼容别名读取。
+
+## 状态文件
 
 ```text
-mailbox.jsonl  # BotMessageEnvelope 和 Mailbox 状态
-tasks.jsonl    # Task、Run、Handoff、Audit
-rooms.json     # Group Room 元数据和短 transcript
+mailbox.jsonl   # Envelope 和 delivery 状态
+tasks.jsonl     # Task/Workflow/Run/Handoff/Audit
+rooms.json      # Group Room/epoch/transcript
+approvals.json  # 审批状态
 ```
 
-这些文件可能包含用户任务和模型输出，只保存在运行机，不提交 Git。大体积回放、压测日志和调研归档放 Google Drive；仓库只保留小型测试和协议文档。
+文件可能包含任务和模型输出，只保存在运行机，不提交 Git。
 
-## 使用示例
+## 边界
 
-```text
-@research 请比较 Hermes Bot Mode 与当前项目，并列出有源码依据的差异
-```
-
-```text
-@research @writer 先研究，再把结果整理成实施方案
-```
-
-可以使用 `/bots` 查看 roster，使用 `/mesh` 查看 Mailbox、Task、Run、Handoff 和正在执行的 Bot 数量。平台 allowlist、配对和原有 Inbound WAL 仍然先于 BotMesh 生效；未获授权的消息不会创建协作任务。
-
-## 后续扩展顺序
-
-1. 增加显式 Planner：根据能力和 acceptance criteria 生成 Task DAG，而不是只按 mention 顺序分派；
-2. 将 `HandoffRecord` 接入结构化 handoff API，并增加审批/拒绝策略；
-3. 增加 Routine → Run → Task 入口，避免 cron 直接执行自由文本；
-4. 抽象远程 transport，支持跨 gateway、跨机器和连接恢复；
-5. 为 Web UI 增加 roster、room transcript、run 状态和审计查询；
-6. 在 CI 中加入协议兼容、恢复、并发创建和跨进程 transport 测试。
-
+BotMesh 当前是单机、单 Node.js 进程的控制平面。没有跨机器共识、远程 worker transport、任意 DAG、Routine/cron 或数百代理弹性 fan-out。Web 控制台提供 roster、状态、审批和 dead-letter 摘要，但还没有 transcript/audit 搜索、取消、重放和 DAG 编辑。

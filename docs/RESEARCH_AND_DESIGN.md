@@ -145,8 +145,8 @@ Harness Adapter  ctx.agents、agent.followup、session/event、DSH commands
 ## 5. 后续路线
 
 1. Telegram 和飞书真实凭证下做端到端 smoke test。
-2. 增加 `dsh-agent-message` 风格的跨会话 mailbox 和回执。
+2. 在当前本机 Typed Mailbox、ack/lease/fencing/retry 基础上增加跨机器 worker transport。
 3. 在现有飞书通道上增加 CardKit 流式回复、按钮审批和媒体上传；复用 `dsh-lark-link` 已验证的 WAL/Outbox 经验，但不复制其业务代码。
 4. 以 DSH `ctx.jobs` / schedule seam 对接 Hermes Routine。
-5. 在当前设置页基础上增加轻量 Bot roster UI：canonical chat、未读标记、profile 选择和 routine 列表。
+5. 在现有 Bot roster/Fleet 控制台基础上增加独立 canonical chat、未读标记、头像和 routine 列表。
 6. 所有大体积回放、诊断 ZIP、压测日志和构建归档放 Google Drive；GitHub 只保存源代码、测试、文档和小型 manifest。

@@ -12,11 +12,13 @@ export default {
   dts: false,
   sourcemap: true,
   clean: false,
-  external: [
-    'react',
-    'react/jsx-runtime',
-    '@deepseek-ai/dsh-client-runtime/client',
-  ],
+  deps: {
+    neverBundle: [
+      'react',
+      'react/jsx-runtime',
+      '@deepseek-ai/dsh-client-runtime/client',
+    ],
+  },
   outputOptions: {
     entryFileNames: 'client.js',
     banner: 'window.__ModuleLoader__.load({ id: "dsh-hermes-bot", factory: (require) => {',

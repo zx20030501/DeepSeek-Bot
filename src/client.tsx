@@ -26,6 +26,47 @@ interface HermesBotSettings {
     chatIds: string[]
     pairing: boolean
   }
+  collaboration: FleetSettings
+  profiles: FleetProfileSettings[]
+}
+
+interface FleetSettings {
+  enabled: boolean
+  autoPlanner: boolean
+  approvalMode: 'never' | 'auto-planned' | 'multi-bot' | 'always'
+  defaultSessionScope: 'requester' | 'chat' | 'shared' | 'task'
+  maxGroupBots: number
+  maxGroupRounds: number
+  maxGroupMessages: number
+  maxParallelRuns: number
+  botRunMaxAttempts: number
+}
+
+interface FleetProfileBase {
+  id: string
+  title: string
+  description: string
+  provider: string
+  model: string
+  soul: string
+  fleetRole: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  sessionScope: 'requester' | 'chat' | 'shared' | 'task'
+  approvalRequired: boolean
+  enabled: boolean
+}
+
+interface FleetProfileSettings extends FleetProfileBase {
+  capabilities: string[]
+  skills: string[]
+  allowedUserIds: string[]
+  allowedChatIds: string[]
+}
+
+interface FleetProfileDraft extends FleetProfileBase {
+  capabilitiesText: string
+  skillsText: string
+  allowedUserIdsText: string
+  allowedChatIdsText: string
 }
 
 interface CredentialState {
@@ -108,6 +149,24 @@ interface Diagnostics {
     duplicate?: number
     last?: DiagnosticDecision | null
   }
+  bots?: Array<{
+    id?: string
+    title?: string
+    capabilities?: string[]
+    skills?: string[]
+    fleetRole?: string
+    sessionScope?: string
+    approvalRequired?: boolean
+  }>
+  collaboration?: { enabled?: boolean; activeRuns?: number }
+  fleet?: {
+    mailbox?: Record<string, number>
+    tasks?: Array<{ id?: string; title?: string; status?: string; assignedTo?: string; updatedAt?: number }>
+    workflows?: Array<{ id?: string; taskId?: string; status?: string; workerBotIds?: string[]; verifierBotId?: string; synthesizerBotId?: string; updatedAt?: number }>
+    approvals?: Array<{ id?: string; code?: string; kind?: string; summary?: string; status?: string; expiresAt?: number }>
+    handoffs?: Array<{ id?: string; fromBot?: string; toBot?: string; status?: string; reason?: string }>
+    deadLetters?: Array<{ id?: string; state?: string; lastError?: string; envelope?: { to?: string; taskId?: string } }>
+  }
 }
 
 interface SetupState {
@@ -119,6 +178,7 @@ interface SetupState {
   readonly saving: boolean
   readonly diagnosing: boolean
   readonly pairingApproving: boolean
+  readonly fleetApproving: boolean
   readonly message?: string | undefined
   readonly error?: string | undefined
   readonly diagnosticsError?: string | undefined
@@ -134,6 +194,8 @@ interface Draft {
   userIds: string[]
   chatIds: string[]
   pairingEnabled: boolean
+  collaboration: FleetSettings
+  profiles: FleetProfileDraft[]
 }
 
 function emptyCredential(): CredentialState {
@@ -171,6 +233,18 @@ function updateRowValue(values: readonly string[], index: number, value: string)
 }
 
 function draftOf(settings: HermesBotSettings): Draft {
+  const collaboration = settings.collaboration ?? {
+    enabled: true,
+    autoPlanner: true,
+    approvalMode: 'auto-planned',
+    defaultSessionScope: 'requester',
+    maxGroupBots: 6,
+    maxGroupRounds: 3,
+    maxGroupMessages: 10,
+    maxParallelRuns: 6,
+    botRunMaxAttempts: 3,
+  }
+  const profiles = settings.profiles ?? []
   return {
     enabled: settings.enabled,
     feishuEnabled: settings.feishu.enabled,
@@ -181,6 +255,42 @@ function draftOf(settings: HermesBotSettings): Draft {
     userIds: [...settings.access.userIds],
     chatIds: [...settings.access.chatIds],
     pairingEnabled: settings.access.pairing !== false,
+    collaboration: { ...collaboration },
+    profiles: profiles.map(profile => ({
+      id: profile.id,
+      title: profile.title,
+      description: profile.description,
+      provider: profile.provider,
+      model: profile.model,
+      soul: profile.soul,
+      fleetRole: profile.fleetRole,
+      sessionScope: profile.sessionScope,
+      approvalRequired: profile.approvalRequired,
+      enabled: profile.enabled,
+      capabilitiesText: profile.capabilities.join(', '),
+      skillsText: profile.skills.join(', '),
+      allowedUserIdsText: profile.allowedUserIds.join(', '),
+      allowedChatIdsText: profile.allowedChatIds.join(', '),
+    })),
+  }
+}
+
+function profileSettingsOf(draft: FleetProfileDraft): FleetProfileSettings {
+  return {
+    id: draft.id,
+    title: draft.title,
+    description: draft.description,
+    provider: draft.provider,
+    model: draft.model,
+    soul: draft.soul,
+    fleetRole: draft.fleetRole,
+    sessionScope: draft.sessionScope,
+    approvalRequired: draft.approvalRequired,
+    enabled: draft.enabled,
+    capabilities: splitIds(draft.capabilitiesText),
+    skills: splitIds(draft.skillsText),
+    allowedUserIds: splitIds(draft.allowedUserIdsText),
+    allowedChatIds: splitIds(draft.allowedChatIdsText),
   }
 }
 
@@ -197,6 +307,7 @@ class FeishuSetupController {
       saving: false,
       diagnosing: false,
       pairingApproving: false,
+      fleetApproving: false,
     })
     void this.refresh()
   }
@@ -264,6 +375,16 @@ class FeishuSetupController {
       this.publish({ error: '请填写飞书 App Secret。' })
       return
     }
+    const profileIds = draft.profiles.map(profile => profile.id.trim())
+    const invalidProfile = profileIds.find(id => id !== id.toLowerCase() || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(id))
+    if (invalidProfile !== undefined) {
+      this.publish({ error: `Bot ID 不合法：${invalidProfile || '空白'}。只能使用小写字母、数字、下划线和短横线。` })
+      return
+    }
+    if (new Set(profileIds).size !== profileIds.length) {
+      this.publish({ error: 'Bot ID 不能重复。' })
+      return
+    }
 
     this.publish({ saving: true, error: undefined, message: undefined })
     try {
@@ -280,6 +401,8 @@ class FeishuSetupController {
               requireMention: draft.requireMention,
             },
             access: { userIds, chatIds, pairing: draft.pairingEnabled },
+            collaboration: draft.collaboration,
+            profiles: draft.profiles.map(profileSettingsOf),
           },
           ...(draft.appSecret.trim() === '' ? {} : { appSecret: draft.appSecret.trim() }),
         }),
@@ -352,6 +475,8 @@ class FeishuSetupController {
             // The server also clears these fields. Keep the request explicit so
             // the temporary discovery state can never authorize an old ID.
             access: { userIds: [], chatIds: [], pairing: draft.pairingEnabled },
+            collaboration: draft.collaboration,
+            profiles: draft.profiles.map(profileSettingsOf),
           },
           ...(draft.appSecret.trim() === '' ? {} : { appSecret: draft.appSecret.trim() }),
         }),
@@ -447,6 +572,31 @@ class FeishuSetupController {
       return false
     } finally {
       this.publish({ pairingApproving: false })
+    }
+  }
+
+  public async resolveFleetApproval(code: string, decision: 'approved' | 'rejected'): Promise<boolean> {
+    this.publish({ fleetApproving: true, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'fleet_approval_resolve', approvalCode: code, decision }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({
+        diagnostics: data.diagnostics,
+        message: data.message ?? (decision === 'approved' ? '已批准 Fleet 操作。' : '已拒绝 Fleet 操作。'),
+        diagnosticsError: undefined,
+      })
+      return true
+    } catch (error) {
+      this.publish({ error: `Fleet 审批失败：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ fleetApproving: false })
     }
   }
 
@@ -567,6 +717,109 @@ function diagnosticDecisionLabel(value: string | undefined): string {
   return '—'
 }
 
+function newFleetProfile(profiles: readonly FleetProfileDraft[]): FleetProfileDraft {
+  const ids = new Set(profiles.map(profile => profile.id))
+  let index = 1
+  while (ids.has(`bot-${index}`)) index += 1
+  return {
+    id: `bot-${index}`,
+    title: `Bot ${index}`,
+    description: '',
+    provider: '',
+    model: '',
+    capabilitiesText: '',
+    skillsText: '',
+    soul: '',
+    fleetRole: 'worker',
+    sessionScope: 'requester',
+    allowedUserIdsText: '',
+    allowedChatIdsText: '',
+    approvalRequired: false,
+    enabled: true,
+  }
+}
+
+function FleetProfileEditor({
+  profiles,
+  onChange,
+}: {
+  profiles: FleetProfileDraft[]
+  onChange: (profiles: FleetProfileDraft[]) => void
+}) {
+  const updateProfile = (index: number, patch: Partial<FleetProfileDraft>): void => {
+    onChange(profiles.map((profile, row) => row === index ? { ...profile, ...patch } : profile))
+  }
+  return (
+    <div className="dsh-hermes-fleet-profiles">
+      {profiles.length === 0 ? <div className="dsh-hermes-id-empty">还没有自定义 Bot；网关仍保留内置 default Bot。点击下方按钮即可组建 Fleet。</div> : profiles.map((profile, index) => (
+        <div className="dsh-hermes-fleet-profile" key={`fleet-profile-${index}`}>
+          <div className="dsh-hermes-fleet-profile-head">
+            <div><strong>Bot {index + 1}</strong><code>@{profile.id || '未命名'}</code></div>
+            <div className="dsh-hermes-action-row">
+              <label className="dsh-hermes-mini-check"><input type="checkbox" checked={profile.enabled} onChange={event => { updateProfile(index, { enabled: event.target.checked }) }} />启用</label>
+              <button type="button" className="dsh-hermes-id-remove" onClick={() => { onChange(profiles.filter((_, row) => row !== index)) }}>删除</button>
+            </div>
+          </div>
+          <div className="dsh-hermes-grid">
+            <Field label="Bot ID" hint="聊天中使用 @这个ID；只允许小写字母、数字、-、_"><input value={profile.id} onChange={event => { updateProfile(index, { id: event.target.value.toLowerCase() }) }} /></Field>
+            <Field label="显示名称"><input value={profile.title} onChange={event => { updateProfile(index, { title: event.target.value }) }} /></Field>
+            <Field label="Fleet 角色"><select value={profile.fleetRole} onChange={event => { updateProfile(index, { fleetRole: event.target.value as FleetProfileDraft['fleetRole'] }) }}><option value="worker">执行 Worker</option><option value="verifier">验证 Verifier</option><option value="synthesizer">汇总 Synthesizer</option><option value="generalist">通用 Generalist</option></select></Field>
+            <Field label="会话隔离"><select value={profile.sessionScope} onChange={event => { updateProfile(index, { sessionScope: event.target.value as FleetProfileDraft['sessionScope'] }) }}><option value="requester">按使用者隔离（推荐）</option><option value="chat">按聊天隔离</option><option value="task">每个任务独立</option><option value="shared">所有人共享（有串话风险）</option></select></Field>
+            <Field label="模型提供方" hint="留空则继承 DSH 默认"><input value={profile.provider} onChange={event => { updateProfile(index, { provider: event.target.value }) }} /></Field>
+            <Field label="模型" hint="留空则继承 DSH 默认"><input value={profile.model} onChange={event => { updateProfile(index, { model: event.target.value }) }} /></Field>
+            <Field label="能力标签" hint="逗号或换行分隔，Planner 会用它选 Bot"><input value={profile.capabilitiesText} onChange={event => { updateProfile(index, { capabilitiesText: event.target.value }) }} /></Field>
+            <Field label="技能名称" hint="逗号或换行分隔"><input value={profile.skillsText} onChange={event => { updateProfile(index, { skillsText: event.target.value }) }} /></Field>
+            <Field label="仅允许这些用户" hint="留空表示继承总白名单"><input value={profile.allowedUserIdsText} onChange={event => { updateProfile(index, { allowedUserIdsText: event.target.value }) }} /></Field>
+            <Field label="仅允许这些群聊" hint="留空表示继承总白名单"><input value={profile.allowedChatIdsText} onChange={event => { updateProfile(index, { allowedChatIdsText: event.target.value }) }} /></Field>
+          </div>
+          <Field label="职责说明"><textarea value={profile.description} onChange={event => { updateProfile(index, { description: event.target.value }) }} /></Field>
+          <Field label="SOUL / 身份提示"><textarea value={profile.soul} onChange={event => { updateProfile(index, { soul: event.target.value }) }} /></Field>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={profile.approvalRequired} onChange={event => { updateProfile(index, { approvalRequired: event.target.checked }) }} /><span>每次通过 Fleet 或 @mention 调用这个 Bot 都需要人工批准</span></label>
+        </div>
+      ))}
+      <button type="button" className="dsh-hermes-id-add" onClick={() => { onChange([...profiles, newFleetProfile(profiles)]) }}>＋ 添加 Bot</button>
+    </div>
+  )
+}
+
+function FleetStatusPanel({
+  diagnostics,
+  approving,
+  onResolve,
+  onRefresh,
+}: {
+  diagnostics: Diagnostics
+  approving: boolean
+  onResolve: (code: string, decision: 'approved' | 'rejected') => void
+  onRefresh: () => void
+}) {
+  const fleet = diagnostics.fleet
+  const approvals = (fleet?.approvals ?? []).filter(approval => approval.status === 'pending')
+  const workflows = fleet?.workflows ?? []
+  const tasks = fleet?.tasks ?? []
+  const deadLetters = fleet?.deadLetters ?? []
+  return (
+    <section className="dsh-hermes-panel">
+      <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 控制台</h3><p className="dsh-hermes-muted">统一查看 Bot、任务、工作流、审批和死信；数据来自本机持久化状态。</p></div><button type="button" className="dsh-hermes-secondary" onClick={onRefresh}>刷新 Fleet</button></div>
+      <div className="dsh-hermes-diagnostic-grid">
+        <div><span>可用 Bot</span><strong>{String(diagnostics.bots?.length ?? 0)}</strong></div>
+        <div><span>正在运行</span><strong>{String(diagnostics.collaboration?.activeRuns ?? 0)}</strong></div>
+        <div><span>待审批</span><strong>{String(approvals.length)}</strong></div>
+        <div><span>死信</span><strong>{String(deadLetters.length)}</strong></div>
+      </div>
+      <div className="dsh-hermes-fleet-roster">
+        {(diagnostics.bots ?? []).map(bot => <div key={bot.id} className="dsh-hermes-fleet-chip"><strong>@{bot.id}</strong><span>{bot.fleetRole ?? 'generalist'} · {bot.sessionScope ?? 'requester'}</span></div>)}
+      </div>
+      <div className="dsh-hermes-fleet-columns">
+        <div><strong>待审批</strong>{approvals.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : approvals.map(approval => <div className="dsh-hermes-fleet-row" key={approval.id}><div><code>{approval.code}</code><span>{approval.summary ?? approval.kind}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'approved') }}>批准</button><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'rejected') }}>拒绝</button></div></div>)}</div>
+        <div><strong>最近工作流</strong>{workflows.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : workflows.slice(0, 6).map(workflow => <div className="dsh-hermes-fleet-row" key={workflow.id}><div><code>{workflow.id}</code><span>{workflow.status} · {(workflow.workerBotIds ?? []).map(id => '@' + id).join('、')}</span></div></div>)}</div>
+        <div><strong>最近任务</strong>{tasks.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : tasks.slice(0, 6).map(task => <div className="dsh-hermes-fleet-row" key={task.id}><div><code>{task.id}</code><span>{task.status} · {task.title}</span></div></div>)}</div>
+        <div><strong>死信</strong>{deadLetters.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : deadLetters.slice(0, 6).map(item => <div className="dsh-hermes-fleet-row" key={item.id}><div><code>{item.envelope?.taskId ?? item.id}</code><span>@{item.envelope?.to} · {item.lastError}</span></div></div>)}</div>
+      </div>
+    </section>
+  )
+}
+
 function DiagnosticPanel({
   diagnostics,
   error,
@@ -674,6 +927,10 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
       setDraftError(error instanceof Error ? error.message : String(error))
     }
   }
+  const updateCollaboration = <K extends keyof FleetSettings>(key: K, value: FleetSettings[K]): void => {
+    setDraft(current => current === undefined ? current : { ...current, collaboration: { ...current.collaboration, [key]: value } })
+    setDraftError(undefined)
+  }
   const approvePairing = (): void => {
     void controller.approvePairing(pairingCode).then(candidate => {
       if (candidate?.userId !== undefined) {
@@ -778,6 +1035,28 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         </div>
       </section>
 
+      <section className="dsh-hermes-panel">
+        <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 设置</h3><p className="dsh-hermes-muted"><code>/fleet 任务</code> 会按能力并行分派，再进行验证和汇总；显式 <code>@bot</code> 仍可创建单 Bot 或顺序协作房间。</p></div><span className={`dsh-hermes-badge ${draft.collaboration.enabled ? 'ok' : 'missing'}`}>{draft.collaboration.enabled ? 'Fleet 已启用' : 'Fleet 已停用'}</span></div>
+        <div className="dsh-hermes-grid">
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.enabled} onChange={event => { updateCollaboration('enabled', event.target.checked) }} /><span>启用 Bot Fleet</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.autoPlanner} onChange={event => { updateCollaboration('autoPlanner', event.target.checked) }} /><span>启用自动 Planner</span></label>
+          <Field label="审批策略"><select value={draft.collaboration.approvalMode} onChange={event => { updateCollaboration('approvalMode', event.target.value as FleetSettings['approvalMode']) }}><option value="auto-planned">自动计划需要批准（推荐）</option><option value="multi-bot">多 Bot 才需要批准</option><option value="always">所有 Fleet 操作都批准</option><option value="never">不需要批准</option></select></Field>
+          <Field label="默认会话隔离"><select value={draft.collaboration.defaultSessionScope} onChange={event => { updateCollaboration('defaultSessionScope', event.target.value as FleetSettings['defaultSessionScope']) }}><option value="requester">按使用者隔离（推荐）</option><option value="chat">按聊天隔离</option><option value="task">按任务隔离</option><option value="shared">共享上下文（有串话风险）</option></select></Field>
+          <Field label="协作 Bot 上限"><input type="number" min="2" max="6" value={draft.collaboration.maxGroupBots} onChange={event => { updateCollaboration('maxGroupBots', Number(event.target.value)) }} /></Field>
+          <Field label="顺序协作轮数"><input type="number" min="1" max="3" value={draft.collaboration.maxGroupRounds} onChange={event => { updateCollaboration('maxGroupRounds', Number(event.target.value)) }} /></Field>
+          <Field label="房间消息上限"><input type="number" min="2" max="100" value={draft.collaboration.maxGroupMessages} onChange={event => { updateCollaboration('maxGroupMessages', Number(event.target.value)) }} /></Field>
+          <Field label="最大并行 Run"><input type="number" min="1" max="6" value={draft.collaboration.maxParallelRuns} onChange={event => { updateCollaboration('maxParallelRuns', Number(event.target.value)) }} /></Field>
+          <Field label="Bot 失败重试次数"><input type="number" min="1" max="10" value={draft.collaboration.botRunMaxAttempts} onChange={event => { updateCollaboration('botRunMaxAttempts', Number(event.target.value)) }} /></Field>
+        </div>
+      </section>
+
+      <section className="dsh-hermes-panel">
+        <div><h3>Bot roster</h3><p className="dsh-hermes-muted">每个 Bot 都有独立模型、角色、能力、SOUL、会话隔离和二级权限。用户必须先通过上面的总白名单/配对，再通过这里的 Bot 权限。</p></div>
+        <FleetProfileEditor profiles={draft.profiles} onChange={profiles => { update('profiles', profiles) }} />
+      </section>
+
+      <FleetStatusPanel diagnostics={state.diagnostics} approving={state.fleetApproving} onResolve={(code, decision) => { void controller.resolveFleetApproval(code, decision) }} onRefresh={() => { void controller.refreshDiagnostics() }} />
+
       <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
 
       <section className="dsh-hermes-panel dsh-hermes-actions">
@@ -796,6 +1075,7 @@ const CSS = `
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
  .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}
  .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-authorized-user{display:grid;gap:3px;min-width:0}.dsh-hermes-authorized-user code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-authorized-user span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
+ .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 

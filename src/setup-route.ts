@@ -9,7 +9,7 @@ import {
   HermesBotSettingsSchema,
   type HermesBotSettings,
 } from './setup.js'
-import type { GatewayDiscoveryCandidate, GatewayDiscoveryStatus } from './types.js'
+import type { FleetApprovalRecord, GatewayDiscoveryCandidate, GatewayDiscoveryStatus } from './types.js'
 import { isTrustedLocalRequest } from './setup-security.js'
 
 const MAX_BODY_BYTES = 64 * 1024
@@ -31,6 +31,7 @@ export interface SetupRouteActions {
   clearDiscovery?: () => void
   approvePairing?: (code: string) => Promise<GatewayDiscoveryCandidate | undefined>
   revokePairing?: (platform: string, userId: string) => Promise<boolean>
+  resolveFleetApproval?: (code: string, decision: 'approved' | 'rejected') => Promise<FleetApprovalRecord | undefined>
 }
 
 class SetupRequestError extends Error {
@@ -82,7 +83,7 @@ function normalizedIds(values: readonly string[]): string[] {
 async function readSnapshot(
   ctx: Context,
   source: () => HermesBotSettings,
-  diagnostics: () => Record<string, unknown>,
+  diagnostics: () => Record<string, unknown> | Promise<Record<string, unknown>>,
 ): Promise<SetupRouteSnapshot> {
   const settings = ctx.get('settings')
   const credentials = ctx.get('credentials')
@@ -97,14 +98,14 @@ async function readSnapshot(
       writable: info.writable,
       ...(info.source === undefined ? {} : { source: info.source }),
     },
-    diagnostics: diagnostics(),
+    diagnostics: await diagnostics(),
   }
 }
 
 async function handleRequest(
   ctx: Context,
   source: () => HermesBotSettings,
-  diagnostics: () => Record<string, unknown>,
+  diagnostics: () => Record<string, unknown> | Promise<Record<string, unknown>>,
   actions: SetupRouteActions,
   req: IncomingMessage,
   res: ServerResponse,
@@ -126,7 +127,7 @@ async function handleRequest(
 
   const body = await readJson(req)
   const action = body.action === undefined ? 'save' : body.action
-  if (action !== 'save' && action !== 'diagnose' && action !== 'pairing_approve' && action !== 'pairing_revoke') {
+  if (action !== 'save' && action !== 'diagnose' && action !== 'pairing_approve' && action !== 'pairing_revoke' && action !== 'fleet_approval_resolve') {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
   if (action === 'pairing_approve') {
@@ -154,11 +155,34 @@ async function handleRequest(
     sendJson(res, 200, { ...snapshot, message: '已取消该用户的配对权限。' })
     return
   }
+  if (action === 'fleet_approval_resolve') {
+    const code = typeof body.approvalCode === 'string' ? body.approvalCode.trim() : ''
+    const decision = body.decision === 'approved' ? 'approved' : body.decision === 'rejected' ? 'rejected' : undefined
+    if (code === '' || decision === undefined) throw new SetupRequestError(400, '缺少审批码或审批决定。')
+    if (actions.resolveFleetApproval === undefined) throw new SetupRequestError(503, 'Fleet 审批服务还没有准备好。')
+    const approval = await actions.resolveFleetApproval(code, decision)
+    if (approval === undefined) throw new SetupRequestError(404, '审批不存在、已处理或已过期。')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, {
+      ...snapshot,
+      message: approval.status === 'approved' ? '已批准，Fleet 正在继续执行。' : approval.status === 'rejected' ? '已拒绝该 Fleet 操作。' : '该审批已过期。',
+    })
+    return
+  }
   let settings: HermesBotSettings
   try {
     settings = HermesBotSettingsSchema(body.settings as HermesBotSettings)
   } catch (error) {
     throw new SetupRequestError(400, `设置格式不正确：${String(error)}`)
+  }
+  const profileIds = new Set<string>()
+  for (const profile of settings.profiles) {
+    const id = profile.id.trim().toLowerCase()
+    if (profile.id.trim() !== id || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(id)) {
+      throw new SetupRequestError(400, `Bot ID 不合法：${profile.id}。只能使用小写字母、数字、下划线和短横线。`)
+    }
+    if (profileIds.has(id)) throw new SetupRequestError(400, `Bot ID 重复：${id}`)
+    profileIds.add(id)
   }
   const appSecret = typeof body.appSecret === 'string' ? body.appSecret.trim() : ''
   if (settings.feishu.appId.trim() === '') {
@@ -222,7 +246,7 @@ async function handleRequest(
 export function installSetupRoute(
   ctx: Context,
   source: () => HermesBotSettings,
-  diagnostics: () => Record<string, unknown> = () => ({}),
+  diagnostics: () => Record<string, unknown> | Promise<Record<string, unknown>> = () => ({}),
   actions: SetupRouteActions = {},
 ): void {
   ctx.inject(['webServer'], (webCtx) => {
