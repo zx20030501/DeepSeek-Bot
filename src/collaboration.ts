@@ -359,6 +359,16 @@ export class TaskRunStore {
     return { ...task, acceptanceCriteria: [...task.acceptanceCriteria] }
   }
 
+  public async attachRoom(taskId: string, roomId: string, actor = 'botmesh'): Promise<TaskRecord | undefined> {
+    await this.load()
+    const task = this.tasks.get(taskId)
+    if (!task) return undefined
+    const next: TaskRecord = { ...task, roomId, updatedAt: now() }
+    await this.recordTask(next)
+    await this.audit('task', taskId, actor, 'task.room_attached', { roomId }, taskId)
+    return { ...next, acceptanceCriteria: [...next.acceptanceCriteria] }
+  }
+
   public async createRun(taskId: string, botId: string, attempt: number): Promise<RunRecord> {
     await this.load()
     const task = this.tasks.get(taskId)
