@@ -33,7 +33,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
       const credentials = ctx.get('credentials')
       const secret = credentials === undefined
         ? undefined
-        : (await credentials.resolve(credentialRef(HERMES_BOT_FEISHU_SECRET_REF)))?.value
+        : (await credentials.resolve(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any))?.value
       await gateway.reconfigure(gatewayConfigFromSettings(baseConfig, settingsSource(), secret))
     }).catch(error => {
       logger?.error?.(`[dsh-hermes-bot] settings apply failed: ${String(error)}`)

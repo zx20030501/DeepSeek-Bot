@@ -5,7 +5,7 @@ import type { BotGatewayConfig } from './types.js'
 // Keep the namespace value as a plain string so the core package remains
 // usable in headless/test installations. DSH's settings service accepts this
 // stable namespace and the Web adapter can use its own helper when available.
-export const HERMES_BOT_SETTINGS_NAMESPACE = 'dsh-hermes-bot'
+export const HERMES_BOT_SETTINGS_NAMESPACE: any = 'dsh-hermes-bot'
 
 /** The secret is stored through DSH credentials, never in settings or Git. */
 export const HERMES_BOT_FEISHU_SECRET_REF = 'DSH_HERMES_BOT_FEISHU_APP_SECRET'

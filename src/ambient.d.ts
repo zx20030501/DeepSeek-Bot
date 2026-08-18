@@ -1,10 +1,10 @@
 declare module '@deepseek-ai/dsh-settings' {
-  export function settingsNamespace(name: string): string
+  export function settingsNamespace(name: string): any
   export function installSettingsSection(...args: any[]): void
 }
 
 declare module '@deepseek-ai/dsh-credentials' {
-  export function credentialRef(value: string): unknown
+  export function credentialRef(value: string): any
 }
 
 declare module '@deepseek-ai/dsh-host-webserver' {

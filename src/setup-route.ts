@@ -88,7 +88,7 @@ async function readSnapshot(
   const credentials = ctx.get('credentials')
   const info = credentials === undefined
     ? { configured: false, writable: false }
-    : await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF))
+    : await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any)
   return {
     settings: source(),
     writable: settings?.writable === true,
@@ -194,17 +194,17 @@ async function handleRequest(
   const credentials = ctx.get('credentials')
   if (appSecret !== '') {
     if (credentials === undefined) throw new SetupRequestError(503, 'DSH 凭据服务不可用。')
-    const info = await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF))
+    const info = await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any)
     if (!info.writable) throw new SetupRequestError(409, '当前飞书密钥来自只读环境变量，不能在网页中覆盖。')
   } else if (credentials !== undefined) {
-    const info = await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF))
+    const info = await credentials.describe(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any)
     if (!info.configured) throw new SetupRequestError(400, '请填写飞书 App Secret。')
   } else {
     throw new SetupRequestError(503, 'DSH 凭据服务不可用。')
   }
 
   if (appSecret !== '') {
-    await credentials!.set(credentialRef(HERMES_BOT_FEISHU_SECRET_REF), appSecret)
+    await credentials!.set(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any, appSecret)
   }
   await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, settings)
   const discovery = action === 'diagnose' ? actions.beginDiscovery!() : undefined
