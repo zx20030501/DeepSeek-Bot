@@ -350,7 +350,9 @@ export class Outbox {
         finish()
       }, ms)
       this.waiters.add(finish)
-      timer.unref?.()
+      // Keep this timer referenced: callers of flush() await the retry, and
+      // an unref'ed timer can let Node's test runner exit with that Promise
+      // still pending. stop() clears all retry timers during shutdown.
       this.timers.add(timer)
       if (!this.active) finish()
     })
