@@ -646,6 +646,7 @@ export class BotGateway {
         const room = await this.rooms.open(message.target, task.id, validBots)
         roomId = room.id
         roomEpoch = room.epoch
+        await this.tasks.attachRoom(task.id, room.id, from)
         await this.rooms.append(room.id, from, instruction)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('could not reserve the first Group Room turn')
