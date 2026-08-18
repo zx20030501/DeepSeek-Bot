@@ -54,6 +54,8 @@ AI Review
 
 这样即使有人绕过工作流调用 Auto-merge，main 仍不会在 AI Review 失败时合并。添加该检查前，先配置 DEEPSEEK_API_KEY 并让工作流至少完成一次。
 
+另外在 Settings → General → Pull Requests 中开启 Allow auto-merge；关闭时，Auto-merge job 会停止并不会直接绕过 Ruleset 合并。
+
 同时建议保持：
 
 - 禁止 force push；
@@ -85,6 +87,8 @@ AI Review
 ~~~text
 .github/workflows/
 .github/actions/
+.github/pr-guardian.mjs
+.github/pr-guardian-policy.json
 package.json
 package-lock.json
 包含 credential、secret、security、auth、pairing 的路径
@@ -94,6 +98,7 @@ src/gateway.ts
 src/harness-bridge.ts
 src/setup-security.ts
 src/setup.ts
+src/setup-route.ts
 ~~~
 
 如需调整范围，编辑 .github/pr-guardian-policy.json，并通过 PR 修改；不要直接在工作流运行时改变安全策略。
