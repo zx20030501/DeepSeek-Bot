@@ -50,9 +50,11 @@ export function formatHelp(): string {
     '/status — 查看网关、队列和会话状态',
     '/bots — 查看可用 Bot profile',
     '/bot <name> — 切换 Bot profile',
+    '/mesh — 查看 BotMesh 的 mailbox、task、run 和 handoff 状态',
     '/model [provider:model] — 查看或设置当前 profile 的下一回合模型',
     '/help — 显示帮助',
     '',
+    '使用 @bot-name <任务> 可把任务交给另一个 Bot；同时 @多个 Bot 会创建最多 3 轮的协作房间。',
     '其他普通消息和未知 / 命令会交给 DeepSeek Harness 处理。',
   ].join('\n')
 }
