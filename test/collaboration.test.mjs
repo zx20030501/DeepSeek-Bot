@@ -70,7 +70,7 @@ test('failed collaboration attempts are requeued and then dead-lettered', async 
     throw new Error('executor unavailable')
   }, { autoRetry: false })
 
-  const request = await hub.send(messageInput({ idempotencyKey: 'retryable' }))
+  const request = await store.enqueue(messageInput({ idempotencyKey: 'retryable' }))
   await hub.dispatchFor('researcher')
   assert.equal((await store.get(request.id))?.state, 'queued')
 
