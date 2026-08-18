@@ -1,76 +1,204 @@
-# dsh-hermes-bot
+# DeepSeek-Bot
 
-一个参照 Hermes Agent Bot 能力、按 DeepSeek Harness 官方 Cordis 插件边界实现的可靠消息网关。
+面向 DeepSeek Harness 的 Telegram 与飞书/Lark 消息接入插件。
 
-当前版本提供 Telegram 长轮询和飞书/Lark WebSocket 长连接适配器；入站 WAL、出站 Outbox、会话路由、访问控制和 DSH Agent 适配层均与平台解耦，后续可以继续复用到 Discord、Slack 或 Webhook。
+本仓库的项目名称是 **DeepSeek-Bot**。它通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部聊天平台，不修改 DeepSeek Harness 核心，也不复制或替代 Harness 的 Agent Loop。
 
-## 已实现
+## 当前版本真实提供的功能
 
-- 每个 Telegram 聊天/线程绑定一个稳定的 DSH session；
-- Inbound WAL：消息交给 Agent 之前先落盘，重启后有限次数补发；
-- Outbox：幂等键、lane 串行发送、发送后确认、指数退避和 dead 状态；
-- Telegram 长轮询、typing、4096 字符切片、文件/图片/语音提示；
-- 飞书/Lark 应用机器人长连接、私聊、群聊 @机器人、话题/回复关系和 Markdown 消息；
-- 默认 allowlist，支持按 user ID 或 chat ID 授权；
-- `/new`、`/reset`、`/stop`、`/status`、`/help`、`/bots`、`/bot <name>`、`/model`；
-- 已安装的 DSH 原生命令优先执行，未知 `/xxx` 仍交给 Agent；
-- 从 `session/event` 读取模型输出并返回原聊天；
-- 标准 `dsh.bundle` 分发格式，不修改 Harness 核心。
+- Telegram Bot API 长轮询；
+- 飞书/Lark 企业自建应用 WebSocket 长连接；
+- 飞书私聊、群聊 @机器人、话题/回复上下文和 Markdown 回复；
+- Telegram 线程/回复、typing 和 4096 字符安全切片；
+- Telegram 文件、图片、语音以及飞书资源的文本提示占位；
+- 入站 WAL：消息交给 Agent 前先落盘，异常退出后可以恢复未完成消息；
+- 出站 Outbox：幂等键、按聊天串行发送、重试、指数退避和 dead 状态；
+- 入站事件去重，避免同一平台事件重复处理；
+- 平台、聊天、线程到 DSH session 的稳定绑定；
+- DSH profile 切换和模型覆盖；
+- allowlist 访问控制，支持按用户 ID 或聊天 ID 授权；
+- 本地命令：\`/new\`、\`/reset\`、\`/stop\`、\`/status\`、\`/help\`、\`/bots\`、\`/bot\`、\`/model\`；
+- 优先执行已安装的 DSH 原生命令；未知的 \`/xxx\` 不会静默丢失，而是继续交给 Agent；
+- 监听 \`session/event\`，把 Agent 的文本输出发送回原聊天；
+- TypeScript 源码、严格类型检查和 Node 测试。
+
+## 工作方式
+
+\`\`\`text
+Telegram / 飞书事件
+        │
+        ▼
+平台消息归一化
+        │
+        ▼
+访问控制 → 去重 → Inbound WAL
+        │
+        ▼
+按聊天/线程串行处理
+        │
+        ▼
+DeepSeek Harness Agent / DSH command
+        │
+        ▼
+session/event → Outbox → 原平台回复
+\`\`\`
+
+平台适配、可靠投递、会话路由和 Harness 调用彼此分离。新增平台时，主要扩展 Transport，不需要重新实现 WAL、Outbox 和 Agent 会话逻辑。
 
 ## 安装
 
-在已安装 DeepSeek Harness 的环境中：
+在已经安装 DeepSeek Harness 的环境中运行：
 
-```bash
+\`\`\`bash
 npm install
+npm run check
 npm run build
+
 dsh plugin --profile web add . --ignore-scripts
-```
-
-也可以安装打包后的 tarball：
-
-```bash
-npm pack
-dsh plugin --profile web add ./dsh-hermes-bot-0.1.0.tgz --ignore-scripts
-```
-
-让 DSH profile 加载 `cordis.patch.yml` 中的 bundle 后，重启 `dsh web`。
-
-## 配置
-
-Token 不写入 patch 或 Git。推荐使用环境变量：
-
-```bash
-export DSH_HERMES_BOT_TELEGRAM_TOKEN='替换为 Telegram Bot Token'
-# 飞书可与 Telegram 同时启用；只接入飞书时可以关闭 Telegram
-export DSH_HERMES_BOT_FEISHU_APP_ID='cli_xxxxxxxxxxxx'
-export DSH_HERMES_BOT_FEISHU_APP_SECRET='不要提交到 Git'
-export DSH_HERMES_BOT_ALLOWED_USERS='123456789'
-# 或按聊天授权：
-# export DSH_HERMES_BOT_ALLOWED_CHATS='-1001234567890'
 dsh web
-```
+\`\`\`
 
-完整配置示例见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+也可以先生成 npm 包，再把生成的 tarball 安装到 DSH profile：
 
-飞书推荐使用官方 SDK 的 WebSocket 长连接模式，不需要公网 Webhook 地址。需要在飞书开放平台创建企业自建应用、开启机器人能力、订阅 `im.message.receive_v1`，并发布应用版本。
+\`\`\`bash
+npm pack
+dsh plugin --profile web add ./生成的-tarball.tgz --ignore-scripts
+\`\`\`
 
-## 设计与调研
+插件入口和 DSH profile 的加载方式由仓库中的 \`cordis.patch.yml\` 与 \`package.json\` 提供。
 
-见 [docs/RESEARCH_AND_DESIGN.md](docs/RESEARCH_AND_DESIGN.md)。其中记录了 Hermes、DeepSeek Harness、社区 Telegram/飞书桥接、Agent Teams 和 Hermes↔DSH 协作项目的调研结果，以及为什么采用“Transport / Delivery / Routing / Harness Adapter”分层。
+## Telegram 配置
+
+当前实现从环境变量读取 Telegram token：
+
+\`\`\`bash
+export DSH_HERMES_BOT_TELEGRAM_TOKEN='你的 Telegram Bot Token'
+\`\`\`
+
+Telegram 支持私聊、群聊、线程/回复和 typing。长回复会按 Telegram 的消息长度限制切分。
+
+## 飞书 / Lark 配置
+
+飞书接入使用官方 \`@larksuiteoapi/node-sdk\` 的 WebSocket 长连接模式。运行 DSH 的机器不需要暴露公网 HTTP Webhook 地址。
+
+设置应用凭证：
+
+\`\`\`bash
+export DSH_HERMES_BOT_FEISHU_APP_ID='cli_xxxxxxxxxxxx'
+export DSH_HERMES_BOT_FEISHU_APP_SECRET='你的 App Secret'
+
+# 海外 Lark 使用：
+# export DSH_HERMES_BOT_FEISHU_DOMAIN='lark'
+\`\`\`
+
+在飞书开放平台完成：
+
+1. 创建企业自建应用；
+2. 开启机器人能力；
+3. 选择使用长连接接收事件；
+4. 订阅 \`im.message.receive_v1\`；
+5. 开通接收消息和发送消息所需权限；
+6. 创建并发布应用版本；
+7. 把机器人加入目标单聊或群聊。
+
+群聊默认只处理 @机器人的消息；单聊不需要 @。白名单应使用飞书的 \`open_id\` 或 \`chat_id\`。
+
+## 访问控制
+
+默认使用 allowlist。没有配置用户或聊天白名单时，不接受普通消息。
+
+\`\`\`bash
+# Telegram 示例
+export DSH_HERMES_BOT_ALLOWED_USERS='123456789'
+# 或：
+export DSH_HERMES_BOT_ALLOWED_CHATS='-1001234567890'
+
+# 飞书示例
+export DSH_HERMES_BOT_ALLOWED_USERS='ou_xxxxxxxxxxxx'
+# 或：
+export DSH_HERMES_BOT_ALLOWED_CHATS='oc_xxxxxxxxxxxx'
+\`\`\`
+
+Telegram 与飞书可以同时启用。它们共用 profile、WAL、Outbox 和 DSH Agent 能力，但会按平台、聊天和线程分别绑定会话。
+
+如果只使用飞书，可以在 profile 配置中关闭 Telegram：
+
+\`\`\`yaml
+telegram:
+  enabled: false
+
+feishu:
+  enabled: true
+  domain: feishu
+  requireMention: true
+\`\`\`
+
+完整配置项见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+
+## 状态和敏感数据
+
+运行状态默认保存在 DSH 的本地状态目录中，也可以通过 \`DSH_HERMES_BOT_HOME\` 指定独立目录。
+
+状态文件可能包含聊天消息和模型回复，不应提交到 GitHub。Bot token、App Secret 等敏感凭证只通过环境变量或本地安全配置提供，不写入源码、README、日志或提交记录。
+
+大体积回放、诊断压缩包、压测日志和构建归档不进入本仓库。GitHub 只保存源代码、测试、文档和小型 manifest；开发过程中产生的大文件按项目约定保存到 Google Drive。用户实际运行时仍使用本地状态目录。
 
 ## 测试
 
-```bash
-npm install --cache /tmp/deepseek-bot-npm-cache
+\`\`\`bash
+npm run check
 npm test
-```
+npm pack --dry-run
+\`\`\`
 
-大体积的回放、诊断 ZIP、压测日志和构建归档不应进入本仓库；按项目约定放入 Google Drive，GitHub 只保存代码、测试、文档和小型 manifest。
+测试覆盖：
 
-## 安全边界
+- 命令解析；
+- Unicode 文本切分；
+- Inbound WAL 重启恢复；
+- Outbox 幂等、顺序和重试；
+- Telegram 长消息切片；
+- 飞书消息归一化；
+- 飞书 Transport 的连接、接收、发送和停止生命周期。
 
-- 默认 allowlist；空 allowlist 不接受普通消息；
-- Token 只从环境变量读取；
-- 运行状态默认位于 `DSH_HOME/hermes-bot`，可用 `DSH_HERMES_BOT_HOME` 指定；
-- 这是 developer-preview 版 DSH 的外部插件，未来 Harness API 变化集中处理在 `src/harness-bridge.ts`。
+当前仓库包含单元测试和模拟 Transport 测试；没有在提交中写入真实 Telegram token 或飞书 App Secret，因此真实平台端到端测试需要由部署者自行配置凭证后执行。
+
+## 当前边界
+
+以下内容不属于当前版本已实现功能：
+
+- 飞书 CardKit 流式卡片和审批按钮；
+- 飞书图片、文件、语音的真实上传、下载和转发；
+- 飞书 HTTP Webhook 接收模式；
+- Discord、Slack、WhatsApp 等其他平台；
+- 独立的 Bot roster Web UI；
+- 自建定时任务系统。
+
+这些能力可以在后续迭代中基于现有 Transport、Delivery 和 Harness Adapter 扩展，但不能在 README 中当作已经完成的功能描述。
+
+## 目录
+
+\`\`\`text
+src/
+├── index.ts          Cordis 插件入口
+├── gateway.ts        消息网关、权限、会话和平台路由
+├── telegram.ts       Telegram 长轮询 Transport
+├── feishu.ts         飞书/Lark WebSocket Transport
+├── durable.ts        Inbound WAL 与 Outbox
+├── state.ts          本地状态与聊天绑定
+├── commands.ts       命令解析、文本处理和切片
+├── harness-bridge.ts DeepSeek Harness Agent 适配
+└── types.ts          平台无关类型
+
+docs/
+└── CONFIGURATION.md  配置和飞书开通说明
+
+test/
+└── *.test.mjs        单元测试与 Transport 模拟测试
+\`\`\`
+
+## 项目链接
+
+- GitHub：<https://github.com/zx20030501/DeepSeek-Bot>
+- DeepSeek Harness：<https://github.com/deepseek-ai/deepseek-harness>
+- 飞书官方 Node SDK：<https://github.com/larksuite/node-sdk>
