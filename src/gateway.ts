@@ -45,6 +45,8 @@ import type {
   ManagerPlan,
   WorkflowDefinition,
   WorkflowDraft,
+} from './fleet-v2-types.js'
+import type {
   BotAddress,
   BotMessageEnvelope,
   BotDescriptor,
@@ -1613,7 +1615,7 @@ export class BotGateway {
         requester,
         replyTarget: message.target,
         instruction,
-        managerBotId: this.config.collaboration?.managerBotId,
+        ...(this.config.collaboration?.managerBotId === undefined ? {} : { managerBotId: this.config.collaboration.managerBotId }),
       })
       if (result.approvalCode !== undefined) {
         await this.sendText(message.target, [
@@ -2739,7 +2741,7 @@ export class BotGateway {
           requester,
           replyTarget: target,
           instruction: parsedMentions.instruction,
-          managerBotId: this.config.collaboration?.managerBotId,
+          ...(this.config.collaboration?.managerBotId === undefined ? {} : { managerBotId: this.config.collaboration.managerBotId }),
           traceId: internal.envelope.traceId ?? internal.envelope.correlationId,
         })
         await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_routed', {

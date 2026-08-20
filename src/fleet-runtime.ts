@@ -61,11 +61,11 @@ function normalizeId(value: string, label: string): string {
   return value.trim().toLowerCase()
 }
 
-function roleFor(bot: BotDescriptor): ManagerBotDescriptor['role'] {
+function roleFor(bot: BotDescriptor): Exclude<ManagerBotDescriptor['role'], undefined> {
   return bot.fleetRole
 }
 
-function statusFor(bot: BotDescriptor, activeRuns: ReadonlyMap<string, string>): ManagerBotDescriptor['status'] {
+function statusFor(bot: BotDescriptor, activeRuns: ReadonlyMap<string, string>): Exclude<ManagerBotDescriptor['status'], undefined> {
   if (!bot.enabled) return 'unavailable'
   return activeRuns.has(bot.id) ? 'busy' : 'available'
 }
@@ -188,7 +188,7 @@ function topologicalOrder(definition: WorkflowDefinition, dependencies: Map<stri
   return order
 }
 
-function entryTaskIds(definition: WorkflowDefinition): string[] {
+function entryTaskNodeIds(definition: WorkflowDefinition): string[] {
   const byId = new Map(definition.nodes.map(node => [node.id, node]))
   const seen = new Set<string>()
   const result: string[] = []
@@ -243,7 +243,7 @@ export function compileWorkflowLaunch(input: unknown): WorkflowLaunchPlan {
   const definition = assertValidWorkflow(input)
   const dependencies = dependencyMap(definition)
   const nodeOrder = topologicalOrder(definition, dependencies)
-  const entryTaskIds = entryTaskIds(definition)
+  const entryTaskIds = entryTaskNodeIds(definition)
   const nodes = nodeOrder.map(nodeId => {
     const node = definition.nodes.find(candidate => candidate.id === nodeId) as WorkflowNode
     return {
