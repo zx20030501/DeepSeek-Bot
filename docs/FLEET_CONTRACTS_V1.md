@@ -96,3 +96,16 @@ kind 兼容 request、response、handoff、event，也支持更明确的 request
 - TTL dead-letter 和重启后的 JSONL 状态恢复。
 
 后续阶段在这个契约上增加任意 @bot 解析、Bot-to-Bot 自主 reply/report、Manager 控制权限、Workflow DAG 和远程 Transport。
+
+## 8. Direct Bot @ routing
+
+直接 Bot 回合输出中的已知 @bot 会被解析为新的结构化 Peer Message。路由会：
+
+- 继承 requester、replyTarget、conversationId、correlationId 和 traceId；
+- 创建独立的 Task/Run，并用 parentRunId、replyTo 和 visitedBots 建立父子关系；
+- 将 sourceReport 作为不受信报告交给目标 Bot，不允许它覆盖结构化 Task 指令；
+- 复用目标 Bot ACL、approvalRequired、Mailbox lease/fencing、TTL 和重试；
+- 每一跳增加 hop，超过 maxHops 或命中 visitedBots 时停止；
+- Workflow 与 Group Room 不走这条动态路径，避免它们在运行中被自由文本改图。
+
+因此当前增量支持的是“直接任务中的有限 @bot fan-out”。让源 Bot 等待 report、整合结果、按消息类型继续调度，将在后续 A2/A3 中继续完善。
