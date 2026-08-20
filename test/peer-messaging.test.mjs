@@ -110,3 +110,24 @@ test('explicit idempotency and TTL use the existing durable mailbox', async () =
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('rejects malformed runtime addresses, non-object roots, cyclic payloads and invalid epochs with typed errors', () => {
+  assert.throws(
+    () => createPeerEnvelope(input({ from: { id: 42, type: 'user' } })),
+    PeerMessageValidationError,
+  )
+  assert.throws(
+    () => createPeerEnvelope(input({ payload: [] })),
+    PeerMessageValidationError,
+  )
+  const cyclic = {}
+  cyclic.self = cyclic
+  assert.throws(
+    () => createPeerEnvelope(input({ payload: cyclic })),
+    PeerMessageValidationError,
+  )
+  assert.throws(
+    () => createPeerEnvelope(input({ epoch: -1 })),
+    PeerMessageValidationError,
+  )
+})

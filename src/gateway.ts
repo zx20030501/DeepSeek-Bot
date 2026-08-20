@@ -18,7 +18,7 @@ import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool.js'
-import { createPeerEnvelope, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
+import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
 import {
   BotDirectory,
   BotMailbox,
@@ -546,7 +546,11 @@ export class BotGateway {
       type: 'bot',
       ...(input.toSessionId === undefined ? {} : { sessionId: input.toSessionId }),
     }
-    if (toAddress.id.toLowerCase() !== bot.id || (toAddress.type !== undefined && toAddress.type !== 'bot')) {
+    if (
+      typeof toAddress.id !== 'string'
+      || toAddress.id.toLowerCase() !== bot.id
+      || (toAddress.type !== undefined && toAddress.type !== 'bot')
+    ) {
       throw new Error('toAddress must identify the selected Bot')
     }
 
@@ -2173,21 +2177,50 @@ export class BotGateway {
             ...(currentRun.phase === undefined ? {} : { phase: currentRun.phase }),
             parentRunId: currentRun.id,
           })
-          const retryEnvelope = createEnvelope({
-            kind: internal.envelope.kind,
-            from: internal.envelope.from,
-            to: internal.envelope.to,
-            taskId: internal.envelope.taskId,
-            runId: nextRun.id,
-            attemptId: nextRun.attemptId,
-            correlationId: internal.envelope.correlationId,
-            ...(internal.envelope.roomId === undefined ? {} : { roomId: internal.envelope.roomId }),
-            ...(internal.envelope.epoch === undefined ? {} : { epoch: internal.envelope.epoch }),
-            ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
-            payload: { ...internal.envelope.payload },
-          })
+          const retryIdempotencyKey = 'retry:' + currentRun.id + ':run:' + nextRun.id
+          const retryEnvelope = isPeerMessage(internal.envelope)
+            ? createPeerEnvelope({
+              kind: internal.envelope.kind,
+              from: internal.envelope.fromAddress ?? {
+                id: internal.envelope.from,
+                type: internal.envelope.from.startsWith('user:') ? 'user' : 'bot',
+              },
+              to: internal.envelope.toAddress ?? { id: internal.envelope.to, type: 'bot' },
+              taskId: internal.envelope.taskId,
+              runId: nextRun.id,
+              attemptId: nextRun.attemptId,
+              correlationId: internal.envelope.correlationId,
+              ...(internal.envelope.conversationId === undefined ? {} : { conversationId: internal.envelope.conversationId }),
+              ...(internal.envelope.replyTo === undefined ? {} : { replyTo: internal.envelope.replyTo }),
+              traceId: internal.envelope.traceId ?? internal.envelope.correlationId,
+              ...(internal.envelope.hop === undefined ? {} : { hop: internal.envelope.hop }),
+              ...(internal.envelope.maxHops === undefined ? {} : { maxHops: internal.envelope.maxHops }),
+              ...(internal.envelope.roomId === undefined ? {} : { roomId: internal.envelope.roomId }),
+              ...(internal.envelope.epoch === undefined ? {} : { epoch: internal.envelope.epoch }),
+              idempotencyKey: retryIdempotencyKey,
+              payload: { ...internal.envelope.payload },
+              ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
+            }, this.config.collaboration ?? {})
+            : createEnvelope({
+              kind: internal.envelope.kind,
+              from: internal.envelope.from,
+              to: internal.envelope.to,
+              taskId: internal.envelope.taskId,
+              runId: nextRun.id,
+              attemptId: nextRun.attemptId,
+              correlationId: internal.envelope.correlationId,
+              ...(internal.envelope.conversationId === undefined ? {} : { conversationId: internal.envelope.conversationId }),
+              ...(internal.envelope.replyTo === undefined ? {} : { replyTo: internal.envelope.replyTo }),
+              ...(internal.envelope.traceId === undefined ? {} : { traceId: internal.envelope.traceId }),
+              ...(internal.envelope.hop === undefined ? {} : { hop: internal.envelope.hop }),
+              ...(internal.envelope.maxHops === undefined ? {} : { maxHops: internal.envelope.maxHops }),
+              ...(internal.envelope.roomId === undefined ? {} : { roomId: internal.envelope.roomId }),
+              ...(internal.envelope.epoch === undefined ? {} : { epoch: internal.envelope.epoch }),
+              ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
+              payload: { ...internal.envelope.payload },
+            })
           const availableAt = Date.now() + this.botRunRetryDelay(currentRun.attempt)
-          await this.mailbox.enqueue(retryEnvelope, `retry:${currentRun.id}:run:${nextRun.id}`, availableAt)
+          await this.mailbox.enqueue(retryEnvelope, retryIdempotencyKey, availableAt)
           await this.tasks.audit('message', retryEnvelope.id, internal.botId, 'message.retry_queued', {
             previousRunId: currentRun.id,
             runId: nextRun.id,
@@ -2392,6 +2425,17 @@ export class BotGateway {
         continue
       }
 
+      const mentionIdempotencyKey = 'peer:mention:' + internal.envelope.id + ':' + bot.id
+      const existingDelivery = await this.mailbox.getByIdempotencyKey(mentionIdempotencyKey)
+      if (existingDelivery !== undefined) {
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'peer.mention_deduplicated', {
+          targetBot: bot.id,
+          deliveryId: existingDelivery.id,
+          state: existingDelivery.state,
+        }, internal.envelope.correlationId)
+        continue
+      }
+
       const nextVisited = [...visited, bot.id]
       let task: TaskRecord | undefined
       let run: RunRecord | undefined
@@ -2418,7 +2462,7 @@ export class BotGateway {
           hop: nextHop,
           maxHops,
           ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
-          idempotencyKey: 'peer:mention:' + internal.envelope.id + ':' + bot.id,
+          idempotencyKey: mentionIdempotencyKey,
           payload: {
             instruction: instruction || '请根据 sourceReport 协助处理。',
             acceptanceCriteria,

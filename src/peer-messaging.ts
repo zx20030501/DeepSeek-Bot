@@ -36,7 +36,10 @@ function bounded(value: number | undefined, fallback: number, minimum: number, m
   return Math.max(minimum, Math.min(maximum, selected))
 }
 
-function reference(value: string, field: string, maximum = 256): string {
+function reference(value: unknown, field: string, maximum = 256): string {
+  if (typeof value !== 'string') {
+    throw new PeerMessageValidationError('invalid-reference', field + ' must be a string')
+  }
   const normalized = value.trim()
   if (normalized.length === 0) throw new PeerMessageValidationError('invalid-reference', field + ' must not be empty')
   if (normalized.length > maximum) throw new PeerMessageValidationError('invalid-reference', field + ' is too long')
@@ -47,7 +50,7 @@ function reference(value: string, field: string, maximum = 256): string {
 }
 
 function normalizeAddress(input: BotAddress, field: string): BotAddress {
-  if (input === null || typeof input !== 'object') {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
     throw new PeerMessageValidationError('invalid-address', field + ' must be an address object')
   }
   const id = reference(input.id, field + '.id')
@@ -105,6 +108,9 @@ export function validatePeerPayload(
   payload: Record<string, unknown>,
   maxBytes = MAX_PAYLOAD_BYTES,
 ): number {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new PeerMessageValidationError('invalid-payload', 'payload must be a plain JSON object')
+  }
   inspectValue(payload, '$', 0)
   const serialized = JSON.stringify(payload)
   if (serialized === undefined) {
@@ -117,11 +123,11 @@ export function validatePeerPayload(
 }
 
 function clonePayload(payload: Record<string, unknown>, maxBytes: number): Record<string, unknown> {
+  validatePeerPayload(payload, maxBytes)
   const serialized = JSON.stringify(payload)
   if (serialized === undefined) {
     throw new PeerMessageValidationError('invalid-payload', 'payload could not be serialized as JSON')
   }
-  validatePeerPayload(payload, maxBytes)
   return JSON.parse(serialized) as Record<string, unknown>
 }
 
@@ -203,6 +209,9 @@ export function createPeerEnvelope(
   }
   if (expiresAt - createdAt > policy.maxTtlMs) {
     throw new PeerMessageValidationError('ttl-exceeded', 'message TTL exceeds the protocol maximum')
+  }
+  if (input.epoch !== undefined && (!Number.isSafeInteger(input.epoch) || input.epoch < 0)) {
+    throw new PeerMessageValidationError('invalid-epoch', 'epoch must be a non-negative integer')
   }
   const maxHops = input.maxHops ?? policy.maxHops
   const hop = input.hop ?? 0
