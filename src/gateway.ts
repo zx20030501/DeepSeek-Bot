@@ -2786,25 +2786,9 @@ export class BotGateway {
     }
     const managerMentioned = parsedMentions.routableTargets.some(target => target.kind === 'manager')
     if (managerMentioned) {
-      try {
-        const managerResult = await this.planManagerTask({
-          requester,
-          replyTarget: target,
-          instruction: parsedMentions.instruction,
-          ...(this.config.collaboration?.managerBotId === undefined ? {} : { managerBotId: this.config.collaboration.managerBotId }),
-          traceId: internal.envelope.traceId ?? internal.envelope.correlationId,
-        })
-        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_routed', {
-          taskId: managerResult.taskId,
-          planId: managerResult.plan.planId,
-          dispatched: managerResult.dispatched.length,
-          approvalCode: managerResult.approvalCode ?? null,
-        }, internal.envelope.correlationId)
-      } catch (error: unknown) {
-        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_rejected', {
-          error: String(error).slice(0, 500),
-        }, internal.envelope.correlationId)
-      }
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_blocked_user_boundary', {
+        reason: 'Manager plans must originate at the user Gateway boundary until hop propagation is compiled into the Manager plan',
+      }, internal.envelope.correlationId)
     }
     if (parsed.botIds.length === 0) return
     const parentTask = await this.tasks.task(internal.envelope.taskId)
