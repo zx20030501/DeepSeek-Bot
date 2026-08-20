@@ -18,7 +18,19 @@ import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool.js'
+import { generateManagerPlan } from './manager-policy.js'
+import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
+import { WorkflowStore } from './workflow-store.js'
+import {
+  compileManagerDispatches,
+  compileWorkflowLaunch,
+  managerDescriptorsFromRoster,
+  workflowDispatchKey,
+  type ManagerGatewayRequest,
+  type ManagerRuntimeResult,
+  type WorkflowLaunchPlan,
+} from './fleet-runtime.js'
 import {
   BotDirectory,
   BotMailbox,
@@ -27,10 +39,12 @@ import {
   GroupRoomStore,
   TaskRunStore,
   createEnvelope,
-  parseBotMentions,
   type MailboxLease,
 } from './collaboration.js'
 import type {
+  ManagerPlan,
+  WorkflowDefinition,
+  WorkflowDraft,
   BotAddress,
   BotMessageEnvelope,
   BotDescriptor,
@@ -217,6 +231,9 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
         : 'auto-planned',
       approvalTtlMs: typeof collaboration.approvalTtlMs === 'number' ? collaboration.approvalTtlMs : 30 * 60_000,
       autoPlanner: collaboration.autoPlanner !== false,
+      managerBotId: typeof collaboration.managerBotId === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/u.test(collaboration.managerBotId)
+        ? collaboration.managerBotId.toLowerCase()
+        : 'manager',
       peerMessageTtlMs: typeof collaboration.peerMessageTtlMs === 'number' ? collaboration.peerMessageTtlMs : 30 * 60_000,
       peerMaxHops: typeof collaboration.peerMaxHops === 'number' ? collaboration.peerMaxHops : 4,
       peerMaxPayloadBytes: typeof collaboration.peerMaxPayloadBytes === 'number' ? collaboration.peerMaxPayloadBytes : 64 * 1_024,
@@ -237,6 +254,7 @@ export class BotGateway {
   private readonly tasks: TaskRunStore
   private readonly rooms: GroupRoomStore
   private readonly approvals: FleetApprovalStore
+  private readonly workflows: WorkflowStore
   private readonly planner = new FleetPlanner()
   private transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
@@ -288,6 +306,7 @@ export class BotGateway {
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
     this.mailbox = new BotMailbox(join(stateDir, 'mailbox.jsonl'), this.config.collaboration)
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
+    this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
     this.rooms = new GroupRoomStore(join(stateDir, 'rooms.json'), this.config.collaboration)
     this.approvals = new FleetApprovalStore(join(stateDir, 'approvals.json'), this.config.collaboration?.approvalTtlMs)
     this.transports = []
@@ -482,6 +501,265 @@ export class BotGateway {
           updatedAt: item.updatedAt,
         })),
       },
+    }
+  }
+
+  /**
+   * Generate a Manager plan from the canonical Gateway roster and, when the
+   * policy allows it, compile the plan into the existing Task/Run/Mailbox path.
+   */
+  public async planManagerTask(input: ManagerGatewayRequest): Promise<ManagerRuntimeResult> {
+    if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
+    const requester = input.requester.trim()
+    const instruction = input.instruction.trim()
+    if (requester.length === 0 || instruction.length === 0) throw new Error('Manager requester and instruction are required')
+    const managerBotId = (input.managerBotId ?? this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+    const traceId = input.traceId?.trim() || 'trace_' + randomUUID()
+    const task = await this.tasks.createTask({
+      title: 'Manager: ' + instruction,
+      instruction,
+      createdBy: requester,
+      assignedTo: managerBotId,
+      acceptanceCriteria: input.acceptanceCriteria ?? [],
+    })
+    const descriptors = managerDescriptorsFromRoster(
+      this.directory.list(),
+      input.replyTarget,
+      (botId, target) => this.directory.canInvoke(botId, target),
+      this.activeBotRuns,
+    )
+    const plan = generateManagerPlan({
+      taskId: task.id,
+      traceId,
+      requester,
+      instruction,
+      ...(input.requiredCapabilities === undefined ? {} : { requiredCapabilities: input.requiredCapabilities }),
+      ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
+      ...(input.risk === undefined ? {} : { risk: input.risk }),
+      ...(input.requiresExternalEffect === undefined ? {} : { requiresExternalEffect: input.requiresExternalEffect }),
+      ...(input.budget === undefined ? {} : { budget: input.budget }),
+      ...(input.maxAssignments === undefined ? {} : { maxAssignments: input.maxAssignments }),
+    }, managerBotId, descriptors)
+    await this.tasks.audit('task', task.id, requester, 'manager.plan_created', {
+      plan,
+      requester,
+      replyTarget: input.replyTarget,
+    }, traceId)
+    if (plan.policyDecision === 'deny') {
+      await this.tasks.failTask(task.id, plan.reasons.join('; '), 'botfleet')
+      return { taskId: task.id, traceId, plan, dispatched: [] }
+    }
+    if (plan.approval.required && input.approved !== true) {
+      const approval = await this.approvals.create({
+        kind: 'bot-invocation',
+        requestedBy: requester,
+        summary: 'Manager 计划：' + instruction,
+        entityId: task.id,
+        ...(this.config.collaboration?.approvalTtlMs === undefined ? {} : { ttlMs: this.config.collaboration.approvalTtlMs }),
+      })
+      await this.tasks.audit('approval', approval.id, requester, 'manager.approval_requested', {
+        taskId: task.id,
+        planId: plan.planId,
+        planRevision: plan.planRevision,
+      }, traceId)
+      this.scheduleApprovalExpiry(approval.expiresAt)
+      return { taskId: task.id, traceId, plan, dispatched: [], approvalCode: approval.code }
+    }
+    try {
+      const dispatched = await this.dispatchManagerPlan(plan, requester, input.replyTarget, input.approved === true)
+      return { taskId: task.id, traceId, plan, dispatched }
+    } catch (error: unknown) {
+      await this.tasks.failTask(task.id, error, 'botfleet')
+      throw error
+    }
+  }
+
+  private async dispatchManagerPlan(
+    plan: ManagerPlan,
+    requester: string,
+    replyTarget: BotTarget,
+    approved: boolean,
+  ): Promise<BotMessageEnvelope[]> {
+    const specs = compileManagerDispatches(plan, { approved })
+    const task = await this.tasks.task(plan.taskId)
+    if (!task) throw new Error('Manager Task not found: ' + plan.taskId)
+    const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
+    const dispatched: BotMessageEnvelope[] = []
+    for (const spec of specs) {
+      const bot = this.directory.get(spec.to.id)
+      if (!bot || !bot.enabled || !this.directory.canInvoke(bot.id, replyTarget)) {
+        throw new Error('Manager delegation is no longer authorized: ' + spec.to.id)
+      }
+      if (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always') {
+        throw new Error('Manager delegation requires a separate approved Bot invocation: ' + bot.id)
+      }
+      const existing = await this.mailbox.getByIdempotencyKey(spec.idempotencyKey)
+      if (existing !== undefined) {
+        dispatched.push(existing.envelope)
+        continue
+      }
+      let run: RunRecord | undefined
+      try {
+        run = await this.tasks.createRun(task.id, bot.id, 1)
+        const hop = Math.min(spec.hop, peerPolicy.maxHops)
+        const maxHops = Math.max(hop, Math.min(spec.maxHops, peerPolicy.maxHops))
+        const payload: Record<string, unknown> = {
+          ...spec.payload,
+          instruction: spec.instruction,
+          acceptanceCriteria: spec.acceptanceCriteria,
+          requester,
+          replyTarget,
+          managerBotId: spec.from.id,
+          source: 'manager',
+        }
+        validatePeerPayload(payload, peerPolicy.maxPayloadBytes)
+        const envelope = createPeerEnvelope({
+          kind: spec.kind,
+          from: spec.from,
+          to: { id: bot.id, type: 'bot' },
+          taskId: task.id,
+          runId: run.id,
+          attemptId: run.attemptId,
+          correlationId: plan.traceId,
+          traceId: plan.traceId,
+          hop,
+          maxHops,
+          idempotencyKey: spec.idempotencyKey,
+          payload,
+        }, this.config.collaboration ?? {})
+        await this.mailbox.enqueue(envelope, spec.idempotencyKey)
+        await this.tasks.audit('message', envelope.id, spec.from.id, 'manager.delegation_queued', {
+          taskId: task.id,
+          runId: run.id,
+          intentId: spec.intentId,
+          to: bot.id,
+          planId: plan.planId,
+        }, envelope.correlationId)
+        dispatched.push(envelope)
+      } catch (error: unknown) {
+        if (run !== undefined) await this.tasks.failRun(run.id, error, false)
+        throw error
+      }
+    }
+    if (dispatched.length > 0) {
+      void this.drainCollaboration().catch(error => this.log('warn', 'Manager delegation drain failed: ' + String(error)))
+    }
+    return dispatched
+  }
+
+  public async createWorkflowDefinition(input: WorkflowDraft, actor = input.ownerId): Promise<WorkflowDefinition> {
+    return this.workflows.create(input, actor)
+  }
+
+  public async listWorkflowDefinitions(actor = 'local-dashboard', workspaceId?: string): Promise<WorkflowDefinition[]> {
+    return this.workflows.list({ actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
+  }
+
+  public async getWorkflowDefinition(workflowId: string, actor = 'local-dashboard', workspaceId?: string): Promise<WorkflowDefinition | undefined> {
+    return this.workflows.get(workflowId, { actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
+  }
+
+  public async compileWorkflowDefinition(input: unknown, actor = 'local-dashboard'): Promise<WorkflowLaunchPlan> {
+    const plan = compileWorkflowLaunch(input)
+    await this.tasks.audit('workflow', plan.definition.id, actor, 'workflow.compiled', {
+      revision: plan.definition.revision,
+      nodeCount: plan.nodes.length,
+      entryTaskIds: [...plan.entryTaskIds],
+      budget: plan.budget,
+    }, plan.definition.id)
+    return plan
+  }
+
+  /**
+   * Launches only the first task stage of a validated Workflow definition.
+   * Conditions, approvals, map/reduce and continuation remain explicit runtime
+   * work; no declarative node is treated as executable code here.
+   */
+  public async launchWorkflowDefinition(
+    workflowId: string,
+    requester: string,
+    replyTarget: BotTarget,
+    actor = 'local-dashboard',
+  ): Promise<{
+    readonly workflowId: string
+    readonly revision: number
+    readonly entryNodes: readonly string[]
+    readonly dispatched: readonly BotMessageEnvelope[]
+  }> {
+    const definition = await this.getWorkflowDefinition(workflowId, actor)
+    if (!definition) throw new Error('Workflow is not found or not visible: ' + workflowId)
+    const plan = await this.compileWorkflowDefinition(definition, actor)
+    if (plan.entryTaskIds.length === 0) throw new Error('Workflow entry requires a condition or approval runtime adapter')
+    if (plan.entryTaskIds.length > plan.budget.maxFanOut) throw new Error('Workflow entry fan-out exceeds the policy budget')
+    const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
+    const correlationId = 'workflow:' + definition.id + ':' + definition.revision
+    const dispatched: BotMessageEnvelope[] = []
+    for (const nodeId of plan.entryTaskIds) {
+      const node = plan.nodes.find(item => item.nodeId === nodeId)
+      if (!node || node.kind !== 'task') throw new Error('Workflow entry node is not a dispatchable task: ' + nodeId)
+      const candidates = this.directory.list()
+        .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
+        .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
+        .filter(bot => !bot.approvalRequired && this.config.collaboration?.approvalMode !== 'always')
+        .sort((left, right) => Number(this.activeBotRuns.has(left.id)) - Number(this.activeBotRuns.has(right.id)) || left.id.localeCompare(right.id))
+      const bot = candidates[0]
+      if (!bot) throw new Error('No authorized Bot can execute Workflow node: ' + nodeId)
+      const idempotencyKey = workflowDispatchKey(definition.id, definition.revision, nodeId)
+      const existing = await this.mailbox.getByIdempotencyKey(idempotencyKey)
+      if (existing !== undefined) {
+        dispatched.push(existing.envelope)
+        continue
+      }
+      const task = await this.tasks.createTask({
+        title: definition.name + ': ' + node.label,
+        instruction: node.instruction,
+        createdBy: requester,
+        assignedTo: bot.id,
+        acceptanceCriteria: node.acceptanceCriteria,
+      })
+      const run = await this.tasks.createRun(task.id, bot.id, 1)
+      const payload: Record<string, unknown> = {
+        workflowDefinitionId: definition.id,
+        workflowRevision: definition.revision,
+        workflowNodeId: nodeId,
+        workflowDependencies: node.dependsOn,
+        workflowOutputs: node.outputNames,
+        instruction: node.instruction,
+        acceptanceCriteria: node.acceptanceCriteria,
+        requester,
+        replyTarget,
+      }
+      validatePeerPayload(payload, peerPolicy.maxPayloadBytes)
+      const envelope = createPeerEnvelope({
+        kind: 'request',
+        from: { id: 'service:workflow:' + definition.id, type: 'service' },
+        to: { id: bot.id, type: 'bot' },
+        taskId: task.id,
+        runId: run.id,
+        attemptId: run.attemptId,
+        correlationId,
+        traceId: correlationId,
+        idempotencyKey,
+        payload,
+      }, this.config.collaboration ?? {})
+      await this.mailbox.enqueue(envelope, idempotencyKey)
+      await this.tasks.audit('workflow', definition.id, 'workflow-runtime', 'workflow.node_queued', {
+        revision: definition.revision,
+        nodeId,
+        taskId: task.id,
+        runId: run.id,
+        botId: bot.id,
+      }, correlationId)
+      dispatched.push(envelope)
+    }
+    if (dispatched.length > 0) {
+      void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
+    }
+    return {
+      workflowId: definition.id,
+      revision: definition.revision,
+      entryNodes: [...plan.entryTaskIds],
+      dispatched,
     }
   }
 
@@ -995,6 +1273,7 @@ export class BotGateway {
     await this.outbox.load()
     await this.mailbox.load()
     await this.tasks.load()
+    await this.workflows.load()
     await this.approvals.snapshot()
     this.durableLoaded = true
   }
@@ -1269,13 +1548,24 @@ export class BotGateway {
     const command = parseBotCommand(message.text)
     if (command && await this.handleLocalCommand(message, walId, binding, command.name, command.args)) return
     if (this.config.collaboration?.enabled !== false) {
-      const mentions = parseBotMentions(
-        message.text,
-        this.directory.ids(),
-        this.config.collaboration?.maxGroupBots ?? 6,
-      )
-      if (mentions.botIds.length) {
-        await this.handleCollaborationRequest(message, walId, binding, mentions.botIds, mentions.instruction)
+      const maxTargets = this.config.collaboration?.maxGroupBots ?? 6
+      const mentions = parseFleetMentions(message.text, {
+        knownBots: this.directory.ids(),
+        managerIds: [this.config.collaboration?.managerBotId ?? 'manager'],
+        selfId: profile.name,
+        maxTargets,
+        mentionBudget: maxTargets,
+      })
+      const managerMention = mentions.routableTargets.find(target => target.kind === 'manager')
+      const botIds = mentions.routableTargets
+        .filter(target => target.kind === 'bot')
+        .map(target => target.id)
+      if (managerMention) {
+        await this.handleManagerMention(message, walId, binding, mentions.instruction)
+        return
+      }
+      if (botIds.length) {
+        await this.handleCollaborationRequest(message, walId, binding, botIds, mentions.instruction)
         return
       }
     }
@@ -1306,6 +1596,43 @@ export class BotGateway {
       await this.bridge.followup(agent, message.text)
     } catch (error: unknown) {
       await this.handleInboundFailure(message, walId, error)
+    }
+  }
+
+  private async handleManagerMention(
+    message: InboundMessage,
+    walId: string,
+    binding: ChatBinding,
+    instruction: string,
+  ): Promise<void> {
+    const claimed = await this.wal.claim(walId, binding.sessionId)
+    if (!claimed) return
+    const requester = 'user:' + message.target.platform + ':' + (message.target.userId ?? message.target.chatId)
+    try {
+      const result = await this.planManagerTask({
+        requester,
+        replyTarget: message.target,
+        instruction,
+        managerBotId: this.config.collaboration?.managerBotId,
+      })
+      if (result.approvalCode !== undefined) {
+        await this.sendText(message.target, [
+          'Manager 已生成计划，等待确认。',
+          '计划：' + result.plan.planId + '@' + result.plan.planRevision,
+          '委派：' + result.plan.delegations.map(item => '@' + item.toBot).join('、'),
+          '原因：' + result.plan.reasons.join('；'),
+          '批准：/approve ' + result.approvalCode,
+          '拒绝：/reject ' + result.approvalCode,
+          '任务 ID：' + result.taskId,
+        ].join('\n'), 'manager-plan:' + message.id)
+      } else if (result.dispatched.length > 0) {
+        await this.sendText(message.target, 'Manager 已启动 ' + result.dispatched.length + ' 个受控委派。任务 ID：' + result.taskId, 'manager-start:' + message.id)
+      } else {
+        await this.sendText(message.target, 'Manager 未找到满足当前能力、ACL 和预算约束的 Bot：\n' + result.plan.reasons.join('；'), 'manager-denied:' + message.id)
+      }
+      await this.wal.complete(walId)
+    } catch (error: unknown) {
+      await this.handleInboundFailure(message, walId, error, false, 'Manager 计划创建失败：' + String(error), 'manager-error:' + message.id)
     }
   }
 
@@ -2380,11 +2707,54 @@ export class BotGateway {
     const target = this.replyTarget(internal.envelope)
     if (!target) return
     const maxFanout = Math.max(1, Math.min(6, Math.floor(this.config.collaboration?.maxGroupBots ?? 6)))
-    const parsed = parseBotMentions(sourceText, this.directory.ids(), maxFanout)
-    if (parsed.botIds.length === 0) return
+    const parsedMentions = parseFleetMentions(sourceText, {
+      knownBots: this.directory.ids(),
+      managerIds: [this.config.collaboration?.managerBotId ?? 'manager'],
+      selfId: internal.botId,
+      maxTargets: maxFanout,
+      mentionBudget: maxFanout,
+      hop: internal.envelope.hop ?? 0,
+      maxHop: internal.envelope.maxHops ?? normalizePeerPolicy(this.config.collaboration ?? {}).maxHops,
+    })
+    const parsed = {
+      botIds: parsedMentions.routableTargets
+        .filter(target => target.kind === 'bot')
+        .map(target => target.id),
+      instruction: parsedMentions.instruction,
+    }
     const requester = typeof internal.envelope.payload.requester === 'string'
       ? internal.envelope.payload.requester
       : internal.envelope.from
+    if (parsedMentions.metadata.truncated || parsedMentions.unknownTargets.length > 0) {
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'peer.mention_parser_bounded', {
+        truncated: parsedMentions.metadata.truncated,
+        unknownTargets: parsedMentions.unknownTargets.map(target => target.normalized).slice(0, 20),
+        remainingMentionBudget: parsedMentions.metadata.remainingMentionBudget,
+      }, internal.envelope.correlationId)
+    }
+    const managerMentioned = parsedMentions.routableTargets.some(target => target.kind === 'manager')
+    if (managerMentioned) {
+      try {
+        const managerResult = await this.planManagerTask({
+          requester,
+          replyTarget: target,
+          instruction: parsedMentions.instruction,
+          managerBotId: this.config.collaboration?.managerBotId,
+          traceId: internal.envelope.traceId ?? internal.envelope.correlationId,
+        })
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_routed', {
+          taskId: managerResult.taskId,
+          planId: managerResult.plan.planId,
+          dispatched: managerResult.dispatched.length,
+          approvalCode: managerResult.approvalCode ?? null,
+        }, internal.envelope.correlationId)
+      } catch (error: unknown) {
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'manager.mention_rejected', {
+          error: String(error).slice(0, 500),
+        }, internal.envelope.correlationId)
+      }
+    }
+    if (parsed.botIds.length === 0) return
     const parentTask = await this.tasks.task(internal.envelope.taskId)
     const acceptanceCriteria = parentTask?.acceptanceCriteria ?? []
     const visited = new Set<string>([internal.botId.toLowerCase()])

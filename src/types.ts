@@ -168,6 +168,8 @@ export interface BotCollaborationConfig {
   readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
   readonly approvalTtlMs?: number
   readonly autoPlanner?: boolean
+  /** Stable virtual Manager identity used by the Gateway policy adapter. */
+  readonly managerBotId?: string
   /** Default lifetime for internal Peer Messages. */
   readonly peerMessageTtlMs?: number
   /** Maximum forwarding depth for Bot-to-Bot messages. */
