@@ -6,9 +6,14 @@
 - Base branch: `origin/codex/dynamic-bot-registry-v2`;
 - Base commit: `c3a7c2f5ee6a0a0200efdef76193c2d1e9d0ef7a`;
 - Working branch: `agent/fleet-product-layer-external-ai`;
-- Part B delivery commits: `1568b85`, `6a6ae07`, `b73637b`, `b706aac`,
-  `8273315`, `d19a6c0`, `4cbcd09`;
+- Local Part B development commits: `1568b85`, `6a6ae07`, `b73637b`,
+  `b706aac`, `8273315`, `d19a6c0`, `4cbcd09`;
 - Handoff tip: `4cbcd09`.
+- GitHub Draft PR delivery commit: `d6d3942f89b69b2bd81406ba4579db66b0d765ed`;
+- The GitHub branch was published as one connector-created commit. The local
+  commit list is retained for development traceability; reviewers should use
+  the Draft PR branch or its remote commit rather than cherry-picking local
+  workspace-only SHAs.
 
 This branch does not modify `main` and does not modify any protected runtime
 file listed in the task brief.
@@ -83,9 +88,9 @@ file listed in the task brief.
 
 ## Rollback
 
-The feature and its handoff records are isolated in the commits listed above.
-To remove Part B from a checkout, do not reset shared branches; revert the
-commits in reverse order:
+The local feature and handoff records are isolated in the commits listed
+above. To remove the local Part B work from a checkout, do not reset shared
+branches; revert the local commits in reverse order:
 
 ```text
 git revert 4cbcd09
