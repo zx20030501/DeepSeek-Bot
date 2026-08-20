@@ -635,6 +635,12 @@ export interface CreateTaskInput {
   readonly acceptanceCriteria?: readonly string[]
   readonly priority?: number
   readonly roomId?: string
+  /** Durable linkage for a compiled Workflow task DAG. */
+  readonly workflowDefinitionId?: string
+  readonly workflowRunId?: string
+  readonly workflowNodeId?: string
+  readonly workflowReplyTarget?: BotTarget
+  readonly workflowTraceId?: string
 }
 
 /** Durable Task/Run/Handoff state machine and append-only audit trail. */
@@ -676,6 +682,11 @@ export class TaskRunStore {
       acceptanceCriteria: [...(input.acceptanceCriteria ?? [])].slice(0, 20),
       priority: Math.max(0, Math.min(100, Math.floor(input.priority ?? 50))),
       ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
+      ...(input.workflowDefinitionId === undefined ? {} : { workflowDefinitionId: input.workflowDefinitionId }),
+      ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
+      ...(input.workflowNodeId === undefined ? {} : { workflowNodeId: input.workflowNodeId }),
+      ...(input.workflowReplyTarget === undefined ? {} : { workflowReplyTarget: { ...input.workflowReplyTarget } }),
+      ...(input.workflowTraceId === undefined ? {} : { workflowTraceId: input.workflowTraceId }),
       status: 'pending',
       createdAt: timestamp,
       updatedAt: timestamp,

@@ -339,6 +339,12 @@ export interface TaskRecord {
   readonly acceptanceCriteria: readonly string[]
   readonly priority: number
   readonly roomId?: string
+  /** Durable linkage for the compiled Workflow task runtime. */
+  readonly workflowDefinitionId?: string
+  readonly workflowRunId?: string
+  readonly workflowNodeId?: string
+  readonly workflowReplyTarget?: BotTarget
+  readonly workflowTraceId?: string
   readonly status: TaskStatus
   readonly currentRunId?: string
   readonly createdAt: number

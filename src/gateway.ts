@@ -695,6 +695,8 @@ export class BotGateway {
   ): Promise<{
     readonly workflowId: string
     readonly revision: number
+    readonly workflowRunId: string
+    readonly rootTaskId: string
     readonly entryNodes: readonly string[]
     readonly dispatched: readonly BotMessageEnvelope[]
   }> {
@@ -703,40 +705,132 @@ export class BotGateway {
     const plan = await this.compileWorkflowDefinition(definition, actor)
     if (plan.entryTaskIds.length === 0) throw new Error('Workflow entry requires a condition or approval runtime adapter')
     if (plan.entryTaskIds.length > plan.budget.maxFanOut) throw new Error('Workflow entry fan-out exceeds the policy budget')
-    const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
+    const workflowRunId = 'workflow-run:' + definition.id + ':' + definition.revision
     const correlationId = 'workflow:' + definition.id + ':' + definition.revision
+    const snapshot = await this.tasks.snapshot()
+    let rootTask = snapshot.tasks.find(task => (
+      task.workflowDefinitionId === definition.id
+      && task.workflowRunId === workflowRunId
+      && task.workflowNodeId === '__root__'
+    ))
+    if (!rootTask) {
+      rootTask = await this.tasks.createTask({
+        title: 'Workflow: ' + definition.name,
+        instruction: definition.description,
+        createdBy: requester,
+        assignedTo: 'workflow',
+        workflowDefinitionId: definition.id,
+        workflowRunId,
+        workflowNodeId: '__root__',
+        workflowReplyTarget: replyTarget,
+        workflowTraceId: correlationId,
+      })
+    }
+    const dispatched = await this.queueCompiledWorkflowNodes(
+      definition,
+      plan,
+      workflowRunId,
+      rootTask,
+      plan.entryTaskIds,
+      requester,
+      replyTarget,
+      correlationId,
+    )
+    if (dispatched.length > 0) {
+      void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
+    }
+    return {
+      workflowId: definition.id,
+      revision: definition.revision,
+      workflowRunId,
+      rootTaskId: rootTask.id,
+      entryNodes: [...plan.entryTaskIds],
+      dispatched,
+    }
+  }
+
+  /**
+   * Queues a bounded set of compiled task nodes. The stable node idempotency key
+   * is checked before both Task and Mailbox creation so restart recovery can
+   * safely finish a torn enqueue without duplicating work.
+   */
+  private async queueCompiledWorkflowNodes(
+    definition: WorkflowDefinition,
+    plan: WorkflowLaunchPlan,
+    workflowRunId: string,
+    rootTask: TaskRecord,
+    nodeIds: readonly string[],
+    requester: string,
+    replyTarget: BotTarget,
+    correlationId: string,
+  ): Promise<BotMessageEnvelope[]> {
+    if (nodeIds.length > plan.budget.maxFanOut) throw new Error('Workflow fan-out exceeds the policy budget')
+    const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
+    const snapshot = await this.tasks.snapshot()
+    const knownTasks = new Map(
+      snapshot.tasks
+        .filter(task => task.workflowDefinitionId === definition.id && task.workflowRunId === workflowRunId && task.workflowNodeId !== undefined)
+        .map(task => [task.workflowNodeId as string, task]),
+    )
+    const knownRuns = new Map(snapshot.runs.map(run => [run.id, run]))
     const dispatched: BotMessageEnvelope[] = []
-    for (const nodeId of plan.entryTaskIds) {
+    for (const nodeId of nodeIds) {
       const node = plan.nodes.find(item => item.nodeId === nodeId)
       const definitionNode = definition.nodes.find(item => item.id === nodeId)
-      if (!node || !definitionNode || node.kind !== 'task') throw new Error('Workflow entry node is not a dispatchable task: ' + nodeId)
+      if (!node || !definitionNode || node.kind !== 'task') throw new Error('Workflow node is not a dispatchable task: ' + nodeId)
       if (definitionNode.effect !== undefined && definitionNode.effect.kind !== 'none') {
         throw new Error('Workflow external effects require an approved runtime adapter: ' + nodeId)
       }
-      const candidates = this.directory.list()
-        .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
-        .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
-        .filter(bot => !bot.approvalRequired && this.config.collaboration?.approvalMode !== 'always')
-        .sort((left, right) => Number(this.activeBotRuns.has(left.id)) - Number(this.activeBotRuns.has(right.id)) || left.id.localeCompare(right.id))
-      const bot = candidates[0]
-      if (!bot) throw new Error('No authorized Bot can execute Workflow node: ' + nodeId)
+
       const idempotencyKey = workflowDispatchKey(definition.id, definition.revision, nodeId)
       const existing = await this.mailbox.getByIdempotencyKey(idempotencyKey)
       if (existing !== undefined) {
         dispatched.push(existing.envelope)
         continue
       }
-      const task = await this.tasks.createTask({
-        title: definition.name + ': ' + node.label,
-        instruction: node.instruction,
-        createdBy: requester,
-        assignedTo: bot.id,
-        acceptanceCriteria: node.acceptanceCriteria,
-      })
-      const run = await this.tasks.createRun(task.id, bot.id, 1)
+
+      const existingTask = knownTasks.get(nodeId)
+      if (existingTask?.status === 'completed') continue
+      if (existingTask?.status === 'failed' || existingTask?.status === 'cancelled') {
+        throw new Error('Workflow node is already terminal: ' + nodeId)
+      }
+      const candidates = this.directory.list()
+        .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
+        .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
+        .filter(bot => !bot.approvalRequired && this.config.collaboration?.approvalMode !== 'always')
+        .sort((left, right) => Number(this.activeBotRuns.has(left.id)) - Number(this.activeBotRuns.has(right.id)) || left.id.localeCompare(right.id))
+      const selectedBot = existingTask === undefined
+        ? candidates[0]
+        : this.directory.get(existingTask.assignedTo)
+      if (!selectedBot || !selectedBot.enabled || !this.directory.canInvoke(selectedBot.id, replyTarget)) {
+        throw new Error('No authorized Bot can execute Workflow node: ' + nodeId)
+      }
+      let task = existingTask
+      if (task === undefined) {
+        task = await this.tasks.createTask({
+          title: definition.name + ': ' + node.label,
+          instruction: node.instruction,
+          createdBy: requester,
+          assignedTo: selectedBot.id,
+          acceptanceCriteria: node.acceptanceCriteria,
+          workflowDefinitionId: definition.id,
+          workflowRunId,
+          workflowNodeId: nodeId,
+          workflowReplyTarget: replyTarget,
+          workflowTraceId: correlationId,
+        })
+        knownTasks.set(nodeId, task)
+      }
+      let run = task.currentRunId === undefined ? undefined : knownRuns.get(task.currentRunId)
+      if (run === undefined || !['queued', 'running'].includes(run.status)) {
+        run = await this.tasks.createRun(task.id, selectedBot.id, 1)
+        knownRuns.set(run.id, run)
+      }
       const payload: Record<string, unknown> = {
         workflowDefinitionId: definition.id,
         workflowRevision: definition.revision,
+        workflowRunId,
+        workflowRootTaskId: rootTask.id,
         workflowNodeId: nodeId,
         workflowDependencies: node.dependsOn,
         workflowOutputs: node.outputNames,
@@ -749,7 +843,7 @@ export class BotGateway {
       const envelope = createPeerEnvelope({
         kind: 'request',
         from: { id: 'service:workflow:' + definition.id, type: 'service' },
-        to: { id: bot.id, type: 'bot' },
+        to: { id: selectedBot.id, type: 'bot' },
         taskId: task.id,
         runId: run.id,
         attemptId: run.attemptId,
@@ -761,22 +855,15 @@ export class BotGateway {
       await this.mailbox.enqueue(envelope, idempotencyKey)
       await this.tasks.audit('workflow', definition.id, 'workflow-runtime', 'workflow.node_queued', {
         revision: definition.revision,
+        workflowRunId,
         nodeId,
         taskId: task.id,
         runId: run.id,
-        botId: bot.id,
+        botId: selectedBot.id,
       }, correlationId)
       dispatched.push(envelope)
     }
-    if (dispatched.length > 0) {
-      void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
-    }
-    return {
-      workflowId: definition.id,
-      revision: definition.revision,
-      entryNodes: [...plan.entryTaskIds],
-      dispatched,
-    }
+    return dispatched
   }
 
   /** Public typed Bot-to-Bot seam retained from the collaboration-core prototype. */
@@ -1316,6 +1403,7 @@ export class BotGateway {
       await this.recoverInterruptedRunCommits()
       await this.recoverAcceptedHandoffs()
       void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
+      await this.recoverCompiledWorkflows().catch(error => this.log('warn', `Compiled Workflow recovery failed: ${String(error)}`))
       void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration recovery failed: ${String(error)}`))
       void this.recoverFleetWorkflows().catch(error => this.log('warn', `Fleet workflow recovery failed: ${String(error)}`))
     }
@@ -1338,6 +1426,44 @@ export class BotGateway {
       const runs = await this.tasks.runsForWorkflow(workflow.id)
       if (workflow.status === 'running' && runs.length === 0) await this.startFleetWorkflow(workflow)
       else void this.queueWorkflowContinuation(workflow.id)
+    }
+  }
+
+  /**
+   * Restarts compiled Workflow DAGs from their durable root and child Task
+   * records. The stable node keys make this safe after a process dies between
+   * Task/Run creation and Mailbox enqueue.
+   */
+  private async recoverCompiledWorkflows(): Promise<void> {
+    const snapshot = await this.tasks.snapshot()
+    const roots = snapshot.tasks.filter(task => (
+      task.workflowNodeId === '__root__'
+      && task.workflowDefinitionId !== undefined
+      && task.workflowRunId !== undefined
+      && task.status !== 'completed'
+      && task.status !== 'failed'
+      && task.status !== 'cancelled'
+    ))
+    for (const root of roots) {
+      const definition = await this.getWorkflowDefinition(root.workflowDefinitionId!, root.createdBy)
+      const replyTarget = root.workflowReplyTarget
+      if (!definition || !replyTarget) {
+        await this.tasks.failTask(root.id, definition ? 'Workflow root is missing its reply target' : 'Workflow definition is no longer available', 'workflow-runtime')
+        await this.tasks.audit('workflow', root.workflowDefinitionId ?? root.id, 'workflow-runtime', 'workflow.recovery_failed', {
+          rootTaskId: root.id,
+          reason: definition ? 'missing_reply_target' : 'missing_definition',
+        }, root.workflowTraceId)
+        continue
+      }
+      await this.advanceCompiledWorkflowState({
+        definition,
+        workflowRunId: root.workflowRunId!,
+        rootTaskId: root.id,
+        requester: root.createdBy,
+        replyTarget,
+        correlationId: root.workflowTraceId ?? 'workflow:' + root.workflowDefinitionId,
+        latestOutput: '',
+      })
     }
   }
 
@@ -2614,6 +2740,11 @@ export class BotGateway {
         }
         return
       }
+      if (typeof internal.envelope.payload.workflowDefinitionId === 'string') {
+        await this.failCompiledWorkflow(internal, error)
+        void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow failure drain failed: ${String(nextError)}`))
+        return
+      }
       const handoffId = typeof internal.envelope.payload.handoffId === 'string' ? internal.envelope.payload.handoffId : undefined
       if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', internal.botId)
       if (internal.envelope.roomId !== undefined) await this.rooms.close(internal.envelope.roomId)
@@ -2663,6 +2794,21 @@ export class BotGateway {
     }
     const result = (output ?? '').trim() || 'Bot 没有返回文本结果。'
     const run = await this.tasks.run(runId)
+    if (run?.workflowId === undefined && roomId === undefined && typeof internal.envelope.payload.workflowDefinitionId === 'string') {
+      await this.tasks.completeRun(runId, result, true)
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.completed', {
+        taskId: internal.envelope.taskId,
+        workflowDefinitionId: internal.envelope.payload.workflowDefinitionId,
+        workflowNodeId: internal.envelope.payload.workflowNodeId ?? null,
+      }, internal.envelope.correlationId)
+      try {
+        await this.advanceCompiledWorkflow(internal, result)
+      } finally {
+        this.cleanupInternalRun(internal)
+      }
+      void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow continuation failed: ${String(nextError)}`))
+      return
+    }
     if (run?.workflowId === undefined && roomId === undefined) {
       await this.routeInternalMentions(internal, result)
     }
@@ -2714,6 +2860,218 @@ export class BotGateway {
     }, internal.envelope.correlationId)
     this.cleanupInternalRun(internal)
     void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration continuation failed: ${String(error)}`))
+  }
+
+  private async advanceCompiledWorkflow(internal: InternalRun, latestOutput: string): Promise<void> {
+    const payload = internal.envelope.payload
+    const definitionId = typeof payload.workflowDefinitionId === 'string' ? payload.workflowDefinitionId : undefined
+    const workflowRunId = typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined
+    const rootTaskId = typeof payload.workflowRootTaskId === 'string' ? payload.workflowRootTaskId : undefined
+    if (!definitionId || !workflowRunId || !rootTaskId) {
+      await this.tasks.audit('message', internal.envelope.id, 'workflow-runtime', 'workflow.invalid_runtime_payload', {
+        taskId: internal.envelope.taskId,
+      }, internal.envelope.correlationId)
+      return
+    }
+    const root = await this.tasks.task(rootTaskId)
+    if (!root) {
+      await this.tasks.audit('workflow', definitionId, 'workflow-runtime', 'workflow.root_missing', { rootTaskId }, internal.envelope.correlationId)
+      return
+    }
+    const replyTarget = root.workflowReplyTarget ?? this.replyTarget(internal.envelope)
+    const definition = await this.getWorkflowDefinition(definitionId, root.createdBy)
+    if (!definition || !replyTarget) {
+      await this.failCompiledWorkflowState({
+        definitionId,
+        workflowRunId,
+        rootTaskId,
+        workflowName: definition?.name ?? definitionId,
+        replyTarget,
+        correlationId: root.workflowTraceId ?? internal.envelope.correlationId,
+      }, definition ? 'Workflow root is missing its reply target' : 'Workflow definition is no longer available')
+      return
+    }
+    try {
+      await this.advanceCompiledWorkflowState({
+        definition,
+        workflowRunId,
+        rootTaskId,
+        requester: root.createdBy,
+        replyTarget,
+        correlationId: root.workflowTraceId ?? internal.envelope.correlationId,
+        latestOutput,
+      })
+    } catch (error: unknown) {
+      await this.failCompiledWorkflowState({
+        definitionId,
+        workflowRunId,
+        rootTaskId,
+        workflowName: definition.name,
+        replyTarget,
+        correlationId: root.workflowTraceId ?? internal.envelope.correlationId,
+      }, error)
+    }
+  }
+
+  private async advanceCompiledWorkflowState(input: {
+    readonly definition: WorkflowDefinition
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly requester: string
+    readonly replyTarget: BotTarget
+    readonly correlationId: string
+    readonly latestOutput: string
+  }): Promise<void> {
+    await this.withTaskLock(input.rootTaskId, async () => {
+      const root = await this.tasks.task(input.rootTaskId)
+      if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
+      const plan = compileWorkflowLaunch(input.definition)
+      const snapshot = await this.tasks.snapshot()
+      const workflowTasks = snapshot.tasks.filter(task => (
+        task.workflowDefinitionId === input.definition.id && task.workflowRunId === input.workflowRunId && task.workflowNodeId !== '__root__'
+      ))
+      const taskByNode = new Map(
+        workflowTasks
+          .filter(task => task.workflowNodeId !== undefined)
+          .map(task => [task.workflowNodeId as string, task]),
+      )
+      const taskNodes = plan.nodes.filter(node => node.kind === 'task')
+      const failedNode = taskNodes.find(node => {
+        const task = taskByNode.get(node.nodeId)
+        return task?.status === 'failed' || task?.status === 'cancelled'
+      })
+      if (failedNode) {
+        const task = taskByNode.get(failedNode.nodeId)
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow node ' + failedNode.nodeId + ' failed: ' + (task?.error ?? task?.status ?? 'unknown'))
+        return
+      }
+      const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => taskByNode.get(node.nodeId)?.status === 'completed')
+      const unsupportedNodes = plan.nodes.filter(node => node.kind !== 'task')
+      if (allTasksCompleted && unsupportedNodes.length > 0) {
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow control nodes require a runtime adapter: ' + unsupportedNodes.map(node => node.nodeId).join(', '))
+        return
+      }
+      if (allTasksCompleted) {
+        const parts = taskNodes
+          .map(node => {
+            const task = taskByNode.get(node.nodeId)
+            return task?.result === undefined || task.result.trim() === '' ? '' : node.nodeId + ': ' + task.result.trim()
+          })
+          .filter(Boolean)
+        const finalResult = (parts.join('\n\n') || input.latestOutput || 'Workflow 没有产生文本结果。').slice(0, 50_000)
+        await this.tasks.completeTask(input.rootTaskId, finalResult, 'workflow-runtime')
+        await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 完成：\n' + finalResult, 'workflow-result:' + input.workflowRunId)
+        await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.completed', {
+          workflowRunId: input.workflowRunId,
+          rootTaskId: input.rootTaskId,
+          nodeCount: taskNodes.length,
+        }, input.correlationId)
+        return
+      }
+
+      let activeCount = 0
+      for (const task of workflowTasks) {
+        if (task.status === 'pending' || task.status === 'running') activeCount += 1
+      }
+      const capacity = Math.min(
+        Math.max(0, plan.budget.maxParallel - activeCount),
+        plan.budget.maxFanOut,
+      )
+      if (capacity <= 0) return
+      const ready = taskNodes.filter(node => {
+        if (taskByNode.has(node.nodeId)) return false
+        return node.dependsOn.every(dependencyId => {
+          const dependencyNode = plan.nodes.find(candidate => candidate.nodeId === dependencyId)
+          return dependencyNode?.kind === 'task' && taskByNode.get(dependencyId)?.status === 'completed'
+        })
+      })
+      if (ready.length === 0) {
+        if (activeCount === 0) {
+          await this.markCompiledWorkflowFailedLocked(input, 'Workflow is blocked by an unresolved dependency or unsupported control node')
+        }
+        return
+      }
+      const nodeIds = ready.slice(0, capacity).map(node => node.nodeId)
+      const dispatched = await this.queueCompiledWorkflowNodes(
+        input.definition,
+        plan,
+        input.workflowRunId,
+        root,
+        nodeIds,
+        input.requester,
+        input.replyTarget,
+        input.correlationId,
+      )
+      await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.nodes_advanced', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        nodeIds,
+        messageIds: dispatched.map(message => message.id),
+      }, input.correlationId)
+    })
+  }
+
+  private async failCompiledWorkflow(internal: InternalRun, error: unknown): Promise<void> {
+    const payload = internal.envelope.payload
+    const definitionId = typeof payload.workflowDefinitionId === 'string' ? payload.workflowDefinitionId : undefined
+    const workflowRunId = typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined
+    const rootTaskId = typeof payload.workflowRootTaskId === 'string' ? payload.workflowRootTaskId : undefined
+    if (!definitionId || !workflowRunId || !rootTaskId) return
+    const root = await this.tasks.task(rootTaskId)
+    const definition = root === undefined ? undefined : await this.getWorkflowDefinition(definitionId, root.createdBy)
+    await this.failCompiledWorkflowState({
+      definitionId,
+      workflowRunId,
+      rootTaskId,
+      workflowName: definition?.name ?? definitionId,
+      replyTarget: root?.workflowReplyTarget ?? this.replyTarget(internal.envelope),
+      correlationId: root?.workflowTraceId ?? internal.envelope.correlationId,
+    }, error)
+  }
+
+  private async failCompiledWorkflowState(input: {
+    readonly definitionId: string
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly workflowName: string
+    readonly replyTarget?: BotTarget
+    readonly correlationId?: string
+  }, error: unknown): Promise<void> {
+    await this.withTaskLock(input.rootTaskId, async () => {
+      const root = await this.tasks.task(input.rootTaskId)
+      if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
+      const detail = String(error).slice(0, 2_000)
+      await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
+      if (input.replyTarget) {
+        await this.sendText(input.replyTarget, 'Workflow ' + input.workflowName + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+      }
+      await this.tasks.audit('workflow', input.definitionId, 'workflow-runtime', 'workflow.failed', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        error: detail.slice(0, 500),
+      }, input.correlationId)
+    })
+  }
+
+  private async markCompiledWorkflowFailedLocked(input: {
+    readonly definition: WorkflowDefinition
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly requester: string
+    readonly replyTarget: BotTarget
+    readonly correlationId: string
+    readonly latestOutput: string
+  }, error: unknown): Promise<void> {
+    const root = await this.tasks.task(input.rootTaskId)
+    if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
+    const detail = String(error).slice(0, 2_000)
+    await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
+    await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+    await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.failed', {
+      workflowRunId: input.workflowRunId,
+      rootTaskId: input.rootTaskId,
+      error: detail.slice(0, 500),
+    }, input.correlationId)
   }
 
   private botRunRetryDelay(attempt: number): number {

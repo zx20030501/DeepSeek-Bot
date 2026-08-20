@@ -183,3 +183,102 @@ test('Manager approval gates dispatch and resumes through the durable approval p
     await rm(root, { recursive: true, force: true })
   }
 })
+
+
+test('compiled Workflow resumes its durable DAG after restart and completes the final stage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-workflow-dag-recovery-'))
+  let first
+  let gateway
+  try {
+    first = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      access: { userIds: ['ou_user'] },
+      profiles: {
+        researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
+        writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+    })
+    await first.stop()
+    const workflow = await first.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
+    const launch = await first.launchWorkflowDefinition(
+      workflow.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+    )
+    assert.equal(launch.dispatched.length, 1)
+    await first.stop()
+
+    const agents = new Map()
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume({ resumeSessionId }) {
+        const agent = agents.get(String(resumeSessionId))
+        if (!agent) throw new Error('not found')
+        return { agent }
+      },
+      async create({ sessionId, agentOptions, meta }) {
+        const preset = meta?.agentPreset ?? 'unknown'
+        const agent = {
+          id: String(sessionId),
+          status: 'idle',
+          options: agentOptions ?? {},
+          cancel() {},
+          followup() {
+            setTimeout(() => {
+              gateway.onSessionEvent(agent, {
+                type: 'assistant/message',
+                data: { message: { content: [{ type: 'text', text: preset + '-result' }] } },
+              })
+              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+            }, 0)
+          },
+        }
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      access: { userIds: ['ou_user'] },
+      profiles: {
+        researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
+        writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+    })
+    const sent = []
+    const transport = {
+      platform: 'feishu',
+      async start() {},
+      async stop() {},
+      async send(destination, text) { sent.push({ destination, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+
+    const deadline = Date.now() + 5_000
+    let detail
+    while (Date.now() < deadline) {
+      detail = await gateway.fleetTaskDetail(launch.rootTaskId, 'local-dashboard')
+      if (detail?.task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(detail?.task.status, 'completed')
+    assert.ok(detail?.task.result?.includes('research: researcher-result'))
+    assert.ok(detail?.task.result?.includes('write: writer-result'))
+    assert.ok(sent.some(item => item.text.includes('Workflow Research then write 完成')))
+    const status = await gateway.fleetStatus()
+    assert.equal(status.fleet.mailbox.completed, 2)
+  } finally {
+    if (gateway) await gateway.stop()
+    if (first) await first.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
