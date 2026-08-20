@@ -15,6 +15,8 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - `/new`、`/reset`、`/stop`、`/status`、`/help`、`/bots`、`/bot`、`/model`；
 - Bot Fleet：可编辑 roster、能力/SOUL/模型/角色、每 Bot ACL，以及默认按使用者隔离的稳定会话；
 - 结构化 Mailbox、Task/Run/Handoff/Audit、租约续期、fencing、真实退避重试、重启恢复和 dead-letter；
+- Peer Messaging v1：带地址、schemaVersion、correlation/reply/trace、TTL、显式幂等键、大小上限和有界 hop 的结构化 Bot 消息；
+- 直接 Bot 输出中的已授权 @bot 会被转换为新的有界 Peer Task/Run；ACL、审批、visitedBots 和 maxHops 会阻止越权与循环。
 - `@bot` 路由、2–6 Bot 顺序 Group Room，以及 `/fleet` 并行“执行 → 验证 → 汇总”工作流；
 - `/tasks`、`/task`、`/cancel`、`/replay`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
 - 仅在内部 Bot Session 注册的结构化 Handoff Tool，Gateway 推导任务身份并支持审批后恢复；

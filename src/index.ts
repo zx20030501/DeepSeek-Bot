@@ -96,6 +96,17 @@ export {
   parseBotMentions,
 } from './collaboration.js'
 export { PairingStore } from './pairing.js'
+export {
+  PEER_MESSAGE_SCHEMA_VERSION,
+  PeerMessageValidationError,
+  createPeerEnvelope,
+  forwardPeerMessage,
+  isPeerMessage,
+  normalizePeerPolicy,
+  peerMessageIdempotencyKey,
+  validatePeerPayload,
+} from './peer-messaging.js'
+export type { PeerMessageInput, PeerMessagePolicy } from './peer-messaging.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
 export { FeishuTransport, toFeishuInbound } from './feishu.js'

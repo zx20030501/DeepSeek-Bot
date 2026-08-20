@@ -418,10 +418,11 @@ test('Bot model failure creates a fresh Run and really retries after backoff', a
     gateway.transports = [transport]
     gateway.transportByPlatform.set('feishu', transport)
     await gateway.start()
-    await inbound({
-      id: 'message_retry_1',
-      target: { platform: 'feishu', chatId: 'oc_dm', chatType: 'dm', userId: 'ou_user' },
-      text: '@researcher retry this', receivedAt: Date.now(),
+    await gateway.sendBotMessage({
+      from: 'user:ou_user',
+      to: 'researcher',
+      instruction: 'retry this',
+      replyTarget: { platform: 'feishu', chatId: 'oc_dm', chatType: 'dm', userId: 'ou_user' },
     })
     const deadline = Date.now() + 5_000
     let fleet
@@ -435,6 +436,10 @@ test('Bot model failure creates a fresh Run and really retries after backoff', a
     assert.deepEqual(fleet.runs.map(run => run.status).sort(), ['completed', 'failed'])
     assert.equal(fleet.mailbox.failed, 1)
     assert.equal(fleet.mailbox.completed, 1)
+    const completedDelivery = (await gateway.mailbox.snapshot()).find(item => item.state === 'completed')
+    assert.equal(completedDelivery?.envelope.schemaVersion, 1)
+    assert.equal(completedDelivery?.envelope.fromAddress?.type, 'user')
+    assert.equal(completedDelivery?.envelope.traceId, completedDelivery?.envelope.correlationId)
     assert.ok(sent.some(text => text.includes('retry-success')))
   } finally {
     if (gateway) await gateway.stop()

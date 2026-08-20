@@ -6,6 +6,7 @@ import type {
   AuditRecord,
   BotCollaborationConfig,
   BotDescriptor,
+  BotAddress,
   BotMessageEnvelope,
   BotMessageKind,
   BotProfile,
@@ -148,6 +149,19 @@ export class BotDirectory {
           ? `chat:${context.target.platform}:${context.target.chatId}:${context.target.threadId ?? ''}`
           : `requester:${context.requester}`
     return String(stableSessionId(`bot:${bot.id}:${suffix}`, bot.profile, 0))
+  }
+
+  /** Accept only a session derived for this request or the Bot's canonical session. */
+  public sessionIdForAddress(
+    id: string,
+    requestedSessionId: string,
+    context: { readonly requester: string; readonly target: BotTarget; readonly taskId: string },
+  ): string | undefined {
+    const bot = this.entries.get(id.toLowerCase())
+    if (!bot || !bot.enabled) return undefined
+    const derived = this.sessionIdFor(id, context)
+    if (requestedSessionId === bot.canonicalSessionId || requestedSessionId === derived) return requestedSessionId
+    return undefined
   }
 
   private clone(entry: BotDescriptor): BotDescriptor {
@@ -308,6 +322,15 @@ export class BotMailbox {
     this.idempotency.set(idempotencyKey, item.id)
     await this.journal.append({ kind: 'enqueued', item })
     return { ...item, envelope: { ...item.envelope, payload: { ...item.envelope.payload } } }
+  }
+
+  /** Look up an existing delivery before creating another Task/Run. */
+  public async getByIdempotencyKey(idempotencyKey: string): Promise<MailboxItem | undefined> {
+    await this.load()
+    const id = this.idempotency.get(idempotencyKey)
+    if (id === undefined) return undefined
+    const item = this.items.get(id)
+    return item && { ...item, envelope: { ...item.envelope, payload: { ...item.envelope.payload } } }
   }
 
   public async claim(
@@ -1497,10 +1520,20 @@ export function createEnvelope(input: {
   readonly runId: string
   readonly attemptId: string
   readonly correlationId: string
+  readonly schemaVersion?: 1
+  readonly fromAddress?: BotAddress
+  readonly toAddress?: BotAddress
+  readonly conversationId?: string
+  readonly replyTo?: string
+  readonly traceId?: string
+  readonly hop?: number
+  readonly maxHops?: number
   readonly roomId?: string
   readonly epoch?: number
-  readonly expiresAt?: number
+  readonly idempotencyKey?: string
   readonly payload: Record<string, unknown>
+  readonly createdAt?: number
+  readonly expiresAt?: number
 }): BotMessageEnvelope {
   return {
     id: 'msg_' + randomUUID(),
@@ -1511,10 +1544,19 @@ export function createEnvelope(input: {
     runId: input.runId,
     attemptId: input.attemptId,
     correlationId: input.correlationId,
+    ...(input.schemaVersion === undefined ? {} : { schemaVersion: input.schemaVersion }),
+    ...(input.fromAddress === undefined ? {} : { fromAddress: { ...input.fromAddress } }),
+    ...(input.toAddress === undefined ? {} : { toAddress: { ...input.toAddress } }),
+    ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
+    ...(input.traceId === undefined ? {} : { traceId: input.traceId }),
+    ...(input.hop === undefined ? {} : { hop: input.hop }),
+    ...(input.maxHops === undefined ? {} : { maxHops: input.maxHops }),
     ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
     ...(input.epoch === undefined ? {} : { epoch: input.epoch }),
+    ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
     payload: { ...input.payload },
-    createdAt: now(),
+    createdAt: input.createdAt ?? now(),
     ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
   }
 }
