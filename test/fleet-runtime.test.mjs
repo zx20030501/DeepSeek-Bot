@@ -150,3 +150,36 @@ test('Gateway rechecks ACL before Manager dispatch and persists Workflow definit
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('Manager approval gates dispatch and resumes through the durable approval path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-manager-approval-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'auto-planned', managerBotId: 'manager' },
+    })
+    const result = await gateway.planManagerTask({
+      requester: 'user:feishu:ou_user',
+      replyTarget: target,
+      instruction: 'research a high-risk topic',
+      requiredCapabilities: ['research'],
+      risk: 'high',
+      maxAssignments: 1,
+    })
+    assert.equal(result.plan.policyDecision, 'approval-required')
+    assert.equal(result.dispatched.length, 0)
+    assert.ok(result.approvalCode)
+    assert.equal((await gateway.fleetStatus()).fleet.mailbox.queued, 0)
+    assert.equal((await gateway.resolveApproval(result.approvalCode, 'approved'))?.status, 'approved')
+    assert.equal((await gateway.fleetStatus()).fleet.mailbox.queued, 1)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
