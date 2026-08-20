@@ -17,6 +17,8 @@ interface AgentRegistryLike {
   currentInitiator?(): Agent | undefined
 }
 
+type AgentSetupLike = (agentCtx: Context) => void | Promise<void>
+
 interface CommandRuntimeLike {
   execute(agent: Agent, line: string, signal: AbortSignal): Promise<{
     result: { kind: string; text?: string }
@@ -87,6 +89,7 @@ export function agentOptions(ctx: Context, profile: BotProfile, modelOverride?: 
 /** The only module that knows how Bot messages enter DeepSeek Harness. */
 export class HarnessBridge {
   private readonly agents: AgentRegistryLike
+  private readonly configuredAgents = new WeakSet<object>()
 
   public constructor(private readonly ctx: Context) {
     const agents = service<AgentRegistryLike>(ctx, 'agents')
@@ -98,15 +101,25 @@ export class HarnessBridge {
     return this.agents.get(sessionId)
   }
 
-  public async resumeOrCreate(sessionId: SessionId, profile: BotProfile, modelOverride?: ModelOverride | string): Promise<Agent> {
+  public async resumeOrCreate(
+    sessionId: SessionId,
+    profile: BotProfile,
+    modelOverride?: ModelOverride | string,
+    setup?: AgentSetupLike,
+  ): Promise<Agent> {
     const live = this.agents.get(sessionId)
-    if (live) return live
+    if (live) {
+      await this.configureAgent(live, setup)
+      return live
+    }
     const options = agentOptions(this.ctx, profile, modelOverride)
     try {
       const resumed = await this.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: options,
+        ...(setup === undefined ? {} : { setup }),
       })
+      if (setup !== undefined) this.configuredAgents.add(resumed.agent as object)
       return resumed.agent
     } catch (resumeError: unknown) {
       try {
@@ -114,12 +127,22 @@ export class HarnessBridge {
           sessionId,
           agentOptions: options,
           meta: { agentPreset: profile.name, cwd: process.cwd() },
+          ...(setup === undefined ? {} : { setup }),
         })
+        if (setup !== undefined) this.configuredAgents.add(created.agent as object)
         return created.agent
       } catch (createError: unknown) {
         throw new Error(`could not resume or create DSH session: ${String(createError)} (resume: ${String(resumeError)})`)
       }
     }
+  }
+
+  private async configureAgent(agent: Agent, setup?: AgentSetupLike): Promise<void> {
+    if (setup === undefined || this.configuredAgents.has(agent as object)) return
+    const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
+    if (agentContext === undefined) return
+    await setup(agentContext)
+    this.configuredAgents.add(agent as object)
   }
 
   public async followup(agent: Agent, text: string): Promise<void> {
