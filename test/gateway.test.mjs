@@ -418,10 +418,11 @@ test('Bot model failure creates a fresh Run and really retries after backoff', a
     gateway.transports = [transport]
     gateway.transportByPlatform.set('feishu', transport)
     await gateway.start()
-    await inbound({
-      id: 'message_retry_1',
-      target: { platform: 'feishu', chatId: 'oc_dm', chatType: 'dm', userId: 'ou_user' },
-      text: '@researcher retry this', receivedAt: Date.now(),
+    await gateway.sendBotMessage({
+      from: 'user:ou_user',
+      to: 'researcher',
+      instruction: 'retry this',
+      replyTarget: { platform: 'feishu', chatId: 'oc_dm', chatType: 'dm', userId: 'ou_user' },
     })
     const deadline = Date.now() + 5_000
     let fleet
