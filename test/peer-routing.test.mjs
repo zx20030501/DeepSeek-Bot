@@ -82,8 +82,12 @@ test('direct Bot output can route a bounded authorized @bot Peer Message', async
     })
     gateway.onSessionEvent(target, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
 
-    await waitUntil(() => sent.some(item => item.text.includes('@target')))
+    await waitUntil(async () => {
+      const status = await gateway.fleetStatus()
+      return status.fleet.tasks.some(task => task.assignedTo === 'target' && task.status === 'completed')
+    })
     const status = await gateway.fleetStatus()
+    assert.ok(sent.some(item => item.text.includes('@target：')))
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'target').length, 1)
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'source').length, 1)
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'target')[0]?.status, 'completed')
