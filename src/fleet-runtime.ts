@@ -28,7 +28,6 @@ export interface ManagerGatewayRequest {
   readonly maxAssignments?: number
   readonly managerBotId?: string
   readonly traceId?: string
-  readonly approved?: boolean
 }
 
 export interface ManagerRuntimeResult {

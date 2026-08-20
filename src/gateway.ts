@@ -527,7 +527,13 @@ export class BotGateway {
     const descriptors = managerDescriptorsFromRoster(
       this.directory.list(),
       input.replyTarget,
-      (botId, target) => this.directory.canInvoke(botId, target),
+      (botId, target) => {
+        const bot = this.directory.get(botId)
+        return bot !== undefined
+          && !bot.approvalRequired
+          && this.config.collaboration?.approvalMode !== 'always'
+          && this.directory.canInvoke(botId, target)
+      },
       this.activeBotRuns,
     )
     const plan = generateManagerPlan({
@@ -551,7 +557,7 @@ export class BotGateway {
       await this.tasks.failTask(task.id, plan.reasons.join('; '), 'botfleet')
       return { taskId: task.id, traceId, plan, dispatched: [] }
     }
-    if (plan.approval.required && input.approved !== true) {
+    if (plan.approval.required) {
       const approval = await this.approvals.create({
         kind: 'bot-invocation',
         requestedBy: requester,
@@ -568,7 +574,7 @@ export class BotGateway {
       return { taskId: task.id, traceId, plan, dispatched: [], approvalCode: approval.code }
     }
     try {
-      const dispatched = await this.dispatchManagerPlan(plan, requester, input.replyTarget, input.approved === true)
+      const dispatched = await this.dispatchManagerPlan(plan, requester, input.replyTarget, false)
       return { taskId: task.id, traceId, plan, dispatched }
     } catch (error: unknown) {
       await this.tasks.failTask(task.id, error, 'botfleet')
@@ -698,7 +704,11 @@ export class BotGateway {
     const dispatched: BotMessageEnvelope[] = []
     for (const nodeId of plan.entryTaskIds) {
       const node = plan.nodes.find(item => item.nodeId === nodeId)
-      if (!node || node.kind !== 'task') throw new Error('Workflow entry node is not a dispatchable task: ' + nodeId)
+      const definitionNode = definition.nodes.find(item => item.id === nodeId)
+      if (!node || !definitionNode || node.kind !== 'task') throw new Error('Workflow entry node is not a dispatchable task: ' + nodeId)
+      if (definitionNode.effect !== undefined && definitionNode.effect.kind !== 'none') {
+        throw new Error('Workflow external effects require an approved runtime adapter: ' + nodeId)
+      }
       const candidates = this.directory.list()
         .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
         .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
@@ -2025,6 +2035,42 @@ export class BotGateway {
         } catch (error: unknown) {
           await this.failFleetWorkflow(running, error)
         }
+      }
+      return
+    }
+    if (approval.kind === 'bot-invocation') {
+      const snapshot = await this.tasks.snapshot()
+      const planAudit = [...snapshot.audits]
+        .reverse()
+        .find(audit => audit.entityType === 'task' && audit.entityId === approval.entityId && audit.action === 'manager.plan_created')
+      const data = planAudit?.data
+      const rawPlan = data?.plan
+      const rawRequester = data?.requester
+      const rawTarget = data?.replyTarget
+      const targetRecord = rawTarget !== null && typeof rawTarget === 'object' && !Array.isArray(rawTarget)
+        ? rawTarget as Record<string, unknown>
+        : undefined
+      const replyTarget = targetRecord !== undefined
+        && typeof targetRecord.platform === 'string'
+        && typeof targetRecord.chatId === 'string'
+        ? targetRecord as unknown as BotTarget
+        : undefined
+      if (typeof rawRequester !== 'string' || rawPlan === undefined || replyTarget === undefined) {
+        await this.tasks.failTask(approval.entityId, 'Manager approval record is incomplete', 'botfleet')
+        return
+      }
+      if (approval.status === 'rejected' || approval.status === 'expired') {
+        await this.tasks.failTask(
+          approval.entityId,
+          approval.status === 'expired' ? 'Manager approval expired' : 'Manager plan was rejected',
+          resolutionActor,
+        )
+        return
+      }
+      try {
+        await this.dispatchManagerPlan(rawPlan as ManagerPlan, rawRequester, replyTarget, true)
+      } catch (error: unknown) {
+        await this.tasks.failTask(approval.entityId, error, 'botfleet')
       }
       return
     }
