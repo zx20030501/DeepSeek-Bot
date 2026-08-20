@@ -273,6 +273,10 @@ test('compiled Workflow resumes its durable DAG after restart and completes the 
     assert.equal(detail?.task.status, 'completed')
     assert.ok(detail?.task.result?.includes('research: researcher-result'))
     assert.ok(detail?.task.result?.includes('write: writer-result'))
+    const sendDeadline = Date.now() + 1_000
+    while (!sent.some(item => item.text.includes('Workflow Research then write 完成')) && Date.now() < sendDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
     assert.ok(sent.some(item => item.text.includes('Workflow Research then write 完成')))
     const status = await gateway.fleetStatus()
     assert.equal(status.fleet.mailbox.completed, 2)

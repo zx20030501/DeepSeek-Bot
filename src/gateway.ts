@@ -716,7 +716,7 @@ export class BotGateway {
     if (!rootTask) {
       rootTask = await this.tasks.createTask({
         title: 'Workflow: ' + definition.name,
-        instruction: definition.description,
+        instruction: definition.description ?? definition.name,
         createdBy: requester,
         assignedTo: 'workflow',
         workflowDefinitionId: definition.id,
