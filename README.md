@@ -18,6 +18,8 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - `@bot` 路由、2–6 Bot 顺序 Group Room，以及 `/fleet` 并行“执行 → 验证 → 汇总”工作流；
 - `/tasks`、`/task`、`/cancel`、`/replay`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
 - 仅在内部 Bot Session 注册的结构化 Handoff Tool，Gateway 推导任务身份并支持审批后恢复；
+- 可选的动态 Bot Registry：在对话中创建/修改私人 Bot 草稿，经 8 位确认码或本机控制台批准后才进入 roster；
+- `/bot create`、`/bot confirm`、`/bot list`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable` 和两步删除；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
@@ -118,9 +120,10 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 npm run check
 npm test
 npm run pack:check
+npm run pack:smoke
 ```
 
-测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批崩溃恢复、模型 Handoff、Task 详情/取消/重放、并行状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。
+测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口、DSH Settings/Credentials Provider 基类事务集成，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批崩溃恢复、模型 Handoff、Task 详情/取消/重放、并行状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。`pack:smoke` 还会在系统临时目录安装刚生成的 tarball，并验证主入口和客户端入口可导入；它可能使用 npm 网络或本机缓存解析 peer dependencies。
 
 ## 当前边界
 

@@ -125,7 +125,7 @@ Fleet 使用两条彼此独立的持久化链：
 - Inbound WAL 保证平台消息接收后可恢复；
 - Typed Mailbox 保证 Bot 任务租约、重试和结果提交可恢复。
 
-每次 Mailbox claim 都有 lease ID 和递增 fencing token。长模型回合会续租；租约过期以后，旧 worker 即使迟到也不能提交结果。单机进程重启会立即回收上一 worker ID 的租约；其他延迟任务再按最早的 `nextAttemptAt`、`leaseExpiresAt` 或消息 TTL 精确唤醒，不依赖固定轮询。
+每次 Mailbox claim 都有 lease ID 和递增 fencing token。长模型回合会续租；租约过期以后，旧 worker 即使迟到也不能提交结果。每次内部 Agent dispatch 还会绑定具体 DSH turn 和事件序号下界；同一 session 重启复用时，旧 turn 的文本、正常结束或取消结束只记为 stale audit，不能完成新 lease。插件正常停止时会先等待 Agent 进入 idle，再加栅栏并交还本 worker 的活动租约、清理内存中的 Run 占用；所以同一 Gateway 重新启动也能立即重新领取，而不会等自己的旧租约超时。单机进程异常重启则立即回收上一 worker ID 的租约；其他延迟任务再按最早的 `nextAttemptAt`、`leaseExpiresAt` 或消息 TTL 精确唤醒，不依赖固定轮询。
 
 模型调用失败时，旧 Run 终止并创建一个新的 Run/attempt；这与简单地把同一个失败 Run 放回队列不同，第二次会真正再次调用模型。超过上限后进入 dead-letter，并在 Fleet 控制台显示原因。
 
@@ -138,6 +138,9 @@ BotMesh 内部 Bot Session 还会获得受限 DSH Tool `bot_fleet_handoff`。模
 ## 状态与命令
 
 - `/bots`：可用 roster；
+- `/bot create <id> [名称]`：创建当前用户私有草稿；
+- `/bot confirm <code>`：确认并激活草稿；
+- `/bot list`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable`、`/bot delete`：管理动态 Bot；
 - `/fleet <任务>`：自动工作流；
 - `/tasks`：最近 Task；
 - `/task <id>`：按需查看自己 Task 的完整详情、Run、Handoff 和 Workflow；
@@ -147,21 +150,27 @@ BotMesh 内部 Bot Session 还会获得受限 DSH Tool `bot_fleet_handoff`。模
 - `/approve`、`/reject`：处理审批；
 - `/mesh`：Mailbox、Task、Run、Handoff、Workflow 和运行数量。
 
-本机控制台显示 Bot、活动 Run、Workflow、Task、审批和 dead-letter。Task 行可按需展开详情、取消或重放；取消前会二次确认。常规 2 秒状态刷新只携带短标题和状态，不携带完整指令、结果或模型输出；只有点击详情时才读取完整内容。重放会创建全新身份并重新检查当前 ACL；聊天发起的重放继续遵守审批策略，本机管理员的明确点击本身视为人工批准，不会复活旧 Run。本机控制台是受信管理员入口；聊天命令只允许原请求者操作自己的 Task。持久化文件位于：
+本机控制台显示 Bot、动态 Bot Registry、活动 Run、Workflow、Task、审批和 dead-letter。动态 Bot 草稿可一键确认激活，已激活 Bot 可停用、重新启用或删除。普通停用/删除不会强制取消工作：只要该 Bot 仍有未结束 Task、Mailbox、Workflow、Handoff、Room，或直接聊天 Agent 正在运行/排队，操作就会被拒绝；Fleet Task 应先等待或用 `/cancel <任务ID>`，直接聊天回合应在对应会话发送 `/stop`。动态 Bot 的直接会话索引会保存在 `state.json`，所以插件重载后仍能保护已切走但尚未结束的回合，即使当前未启用消息 Transport；如果 Agent 服务暂时不可用，系统会保守拒绝停用/删除，而不会把未知状态当作空闲。已解绑且不再忙的旧索引会在下一次相关生命周期检查时自动清理。插件停止会先关闭所有新的持久化变更入口并取消尚未触发的 Mailbox 心跳，再排空已进入的心跳和其他统一 mutation lease、生命周期/命名空间事务及各任务 lane；完成后旧实例不再写入 Registry、审批、Task、Mailbox、配对或设置。同一 Gateway 再次启动时会按当前配置重建 Transport。Task 行可按需展开详情、取消或重放；取消和删除前会二次确认。常规 2 秒状态刷新只携带短标题和状态，不携带完整指令、结果、SOUL 或模型输出；只有点击任务详情时才读取完整内容。重放会创建全新身份并重新检查当前 ACL；聊天发起的重放继续遵守审批策略，本机管理员的明确点击本身视为人工批准，不会复活旧 Run。本机控制台是受信管理员入口；聊天命令只允许原请求者操作自己的 Task 和动态 Bot。持久化文件位于：
 
 ```text
 ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── mailbox.jsonl
 ├── tasks.jsonl
 ├── rooms.json
-└── approvals.json
+├── approvals.json
+├── bot-registry.jsonl
+└── teams.jsonl
 ```
 
 这些文件包含任务或模型结果，只应保存在运行机。
 
 ## 当前真实边界
 
-已实现的是单机 Fleet v1：确定性 Planner、最多 6 个 Bot、固定的 execute/verify/synthesize Workflow、可靠 Mailbox、可恢复审批、公开 Handoff API、受限模型 Handoff Tool，以及带详情/取消/重放的本机控制台。
+已实现的是单机 Fleet v1 加 Fleet v2 Phase 1–2：确定性 Planner、最多 6 个运行 Bot、固定的 execute/verify/synthesize Workflow、可靠 Mailbox、可恢复审批、公开 Handoff API、受限模型 Handoff Tool，以及可在会话中创建/修改/确认的用户私有动态 Bot。
+
+普通 Hermes Agent 只会获得 `bot_create_draft` 和 `bot_update_draft`；owner、带平台的 ACL principal、scope 和 session identity 全部由 Gateway 推导。模型不能激活自己，用户必须发送 `/bot confirm <code>` 或在本机控制台明确批准。确认码只绑定当时的 definition version、revision 和内容指纹；草稿一经修改，旧码立即失效。跨会话 Peer Messaging、Manager Agent、Saved Workflow 和 Hermes/Grok 外部 Runtime Adapter 仍属于后续阶段。
+
+Fleet v2 第 1 阶段已经加入默认关闭的数据基础：版本化 Bot Registry、作用域、Team、Agent Thread、Artifact Reference 和独立功能开关。它目前不会替换静态 `profiles`，也不会让聊天自动获得创建 Bot、跨会话互发或 Manager 调度权限。
 
 尚未实现：
 

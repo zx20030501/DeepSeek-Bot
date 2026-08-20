@@ -5,10 +5,11 @@ import { installSetupRoute } from '../dist/setup-route.js'
 
 function createHarness(actions) {
   let handler
+  const directReplaceCalls = []
   const settings = {
     writable: true,
     get() { return {} },
-    async replace() {},
+    async replace(namespace, value) { directReplaceCalls.push([namespace, value]) },
   }
   const credentials = {
     async describe() { return { configured: true, writable: true, source: 'test' } },
@@ -30,11 +31,14 @@ function createHarness(actions) {
     collaboration: {
       enabled: true, autoPlanner: true, approvalMode: 'auto-planned', defaultSessionScope: 'requester',
       maxGroupBots: 6, maxGroupRounds: 3, maxGroupMessages: 10, maxParallelRuns: 6, botRunMaxAttempts: 3,
+      features: { dynamicRegistry: true, chatBotCreation: true },
     },
     profiles: [],
   })
   installSetupRoute(ctx, source, () => ({ fleet: { tasks: [] } }), actions)
   return {
+    settings: source(),
+    directReplaceCalls,
     async post(body, remoteAddress = '127.0.0.1') {
       const raw = JSON.stringify(body)
       const req = Readable.from([Buffer.from(raw)])
@@ -104,4 +108,85 @@ test('remote callers cannot invoke Fleet task controls', async () => {
   const response = await harness.post({ action: 'fleet_task_cancel', taskId: 'task_old' }, '10.0.0.2')
   assert.equal(response.status, 403)
   assert.equal(called, false)
+})
+
+test('trusted setup route manages dynamic Bot lifecycle while remote callers remain blocked', async () => {
+  const calls = []
+  const harness = createHarness({
+    async setDynamicBotStatus(botId, status) {
+      calls.push([botId, status])
+      return {
+        definition: {
+          id: botId, handle: 'analyst', scope: 'user', ownerId: 'user:feishu:ou_test', source: 'chat',
+          status, version: 2, currentRevision: 1, createdAt: 1, updatedAt: 2,
+        },
+        revision: {
+          id: 'revision-1', botId, revision: 1, title: 'Analyst', capabilities: [], skills: [],
+          fleetRole: 'worker', sessionScope: 'requester', allowedUserIds: ['ou_test'], allowedChatIds: [],
+          approvalRequired: false, createdBy: 'user:feishu:ou_test', createdAt: 1,
+        },
+      }
+    },
+  })
+  const disabled = await harness.post({ action: 'bot_registry_status', botId: 'bot-1', status: 'disabled' })
+  assert.equal(disabled.status, 200)
+  assert.match(disabled.json.message, /已停用 @analyst/u)
+  const blocked = await harness.post({ action: 'bot_registry_status', botId: 'bot-1', status: 'deleted' }, '10.0.0.2')
+  assert.equal(blocked.status, 403)
+  assert.deepEqual(calls, [['bot-1', 'disabled']])
+})
+
+test('setup save rejects a static Bot handle reserved by a dynamic definition or tombstone', async () => {
+  let validated
+  const harness = createHarness({
+    async validateStaticProfiles(handles) {
+      validated = handles
+      throw new Error('Bot ID @analyst 已被动态 Bot 或其删除墓碑永久占用')
+    },
+  })
+  const response = await harness.post({
+    action: 'save',
+    settings: { ...harness.settings, profiles: [{
+      id: 'analyst', title: 'Static Analyst', description: '', provider: '', model: '', maxTokens: 8192,
+      enabled: true, capabilities: [], skills: [], soul: '', fleetRole: 'generalist', sessionScope: 'requester',
+      allowedUserIds: [], allowedChatIds: [], approvalRequired: false,
+    }] },
+  })
+  assert.equal(response.status, 409)
+  assert.match(response.json.error, /墓碑|占用/u)
+  assert.deepEqual(validated, ['analyst'])
+})
+
+test('setup save waits for transactional runtime apply and does not fall back to direct persistence on failure', async () => {
+  let releaseApply
+  const applyReleased = new Promise(resolve => { releaseApply = resolve })
+  let applyReached
+  const reachedApply = new Promise(resolve => { applyReached = resolve })
+  let received
+  const harness = createHarness({
+    async saveAndApplySettings(settings, appSecret) {
+      received = { settings, appSecret }
+      applyReached()
+      await applyReleased
+      throw new Error(`controlled runtime apply failure containing ${appSecret}`)
+    },
+  })
+  const pendingResponse = harness.post({
+    action: 'save',
+    appSecret: 'new-secret-for-test',
+    settings: harness.settings,
+  })
+  await reachedApply
+  const stateBeforeRelease = await Promise.race([
+    pendingResponse.then(() => 'settled'),
+    Promise.resolve('pending'),
+  ])
+  assert.equal(stateBeforeRelease, 'pending')
+  assert.equal(received.appSecret, 'new-secret-for-test')
+  releaseApply()
+  const response = await pendingResponse
+  assert.equal(response.status, 409)
+  assert.match(response.json.error, /没有保留半完成配置/u)
+  assert.doesNotMatch(response.json.error, /new-secret-for-test|controlled runtime apply failure/u)
+  assert.deepEqual(harness.directReplaceCalls, [])
 })
