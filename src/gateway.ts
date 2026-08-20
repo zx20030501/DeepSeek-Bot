@@ -2363,6 +2363,9 @@ export class BotGateway {
           currentRun?.workflowId === undefined,
         )
         if (failedRun?.workflowId !== undefined) void this.queueWorkflowContinuation(failedRun.workflowId)
+        if (typeof item.envelope.payload.workflowDefinitionId === 'string') {
+          await this.failCompiledWorkflowEnvelope(item.envelope, item.lastError ?? 'mailbox delivery expired')
+        }
         if (item.envelope.roomId !== undefined) await this.rooms.close(item.envelope.roomId)
         if (failedRun) {
           await this.tasks.audit('message', item.id, 'botfleet', 'message.dead_lettered', {
@@ -2465,6 +2468,9 @@ export class BotGateway {
     const run = await this.tasks.run(envelope.runId)
     await this.tasks.failRun(envelope.runId, error, run?.workflowId === undefined)
     if (run?.workflowId !== undefined) void this.queueWorkflowContinuation(run.workflowId)
+    if (typeof envelope.payload.workflowDefinitionId === 'string') {
+      await this.failCompiledWorkflowEnvelope(envelope, error)
+    }
     if (envelope.roomId !== undefined) await this.rooms.close(envelope.roomId)
     const handoffId = typeof envelope.payload.handoffId === 'string' ? envelope.payload.handoffId : undefined
     if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', 'botfleet')
@@ -3012,7 +3018,11 @@ export class BotGateway {
   }
 
   private async failCompiledWorkflow(internal: InternalRun, error: unknown): Promise<void> {
-    const payload = internal.envelope.payload
+    await this.failCompiledWorkflowEnvelope(internal.envelope, error)
+  }
+
+  private async failCompiledWorkflowEnvelope(envelope: BotMessageEnvelope, error: unknown): Promise<void> {
+    const payload = envelope.payload
     const definitionId = typeof payload.workflowDefinitionId === 'string' ? payload.workflowDefinitionId : undefined
     const workflowRunId = typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined
     const rootTaskId = typeof payload.workflowRootTaskId === 'string' ? payload.workflowRootTaskId : undefined
@@ -3024,8 +3034,8 @@ export class BotGateway {
       workflowRunId,
       rootTaskId,
       workflowName: definition?.name ?? definitionId,
-      replyTarget: root?.workflowReplyTarget ?? this.replyTarget(internal.envelope),
-      correlationId: root?.workflowTraceId ?? internal.envelope.correlationId,
+      replyTarget: root?.workflowReplyTarget ?? this.replyTarget(envelope),
+      correlationId: root?.workflowTraceId ?? envelope.correlationId,
     }, error)
   }
 
