@@ -515,7 +515,11 @@ export class BotGateway {
     const requester = input.requester.trim()
     const instruction = input.instruction.trim()
     if (requester.length === 0 || instruction.length === 0) throw new Error('Manager requester and instruction are required')
-    const managerBotId = (input.managerBotId ?? this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+    const configuredManagerBotId = (this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+    if (input.managerBotId !== undefined && input.managerBotId.trim().toLowerCase() !== configuredManagerBotId) {
+      throw new Error('Manager identity is controlled by Gateway configuration')
+    }
+    const managerBotId = configuredManagerBotId
     const traceId = input.traceId?.trim() || 'trace_' + randomUUID()
     const task = await this.tasks.createTask({
       title: 'Manager: ' + instruction,
