@@ -2892,7 +2892,7 @@ export class BotGateway {
         workflowRunId,
         rootTaskId,
         workflowName: definition?.name ?? definitionId,
-        replyTarget,
+        ...(replyTarget === undefined ? {} : { replyTarget }),
         correlationId: root.workflowTraceId ?? internal.envelope.correlationId,
       }, definition ? 'Workflow root is missing its reply target' : 'Workflow definition is no longer available')
       return
@@ -3029,12 +3029,13 @@ export class BotGateway {
     if (!definitionId || !workflowRunId || !rootTaskId) return
     const root = await this.tasks.task(rootTaskId)
     const definition = root === undefined ? undefined : await this.getWorkflowDefinition(definitionId, root.createdBy)
+    const replyTarget = root?.workflowReplyTarget ?? this.replyTarget(envelope)
     await this.failCompiledWorkflowState({
       definitionId,
       workflowRunId,
       rootTaskId,
       workflowName: definition?.name ?? definitionId,
-      replyTarget: root?.workflowReplyTarget ?? this.replyTarget(envelope),
+      ...(replyTarget === undefined ? {} : { replyTarget }),
       correlationId: root?.workflowTraceId ?? envelope.correlationId,
     }, error)
   }
