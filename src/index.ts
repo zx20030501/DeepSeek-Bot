@@ -107,6 +107,35 @@ export {
   validatePeerPayload,
 } from './peer-messaging.js'
 export type { PeerMessageInput, PeerMessagePolicy } from './peer-messaging.js'
+export {
+  compileManagerDispatches,
+  compileWorkflowLaunch,
+  managerDescriptorsFromRoster,
+  workflowDispatchKey,
+  FleetRuntimeCompileError,
+} from './fleet-runtime.js'
+export type {
+  ManagerGatewayRequest,
+  ManagerRuntimeResult,
+  ManagerDispatchSpec,
+  WorkflowLaunchPlan,
+  WorkflowNodeDispatchSpec,
+} from './fleet-runtime.js'
+export {
+  generateManagerPlan,
+  generateReplanSuggestion,
+  managerPolicySummary,
+} from './manager-policy.js'
+export { parseFleetMentions, parseMentions } from './mention-parser.js'
+export {
+  assertValidWorkflow,
+  assertValidWorkflowDraft,
+  migrateWorkflowManifest,
+  validateWorkflow,
+  validateWorkflowDraft,
+} from './workflow-schema.js'
+export { WorkflowStore } from './workflow-store.js'
+export type * from './fleet-v2-types.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
 export { FeishuTransport, toFeishuInbound } from './feishu.js'
