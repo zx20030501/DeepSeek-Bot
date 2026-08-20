@@ -57,6 +57,7 @@ import type {
   FleetWorkflowRecord,
   HandoffRecord,
   HandoffRequestInput,
+  ReplyToBotMessageInput,
   RunRecord,
   SendBotMessageInput,
   TaskRecord,
@@ -485,6 +486,42 @@ export class BotGateway {
   }
 
   /** Public typed Bot-to-Bot seam retained from the collaboration-core prototype. */
+  /** Compatibility alias for integrations that use the BotMesh terminology. */
+  public async sendToBot(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
+    return this.sendBotMessage(input)
+  }
+
+  /** Request a new peer Task while forcing the request message kind. */
+  public async requestBot(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
+    return this.sendBotMessage({ ...input, kind: 'request' })
+  }
+
+  /** Reply to an existing Peer Message without losing its trace or conversation. */
+  public async replyToMessage(input: ReplyToBotMessageInput): Promise<BotMessageEnvelope> {
+    const targetBot = input.to ?? input.message.from
+    const target = this.directory.get(targetBot)
+    if (!target) throw new Error('reply target is not an available Bot: ' + targetBot)
+    return this.sendBotMessage({
+      from: input.from,
+      to: target.id,
+      instruction: input.instruction,
+      replyTarget: input.replyTarget,
+      kind: 'reply',
+      ...(input.title === undefined ? {} : { title: input.title }),
+      ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
+      ...(input.fromAddress === undefined ? {} : { fromAddress: input.fromAddress }),
+      ...(input.toAddress === undefined ? {} : { toAddress: input.toAddress }),
+      ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
+      ...(input.toSessionId === undefined ? {} : { toSessionId: input.toSessionId }),
+      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      ...(input.payload === undefined ? {} : { payload: input.payload }),
+      correlationId: input.message.correlationId,
+      ...(input.message.conversationId === undefined ? {} : { conversationId: input.message.conversationId }),
+      replyTo: input.message.id,
+      traceId: input.message.traceId ?? input.message.correlationId,
+    })
+  }
+
   /** Public typed Bot-to-Bot seam backed by Task/Run and the durable Mailbox. */
   public async sendBotMessage(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')

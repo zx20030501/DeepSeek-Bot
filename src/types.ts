@@ -508,6 +508,22 @@ export interface SendBotMessageInput {
   readonly expiresAt?: number
 }
 
+export interface ReplyToBotMessageInput {
+  readonly message: BotMessageEnvelope
+  readonly from: string
+  readonly to?: string
+  readonly instruction: string
+  readonly replyTarget: BotTarget
+  readonly title?: string
+  readonly acceptanceCriteria?: readonly string[]
+  readonly fromAddress?: BotAddress
+  readonly toAddress?: BotAddress
+  readonly fromSessionId?: string
+  readonly toSessionId?: string
+  readonly idempotencyKey?: string
+  readonly payload?: Readonly<Record<string, unknown>>
+}
+
 export interface HandoffRequestInput {
   readonly taskId: string
   readonly runId: string
