@@ -168,6 +168,12 @@ export interface BotCollaborationConfig {
   readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
   readonly approvalTtlMs?: number
   readonly autoPlanner?: boolean
+  /** Default lifetime for internal Peer Messages. */
+  readonly peerMessageTtlMs?: number
+  /** Maximum forwarding depth for Bot-to-Bot messages. */
+  readonly peerMaxHops?: number
+  /** Maximum UTF-8 JSON payload size for one Peer Message. */
+  readonly peerMaxPayloadBytes?: number
 }
 
 export interface BotDescriptor {
@@ -258,20 +264,46 @@ export interface PairingApproval {
   readonly approvedAt: number
 }
 
-export type BotMessageKind = 'request' | 'response' | 'handoff' | 'event'
+export type BotAddressType = 'user' | 'bot' | 'system' | 'service'
+
+/** Stable logical address used by the typed BotMesh protocol. */
+export interface BotAddress {
+  readonly id: string
+  readonly type?: BotAddressType
+  readonly sessionId?: string
+  readonly roomId?: string
+  readonly threadId?: string
+}
+
+export type PeerMessageKind = 'request' | 'reply' | 'report' | 'event' | 'cancel'
+export type BotMessageKind = PeerMessageKind | 'response' | 'handoff'
 
 export interface BotMessageEnvelope {
   readonly id: string
   readonly kind: BotMessageKind
+  /** Legacy actor IDs remain the durable compatibility fields. */
   readonly from: string
   readonly to: string
   readonly taskId: string
   readonly runId: string
   readonly attemptId: string
   readonly correlationId: string
+  readonly schemaVersion?: 1
+  readonly fromAddress?: BotAddress
+  readonly toAddress?: BotAddress
+  readonly conversationId?: string
+  /** Message ID being answered or superseded. */
+  readonly replyTo?: string
+  /** Trace identity shared by forwarded messages. */
+  readonly traceId?: string
+  /** Forwarding depth; new messages start at zero. */
+  readonly hop?: number
+  readonly maxHops?: number
   readonly roomId?: string
   /** Room generation used to reject results from a closed or superseded room. */
   readonly epoch?: number
+  /** Explicit key used by callers that need enqueue idempotency. */
+  readonly idempotencyKey?: string
   readonly payload: Record<string, unknown>
   readonly createdAt: number
   readonly expiresAt?: number
@@ -458,7 +490,21 @@ export interface SendBotMessageInput {
   readonly replyTarget: BotTarget
   readonly title?: string
   readonly acceptanceCriteria?: readonly string[]
+  readonly kind?: BotMessageKind
+  readonly fromAddress?: BotAddress
+  readonly toAddress?: BotAddress
+  readonly fromSessionId?: string
+  readonly toSessionId?: string
+  readonly conversationId?: string
+  readonly replyTo?: string
+  readonly traceId?: string
+  readonly hop?: number
+  readonly maxHops?: number
+  readonly idempotencyKey?: string
+  /** Optional structured context; credential-like fields are rejected at the protocol boundary. */
+  readonly payload?: Readonly<Record<string, unknown>>
   readonly correlationId?: string
+  readonly ttlMs?: number
   readonly expiresAt?: number
 }
 

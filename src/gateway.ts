@@ -18,6 +18,7 @@ import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool.js'
+import { createPeerEnvelope, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
 import {
   BotDirectory,
   BotMailbox,
@@ -30,6 +31,7 @@ import {
   type MailboxLease,
 } from './collaboration.js'
 import type {
+  BotAddress,
   BotMessageEnvelope,
   BotDescriptor,
   BotCollaborationConfig,
@@ -214,6 +216,9 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
         : 'auto-planned',
       approvalTtlMs: typeof collaboration.approvalTtlMs === 'number' ? collaboration.approvalTtlMs : 30 * 60_000,
       autoPlanner: collaboration.autoPlanner !== false,
+      peerMessageTtlMs: typeof collaboration.peerMessageTtlMs === 'number' ? collaboration.peerMessageTtlMs : 30 * 60_000,
+      peerMaxHops: typeof collaboration.peerMaxHops === 'number' ? collaboration.peerMaxHops : 4,
+      peerMaxPayloadBytes: typeof collaboration.peerMaxPayloadBytes === 'number' ? collaboration.peerMaxPayloadBytes : 64 * 1_024,
     },
   }
 }
@@ -480,13 +485,44 @@ export class BotGateway {
   }
 
   /** Public typed Bot-to-Bot seam retained from the collaboration-core prototype. */
+  /** Public typed Bot-to-Bot seam backed by Task/Run and the durable Mailbox. */
   public async sendBotMessage(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
     const bot = this.directory.get(input.to)
-    if (!bot || !this.directory.canInvoke(bot.id, input.replyTarget)) throw new Error(`Bot is unavailable or not authorized: ${input.to}`)
+    if (!bot || !this.directory.canInvoke(bot.id, input.replyTarget)) throw new Error('Bot is unavailable or not authorized: ' + input.to)
     if (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always') {
-      throw new Error(`Bot requires an approved Fleet workflow or handoff: ${input.to}`)
+      throw new Error('Bot requires an approved Fleet workflow or handoff: ' + input.to)
     }
+    if (input.idempotencyKey !== undefined) {
+      const existing = await this.mailbox.getByIdempotencyKey(input.idempotencyKey)
+      if (existing) return existing.envelope
+    }
+
+    const fromAddress: BotAddress = input.fromAddress ?? {
+      id: input.from,
+      type: input.from.startsWith('user:') ? 'user' : 'bot',
+      ...(input.fromSessionId === undefined ? {} : { sessionId: input.fromSessionId }),
+    }
+    if (fromAddress.id !== input.from) throw new Error('fromAddress.id must match from')
+    const toAddress: BotAddress = input.toAddress ?? {
+      id: bot.id,
+      type: 'bot',
+      ...(input.toSessionId === undefined ? {} : { sessionId: input.toSessionId }),
+    }
+    if (toAddress.id.toLowerCase() !== bot.id || (toAddress.type !== undefined && toAddress.type !== 'bot')) {
+      throw new Error('toAddress must identify the selected Bot')
+    }
+
+    const messagePayload: Record<string, unknown> = {
+      ...(input.payload ?? {}),
+      instruction: input.instruction,
+      acceptanceCriteria: input.acceptanceCriteria ?? [],
+      requester: input.from,
+      replyTarget: input.replyTarget,
+    }
+    const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
+    validatePeerPayload(messagePayload, peerPolicy.maxPayloadBytes)
+
     const task = await this.tasks.createTask({
       title: input.title ?? input.instruction,
       instruction: input.instruction,
@@ -495,24 +531,32 @@ export class BotGateway {
       ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
     })
     const run = await this.tasks.createRun(task.id, bot.id, 1)
-    const envelope = createEnvelope({
-      from: input.from,
-      to: bot.id,
+    const envelope = createPeerEnvelope({
+      kind: input.kind ?? 'request',
+      from: fromAddress,
+      to: toAddress,
       taskId: task.id,
       runId: run.id,
       attemptId: run.attemptId,
-      correlationId: input.correlationId ?? task.id,
+      ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
+      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+      ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
+      ...(input.traceId === undefined ? {} : { traceId: input.traceId }),
+      ...(input.hop === undefined ? {} : { hop: input.hop }),
+      ...(input.maxHops === undefined ? {} : { maxHops: input.maxHops }),
+      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      ...(input.ttlMs === undefined ? {} : { ttlMs: input.ttlMs }),
       ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-      payload: {
-        instruction: input.instruction,
-        acceptanceCriteria: input.acceptanceCriteria ?? [],
-        requester: input.from,
-        replyTarget: input.replyTarget,
-      },
-    })
-    await this.mailbox.enqueue(envelope, `task:${task.id}:run:${run.id}`)
-    await this.tasks.audit('message', envelope.id, input.from, 'message.queued', { taskId: task.id, to: bot.id }, envelope.correlationId)
-    void this.drainCollaboration().catch(error => this.log('warn', `Bot message dispatch failed: ${String(error)}`))
+      payload: messagePayload,
+    }, this.config.collaboration ?? {})
+    await this.mailbox.enqueue(envelope, peerMessageIdempotencyKey(envelope))
+    await this.tasks.audit('message', envelope.id, input.from, 'message.queued', {
+      taskId: task.id,
+      to: bot.id,
+      schemaVersion: envelope.schemaVersion ?? null,
+      hop: envelope.hop ?? 0,
+    }, envelope.correlationId)
+    void this.drainCollaboration().catch(error => this.log('warn', 'Bot message dispatch failed: ' + String(error)))
     return envelope
   }
 
@@ -1827,11 +1871,18 @@ export class BotGateway {
       const requester = typeof lease.item.envelope.payload.requester === 'string'
         ? lease.item.envelope.payload.requester
         : lease.item.envelope.from
-      const scopedSessionId = this.directory.sessionIdFor(bot.id, {
-        requester,
-        target: replyTarget,
-        taskId: task.id,
-      })
+      const requestedSessionId = lease.item.envelope.toAddress?.sessionId
+      const scopedSessionId = requestedSessionId === undefined
+        ? this.directory.sessionIdFor(bot.id, {
+          requester,
+          target: replyTarget,
+          taskId: task.id,
+        })
+        : this.directory.sessionIdForAddress(bot.id, requestedSessionId, {
+          requester,
+          target: replyTarget,
+          taskId: task.id,
+        })
       if (scopedSessionId === undefined) {
         const error = `could not resolve session for Bot: ${bot.id}`
         await this.mailbox.deadLetter(runningLease, error)
@@ -1964,6 +2015,13 @@ export class BotGateway {
     return [
       bot.soul ? `[SOUL]\n${bot.soul}` : '',
       '[BotMesh structured task]',
+      envelope.schemaVersion === undefined ? '' : '[BotMesh peer protocol v1]',
+      envelope.fromAddress === undefined ? '' : 'fromAddress: ' + JSON.stringify(envelope.fromAddress),
+      envelope.toAddress === undefined ? '' : 'toAddress: ' + JSON.stringify(envelope.toAddress),
+      envelope.conversationId === undefined ? '' : 'conversationId: ' + envelope.conversationId,
+      envelope.replyTo === undefined ? '' : 'replyTo: ' + envelope.replyTo,
+      envelope.traceId === undefined ? '' : 'traceId: ' + envelope.traceId,
+      envelope.hop === undefined ? '' : 'hop: ' + envelope.hop + '/' + (envelope.maxHops ?? envelope.hop),
       `botId: ${bot.id}`,
       `taskId: ${task.id}`,
       `runId: ${envelope.runId}`,
