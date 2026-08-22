@@ -168,6 +168,9 @@ test('chat-created Bot automatically joins the authorized Fleet and survives res
     const joined = joinedStatus.fleet.registryBots.find(bot => bot.handle === 'analyst')
     assert.equal(joined?.fleetMembership, 'joined')
     assert.equal(joined?.runtimeReady, true)
+    assert.match(joined?.membershipReason ?? '', /Fleet roster/u)
+    assert.equal(joined?.busy, false)
+    assert.equal(joined?.activeRuns, 0)
     assert.equal(gateway.directory.canInvoke('analyst', ownerTarget), true)
     assert.equal(gateway.directory.canInvoke('analyst', {
       platform: 'feishu', chatId: 'oc_other', chatType: 'dm', userId: 'ou_other',
