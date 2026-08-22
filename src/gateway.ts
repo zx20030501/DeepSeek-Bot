@@ -732,6 +732,32 @@ export class BotGateway {
         .filter(approval => approval.kind === 'bot-activation' && approval.status === 'pending')
         .map(approval => [approval.entityId, approval]),
     )
+    type BotRunActivity = {
+      activeRuns: number
+      lastFailure?: {
+        runId: string
+        taskId: string
+        error: string
+        at: number
+      }
+    }
+    const runActivityByBot = new Map<string, BotRunActivity>()
+    for (const run of taskSnapshot.runs) {
+      const activity = runActivityByBot.get(run.botId) ?? { activeRuns: 0 }
+      if (run.status === 'queued' || run.status === 'running') activity.activeRuns += 1
+      if (run.status === 'failed') {
+        const candidate = {
+          runId: run.id,
+          taskId: run.taskId,
+          error: run.error ?? 'Run failed',
+          at: run.updatedAt,
+        }
+        if (activity.lastFailure === undefined || candidate.at >= activity.lastFailure.at) {
+          activity.lastFailure = candidate
+        }
+      }
+      runActivityByBot.set(run.botId, activity)
+    }
     return {
       ...this.status(),
       fleet: {
@@ -748,6 +774,19 @@ export class BotGateway {
             && runtimeRef.definitionId === entry.definition.id
             && runtimeRef.revision === entry.definition.currentRevision
           const blockedReason = this.dynamicBlockedReasons.get(entry.definition.id)
+          const activity = runActivityByBot.get(entry.definition.handle) ?? { activeRuns: 0 }
+          const fleetMembership = runtimeReady
+            ? 'joined'
+            : entry.definition.status === 'active' ? 'blocked' : 'not-joined'
+          const membershipReason = runtimeReady
+            ? '已将当前 Revision 投影到所有者私有 Fleet roster'
+            : entry.definition.status === 'active'
+              ? blockedReason ?? '当前 Revision 未能安全投影到 Fleet runtime'
+              : entry.definition.status === 'draft'
+                ? '等待所有者确认'
+                : entry.definition.status === 'disabled'
+                  ? 'Bot 已停用'
+                  : '已删除并保留墓碑'
           return {
             id: entry.definition.id,
             handle: entry.definition.handle,
@@ -761,9 +800,11 @@ export class BotGateway {
             fleetRole: entry.revision.fleetRole,
             capabilities: [...entry.revision.capabilities],
             runtimeReady,
-            fleetMembership: runtimeReady
-              ? 'joined'
-              : entry.definition.status === 'active' ? 'blocked' : 'not-joined',
+            fleetMembership,
+            membershipReason,
+            busy: activity.activeRuns > 0,
+            activeRuns: activity.activeRuns,
+            ...(activity.lastFailure === undefined ? {} : { lastFailure: activity.lastFailure }),
             runtimeSource: runtimeRef?.source,
             ...(runtimeRef?.definitionId === undefined ? {} : { runtimeDefinitionId: runtimeRef.definitionId }),
             ...(runtimeRef?.revision === undefined ? {} : { runtimeRevision: runtimeRef.revision }),
@@ -4837,7 +4878,7 @@ export class BotGateway {
   ): Promise<boolean> {
     const parts = args.trim().split(/\s+/u)
     const action = (parts[0] ?? '').toLowerCase()
-    if (!new Set(['create', 'confirm', 'list', 'edit', 'disable', 'enable', 'delete', 'clone']).has(action)) return false
+    if (!new Set(['create', 'confirm', 'list', 'status', 'edit', 'disable', 'enable', 'delete', 'clone']).has(action)) return false
     if (!this.dynamicBotCreationEnabled()) {
       await this.completeWithText(message, walId, binding, '对话创建 Bot 尚未启用。请在本机设置页依次开启“动态 Bot 注册表”和“允许在对话中创建 Bot”，保存后发送 /new。')
       return true
@@ -4908,6 +4949,46 @@ export class BotGateway {
         await this.completeWithText(message, walId, binding, rows.length
           ? `你的动态 Bot：\n${rows.join('\n')}\n\n修改：/bot edit <bot-id> <字段> <新值>`
           : '你还没有动态 Bot。用 /bot create <bot-id> [显示名称] 建立一个草稿。')
+        return true
+      }
+      if (action === 'status') {
+        if (handle === '') {
+          await this.completeWithText(message, walId, binding, '用法：/bot status <bot-id>')
+          return true
+        }
+        const visibleEntries = await this.registry.list({ actorId: actor, sessionId: binding.sessionId })
+        const entry = visibleEntries.find(item => item.definition.handle === handle && item.definition.source !== 'config')
+        if (entry === undefined) throw new Error(`找不到你的动态 Bot：@${handle}`)
+        const snapshot = await this.fleetStatus()
+        const fleet = snapshot.fleet as {
+          registryBots?: Array<{
+            id?: string
+            handle?: string
+            status?: string
+            revision?: number
+            version?: number
+            fleetMembership?: string
+            membershipReason?: string
+            busy?: boolean
+            activeRuns?: number
+            lastFailure?: { error?: string; taskId?: string; runId?: string }
+          }>
+        } | undefined
+        const row = fleet?.registryBots?.find(item => item.id === entry.definition.id)
+        const membership = row?.fleetMembership ?? 'not-joined'
+        const reason = row?.membershipReason ?? '当前状态还没有可用的 Fleet 投影信息'
+        const activity = row?.busy === true
+          ? `忙碌（${String(row.activeRuns ?? 0)} 个 Run）`
+          : '空闲'
+        const failure = row?.lastFailure?.error === undefined
+          ? ''
+          : `\n最近失败：${row.lastFailure.error}`
+        await this.completeWithText(
+          message,
+          walId,
+          binding,
+          `@${entry.definition.handle} · ${entry.definition.status} · v${entry.definition.version} / r${entry.definition.currentRevision} · Fleet ${membership} · ${activity}\n${reason}${failure}`,
+        )
         return true
       }
       if (action === 'clone') {

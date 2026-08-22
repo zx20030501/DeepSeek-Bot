@@ -53,6 +53,7 @@ export function formatHelp(): string {
     '/bot create <id> [名称] — 建立只属于当前用户的 Bot 草稿',
     '/bot confirm <code> — 用 8 位确认码激活 Bot 草稿',
     '/bot list — 查看自己的动态 Bot、状态和待确认码',
+    '/bot status <id> — 查看动态 Bot 的 Fleet 加入、忙碌和最近失败状态',
     '/bot edit|disable|enable|delete|clone … — 管理自己的动态 Bot',
     '/mesh — 查看你自己的 BotMesh mailbox、task、run 和 handoff 状态',
     '/fleet <任务> — 自动规划并行 Bot 工作流（执行→验证→汇总）',

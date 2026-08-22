@@ -191,6 +191,10 @@ interface Diagnostics {
       runtimeDefinitionId?: string
       runtimeRevision?: number
       blockedReason?: string
+      membershipReason?: string
+      busy?: boolean
+      activeRuns?: number
+      lastFailure?: { runId?: string; taskId?: string; error?: string; at?: number }
       activationCode?: string
       updatedAt?: number
     }>
@@ -972,6 +976,14 @@ function FleetStatusPanel({
   const tasks = fleet?.tasks ?? []
   const deadLetters = fleet?.deadLetters ?? []
   const registryBots = fleet?.registryBots ?? []
+  const [registryFilter, setRegistryFilter] = useState<'all' | 'joined' | 'blocked' | 'busy' | 'draft' | 'disabled' | 'deleted'>('all')
+  const filteredRegistryBots = registryBots.filter(bot => {
+    if (registryFilter === 'all') return true
+    if (registryFilter === 'joined') return bot.fleetMembership === 'joined'
+    if (registryFilter === 'blocked') return bot.fleetMembership === 'blocked'
+    if (registryFilter === 'busy') return bot.busy === true
+    return bot.status === registryFilter
+  })
   return (
     <section className="dsh-hermes-panel">
       <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 控制台</h3><p className="dsh-hermes-muted">统一查看 Bot、任务、工作流、审批和死信；数据来自本机持久化状态。</p></div><button type="button" className="dsh-hermes-secondary" onClick={onRefresh}>刷新 Fleet</button></div>
@@ -985,12 +997,14 @@ function FleetStatusPanel({
         {(diagnostics.bots ?? []).map(bot => <div key={bot.id} className="dsh-hermes-fleet-chip"><strong>@{bot.id}</strong><span>{bot.fleetRole ?? 'generalist'} · {bot.sessionScope ?? 'requester'}</span></div>)}
       </div>
       <div className="dsh-hermes-dynamic-bots">
-        <div><strong>动态 Bot 注册表</strong><span className="dsh-hermes-muted">对话创建的 Bot 会先成为草稿；确认后才进入上面的可用 roster。</span></div>
-        {registryBots.length === 0 ? <span className="dsh-hermes-muted">暂无动态 Bot。启用对话创建后，可在飞书发送 <code>/bot create analyst 数据分析师</code>。</span> : registryBots.map(bot => {
+        <div><strong>动态 Bot 注册表</strong><span className="dsh-hermes-muted">对话创建的 Bot 会先成为草稿；确认后才进入上面的可用 roster。</span><label className="dsh-hermes-mini-check">筛选 <select value={registryFilter} onChange={event => { setRegistryFilter(event.target.value as typeof registryFilter) }}><option value="all">全部（{registryBots.length}）</option><option value="joined">已加入 Fleet</option><option value="blocked">加入受阻</option><option value="busy">正在运行</option><option value="draft">草稿</option><option value="disabled">已停用</option><option value="deleted">已删除</option></select></label></div>
+        {registryBots.length === 0 ? <span className="dsh-hermes-muted">暂无动态 Bot。启用对话创建后，可在飞书发送 <code>/bot create analyst 数据分析师</code>。</span> : filteredRegistryBots.length === 0 ? <span className="dsh-hermes-muted">当前筛选没有匹配的动态 Bot。</span> : filteredRegistryBots.map(bot => {
           const botId = bot.id ?? ''
           const handle = bot.handle ?? 'bot'
           const busy = registryAction !== undefined || approving
-          return <div className="dsh-hermes-fleet-row" key={botId || handle}><div><strong>@{handle} · {bot.title ?? handle}</strong><span>{bot.status} · {bot.fleetRole ?? 'generalist'} · v{String(bot.version ?? 1)} / r{String(bot.revision ?? 1)} · {bot.runtimeReady ? `已自动加入 Fleet（dynamic r${String(bot.runtimeRevision ?? bot.revision ?? 1)}）` : bot.blockedReason ?? '尚未加入 Fleet'}</span></div><div className="dsh-hermes-action-row">
+          const activity = bot.busy === true ? `忙碌（${String(bot.activeRuns ?? 0)} 个 Run）` : '空闲'
+          const failure = bot.lastFailure?.error === undefined ? '' : ` · 最近失败：${bot.lastFailure.error}`
+          return <div className="dsh-hermes-fleet-row" key={botId || handle}><div><strong>@{handle} · {bot.title ?? handle}</strong><span>{bot.status} · {bot.fleetRole ?? 'generalist'} · v{String(bot.version ?? 1)} / r{String(bot.revision ?? 1)} · {bot.membershipReason ?? (bot.runtimeReady ? `已自动加入 Fleet（dynamic r${String(bot.runtimeRevision ?? bot.revision ?? 1)}）` : bot.blockedReason ?? '尚未加入 Fleet')} · {activity}{failure}</span></div><div className="dsh-hermes-action-row">
             {bot.status === 'draft' && bot.activationCode !== undefined ? <button type="button" className="dsh-hermes-secondary" disabled={busy} onClick={() => { onResolve(bot.activationCode!, 'approved') }}>确认并激活</button> : null}
             {bot.status === 'active' ? <button type="button" className="dsh-hermes-secondary" disabled={busy || botId === ''} onClick={() => { onRegistryStatus(botId, 'disabled') }}>停用</button> : null}
             {bot.status === 'disabled' ? <button type="button" className="dsh-hermes-secondary" disabled={busy || botId === ''} onClick={() => { onRegistryStatus(botId, 'active') }}>重新启用</button> : null}
