@@ -188,7 +188,7 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 - `/status`：查看网关、Transport、WAL 和 Outbox 状态；
 - `/bots`、`/bot <name>`：查看和切换 profile/Bot roster；
 - `/bot create <id> [名称]`：建立当前用户私有的动态 Bot 草稿；
-- `/bot confirm <code>`、`/bot list`：确认激活或查看自己的动态 Bot；
+- `/bot confirm <code>`、`/bot list`、`/bot status <id>`：确认激活、查看自己的动态 Bot，或核实 Fleet 加入和健康状态；
 - `/bot edit|clone|disable|enable|delete …`：修改、复制或管理自己的动态 Bot；
 - `/mesh`：查看当前请求者自己的 mailbox、Task、Run、Handoff 和正在执行的 Bot 数量；
 - `/fleet <任务>`：按能力生成并执行“并行执行 → 验证 → 汇总”计划；

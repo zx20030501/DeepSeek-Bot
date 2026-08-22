@@ -22,7 +22,7 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - 仅在内部 Bot Session 注册的结构化 Handoff Tool，Gateway 推导任务身份并支持审批后恢复；
 - 可选的动态 Bot Registry：在对话中创建/修改私人 Bot 草稿，经 8 位确认码或本机控制台批准后自动加入该用户的 Fleet roster；
 - 可选的 `@manager` 结构化计划与版本化 Workflow Task DAG；相关功能开关默认关闭并在执行入口强制检查；
-- `/bot create`、`/bot confirm`、`/bot list`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable` 和两步删除；
+- `/bot create`、`/bot confirm`、`/bot list`、`/bot status`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable` 和两步删除；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
