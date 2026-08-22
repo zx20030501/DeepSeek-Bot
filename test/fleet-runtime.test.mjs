@@ -175,7 +175,13 @@ test('Gateway rechecks ACL before Manager dispatch and persists Workflow definit
     const workflow = await gateway.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
     const stored = await gateway.getWorkflowDefinition(workflow.id, 'user:feishu:ou_user')
     assert.equal(stored?.revision, 1)
-    const launch = await gateway.launchWorkflowDefinition(workflow.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user')
+    const launch = await gateway.launchWorkflowDefinition(
+      workflow.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+      { inputs: { topic: 'research this topic' } },
+    )
     assert.deepEqual(launch.entryNodes, ['research'])
     assert.equal(launch.dispatched.length, 1)
     const detail = await gateway.fleetTaskDetail(manager.taskId, 'local-dashboard')
@@ -383,8 +389,20 @@ test('Workflow launches are isolated by launchId and retain immutable revision h
       collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     })
     const workflow = await gateway.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
-    const first = await gateway.launchWorkflowDefinition(workflow.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', { launchId: 'one' })
-    const second = await gateway.launchWorkflowDefinition(workflow.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', { launchId: 'two' })
+    const first = await gateway.launchWorkflowDefinition(
+      workflow.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+      { launchId: 'one', inputs: { topic: 'first launch' } },
+    )
+    const second = await gateway.launchWorkflowDefinition(
+      workflow.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+      { launchId: 'two', inputs: { topic: 'second launch' } },
+    )
     assert.notEqual(first.workflowRunId, second.workflowRunId)
     assert.notEqual(first.rootTaskId, second.rootTaskId)
     const current = await gateway.getWorkflowDefinition(workflow.id, 'user:feishu:ou_user')
