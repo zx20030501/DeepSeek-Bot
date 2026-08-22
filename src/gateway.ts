@@ -56,6 +56,7 @@ import type {
   ManagerPlan,
   WorkflowDefinition,
   WorkflowDraft,
+  WorkflowValueType,
 } from './fleet-v2-types.js'
 import type {
   BotAddress,
@@ -158,6 +159,38 @@ function legacyWorkflowRevision(workflowRunId: string | undefined): number | und
 
 function isActiveMailboxState(state: MailboxState): boolean {
   return mailboxStateIsActive(state)
+}
+
+function workflowValueMatches(value: unknown, expected: WorkflowValueType): boolean {
+  switch (expected) {
+    case 'string':
+      return typeof value === 'string'
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value)
+    case 'boolean':
+      return typeof value === 'boolean'
+    case 'object':
+      return value !== null && typeof value === 'object' && !Array.isArray(value)
+    case 'array':
+      return Array.isArray(value)
+    case 'unknown':
+      return true
+  }
+}
+
+function validateWorkflowLaunchInputs(
+  definition: WorkflowDefinition,
+  inputs: Readonly<Record<string, unknown>>,
+): void {
+  for (const input of definition.inputs) {
+    const hasValue = Object.hasOwn(inputs, input.name) && inputs[input.name] !== undefined
+    if (input.required === true && !hasValue) {
+      throw new Error('Workflow input ' + input.name + ' is required')
+    }
+    if (hasValue && !workflowValueMatches(inputs[input.name], input.type)) {
+      throw new Error('Workflow input ' + input.name + ' must be of type ' + input.type)
+    }
+  }
 }
 
 export interface WorkflowLaunchOptions {
@@ -355,6 +388,8 @@ export class BotGateway {
   /** Direct chat sessions that have actually invoked each dynamic profile. */
   private readonly directProfileSessions = new Map<string, Set<string>>()
   private readonly workflowLanes = new Map<string, Promise<void>>()
+  /** Serializes concurrent launches that share the same caller-provided launch ID. */
+  private readonly workflowLaunchLanes = new Map<string, Promise<void>>()
   private readonly runLanes = new Map<string, Promise<void>>()
   private readonly taskLanes = new Map<string, Promise<void>>()
   /** Serializes dynamic lifecycle transitions with final work-admission checks. */
@@ -987,12 +1022,18 @@ export class BotGateway {
     actor = 'local-dashboard',
     options: WorkflowLaunchOptions = {},
   ): Promise<WorkflowLaunchResult> {
-    return this.withDurableMutation(() => this.launchWorkflowDefinitionUnlocked(
+    const launchId = options.launchId?.trim() || randomUUID()
+    if (launchId.length > 200) throw new Error('Workflow launchId is too long')
+    return this.withDurableMutation(() => this.withWorkflowLaunchLane(
       workflowId,
-      requester,
-      replyTarget,
-      actor,
-      options,
+      launchId,
+      () => this.launchWorkflowDefinitionUnlocked(
+        workflowId,
+        requester,
+        replyTarget,
+        actor,
+        { ...options, launchId },
+      ),
     ))
   }
 
@@ -1017,6 +1058,7 @@ export class BotGateway {
     const workflowRunId = 'workflow-run:' + definition.id + ':' + definition.revision + ':' + launchId
     const correlationId = 'workflow:' + definition.id + ':' + definition.revision + ':' + launchId
     const workflowInputs = options.inputs === undefined ? {} : structuredClone(options.inputs)
+    validateWorkflowLaunchInputs(definition, workflowInputs)
     validatePeerPayload({ workflowInputs }, normalizePeerPolicy(this.config.collaboration ?? {}).maxPayloadBytes)
     const snapshot = await this.tasks.snapshot()
     let rootTask = snapshot.tasks.find(task => (
@@ -1046,7 +1088,7 @@ export class BotGateway {
       plan,
       workflowRunId,
       rootTask,
-      plan.entryTaskIds,
+      plan.entryTaskIds.slice(0, plan.budget.maxParallel),
       requester,
       replyTarget,
       correlationId,
@@ -4389,6 +4431,27 @@ export class BotGateway {
    * to stop(). Every invocation owns a separate lease, including nested and
    * detached work, so an outer operation cannot accidentally hide a late write.
    */
+  private async withWorkflowLaunchLane<T>(
+    workflowId: string,
+    launchId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const key = workflowId.trim().toLowerCase() + ':' + launchId
+    const previous = this.workflowLaunchLanes.get(key) ?? Promise.resolve()
+    let result!: T
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        result = await operation()
+      })
+      .finally(() => {
+        if (this.workflowLaunchLanes.get(key) === current) this.workflowLaunchLanes.delete(key)
+      })
+    this.workflowLaunchLanes.set(key, current)
+    await current
+    return result
+  }
+
   private async withDurableMutation<T>(operation: () => Promise<T>): Promise<T> {
     if (this.stopped) throw new Error('Bot Gateway is stopping; durable mutation rejected')
     let release!: () => void
