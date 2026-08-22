@@ -80,6 +80,10 @@ export interface GatewayDiscoveryStatus {
   readonly candidate?: GatewayDiscoveryCandidate
 }
 
+export type BotFleetRole = 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+export type BotRegistryRole = BotFleetRole | 'manager'
+export type BotSessionScope = 'requester' | 'chat' | 'shared' | 'task'
+
 export interface BotProfile {
   readonly name: string
   readonly title?: string
@@ -95,12 +99,14 @@ export interface BotProfile {
   /** Optional short SOUL-style identity prompt for the canonical Bot Chat. */
   readonly soul?: string
   /** Fleet responsibility used by the deterministic planner. */
-  readonly fleetRole?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  readonly fleetRole?: BotFleetRole
   /** Safe default isolates long-term Bot context by requester. */
-  readonly sessionScope?: 'requester' | 'chat' | 'shared' | 'task'
+  readonly sessionScope?: BotSessionScope
   /** Optional Bot-level ACL applied after the gateway allowlist/pairing check. */
   readonly allowedUserIds?: readonly (string | number)[]
   readonly allowedChatIds?: readonly (string | number)[]
+  /** Platform-qualified principals, for example user:feishu:ou_x. */
+  readonly allowedPrincipals?: readonly string[]
   /** Require an explicit Fleet approval even when the requester names this Bot. */
   readonly approvalRequired?: boolean
 }
@@ -164,7 +170,7 @@ export interface BotCollaborationConfig {
   readonly mailboxRetryMaxMs?: number
   readonly botRunMaxAttempts?: number
   readonly maxParallelRuns?: number
-  readonly defaultSessionScope?: 'requester' | 'chat' | 'shared' | 'task'
+  readonly defaultSessionScope?: BotSessionScope
   readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
   readonly approvalTtlMs?: number
   readonly autoPlanner?: boolean
@@ -176,6 +182,17 @@ export interface BotCollaborationConfig {
   readonly peerMaxHops?: number
   /** Maximum UTF-8 JSON payload size for one Peer Message. */
   readonly peerMaxPayloadBytes?: number
+  /** Fleet v2 capabilities are opt-in until their individual migration gates pass. */
+  readonly features?: BotFleetFeatureFlags
+}
+
+export interface BotFleetFeatureFlags {
+  readonly dynamicRegistry?: boolean
+  readonly chatBotCreation?: boolean
+  readonly peerMessaging?: boolean
+  readonly managerAgent?: boolean
+  readonly savedWorkflows?: boolean
+  readonly externalRuntimes?: boolean
 }
 
 export interface BotDescriptor {
@@ -186,13 +203,147 @@ export interface BotDescriptor {
   readonly capabilities: readonly string[]
   readonly skills: readonly string[]
   readonly soul?: string
-  readonly fleetRole: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
-  readonly sessionScope: 'requester' | 'chat' | 'shared' | 'task'
+  readonly fleetRole: BotFleetRole
+  readonly sessionScope: BotSessionScope
   readonly allowedUserIds: readonly string[]
   readonly allowedChatIds: readonly string[]
+  readonly allowedPrincipals: readonly string[]
   readonly approvalRequired: boolean
   readonly canonicalSessionId: string
   readonly enabled: boolean
+}
+
+export type BotDefinitionScope = 'session' | 'user' | 'workspace' | 'shared'
+export type BotDefinitionSource = 'config' | 'chat' | 'dashboard' | 'import'
+export type BotDefinitionStatus = 'draft' | 'active' | 'disabled' | 'deleted'
+
+/** Stable Bot identity. Mutable prompt/model fields live in append-only revisions. */
+export interface BotDefinition {
+  readonly id: string
+  readonly handle: string
+  readonly scope: BotDefinitionScope
+  readonly ownerId: string
+  readonly workspaceId?: string
+  readonly sessionId?: string
+  readonly source: BotDefinitionSource
+  readonly status: BotDefinitionStatus
+  /** Increments for every revision or lifecycle transition. */
+  readonly version: number
+  /** Latest immutable content revision. */
+  readonly currentRevision: number
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export interface BotRevision {
+  readonly id: string
+  readonly botId: string
+  readonly revision: number
+  readonly title: string
+  readonly description?: string
+  readonly provider?: string
+  readonly model?: string
+  readonly maxTokens?: number
+  readonly capabilities: readonly string[]
+  readonly skills: readonly string[]
+  readonly soul?: string
+  readonly fleetRole: BotRegistryRole
+  readonly sessionScope: BotSessionScope
+  readonly allowedUserIds: readonly string[]
+  readonly allowedChatIds: readonly string[]
+  readonly approvalRequired: boolean
+  readonly createdBy: string
+  readonly createdAt: number
+  readonly changeSummary?: string
+}
+
+export interface BotRevisionDraft {
+  readonly title: string
+  readonly description?: string
+  readonly provider?: string
+  readonly model?: string
+  readonly maxTokens?: number
+  readonly capabilities?: readonly string[]
+  readonly skills?: readonly string[]
+  readonly soul?: string
+  readonly fleetRole?: BotRegistryRole
+  readonly sessionScope?: BotSessionScope
+  readonly allowedUserIds?: readonly (string | number)[]
+  readonly allowedChatIds?: readonly (string | number)[]
+  readonly approvalRequired?: boolean
+  readonly changeSummary?: string
+}
+
+export interface CreateBotDefinitionInput {
+  readonly handle: string
+  readonly scope: BotDefinitionScope
+  readonly ownerId: string
+  readonly workspaceId?: string
+  readonly sessionId?: string
+  readonly source?: BotDefinitionSource
+  readonly status?: 'draft' | 'active' | 'disabled'
+  readonly revision: BotRevisionDraft
+}
+
+export interface BotRegistryEntry {
+  readonly definition: BotDefinition
+  readonly revision: BotRevision
+}
+
+export interface BotRegistryContext {
+  readonly actorId: string
+  readonly workspaceId?: string
+  readonly sessionId?: string
+}
+
+export type TeamStatus = 'active' | 'paused' | 'disabled' | 'deleted'
+
+export interface TeamDefinition {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+  readonly scope: BotDefinitionScope
+  readonly ownerId: string
+  readonly workspaceId?: string
+  readonly sessionId?: string
+  readonly managerBotId?: string
+  readonly memberBotIds: readonly string[]
+  readonly maxConcurrency: number
+  readonly status: TeamStatus
+  readonly version: number
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export type ArtifactReferenceKind = 'file' | 'url' | 'message' | 'text'
+
+/** Reference only: artifact bodies and credentials must not be copied into Fleet state. */
+export interface ArtifactReference {
+  readonly id: string
+  readonly kind: ArtifactReferenceKind
+  readonly label: string
+  readonly uri: string
+  readonly mimeType?: string
+  readonly sha256?: string
+  readonly createdAt: number
+}
+
+export type AgentThreadStatus = 'open' | 'waiting' | 'completed' | 'cancelled'
+
+/** Durable collaboration context shared by a bounded set of Bots. */
+export interface AgentThread {
+  readonly id: string
+  readonly contextId: string
+  readonly teamId: string
+  readonly createdBy: string
+  readonly participantBotIds: readonly string[]
+  readonly managerBotId?: string
+  readonly taskId?: string
+  readonly artifacts: readonly ArtifactReference[]
+  readonly status: AgentThreadStatus
+  readonly version: number
+  readonly createdAt: number
+  readonly updatedAt: number
 }
 
 export type WalState = 'accepted' | 'dispatched' | 'completed' | 'failed'
@@ -236,6 +387,8 @@ export interface BotStateFile {
   readonly version: 1
   readonly bindings: Record<string, ChatBinding>
   readonly sessions: Record<string, BotTarget>
+  /** Dynamic profiles that actually started a direct DSH Agent session. */
+  readonly directProfileSessions: Record<string, readonly string[]>
 }
 
 export interface DshAgentOptions {
@@ -396,7 +549,7 @@ export interface AuditRecord {
   readonly at: number
   readonly actor: string
   readonly action: string
-  readonly entityType: 'message' | 'task' | 'run' | 'handoff' | 'room' | 'workflow' | 'approval'
+  readonly entityType: 'message' | 'task' | 'run' | 'handoff' | 'room' | 'workflow' | 'approval' | 'bot' | 'team'
   readonly entityId: string
   readonly correlationId?: string
   readonly data?: Record<string, unknown>
@@ -470,7 +623,7 @@ export interface FleetWorkflowRecord {
   readonly updatedAt: number
 }
 
-export type FleetApprovalKind = 'workflow' | 'handoff' | 'bot-invocation'
+export type FleetApprovalKind = 'workflow' | 'handoff' | 'bot-invocation' | 'bot-activation'
 export type FleetApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired'
 
 export interface FleetApprovalRecord {
@@ -481,6 +634,10 @@ export interface FleetApprovalRecord {
   readonly requestedBy: string
   readonly summary: string
   readonly entityId: string
+  /** Immutable target metadata used when an approval must bind exact content. */
+  readonly targetVersion?: number
+  readonly targetRevision?: number
+  readonly targetHash?: string
   readonly status: FleetApprovalStatus
   readonly createdAt: number
   readonly expiresAt: number

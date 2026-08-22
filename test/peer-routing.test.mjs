@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BotGateway } from '../dist/gateway.js'
+import { emitMockAgentEvent, withMockSession } from './mock-agent.mjs'
 
 async function waitUntil(predicate, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs
@@ -26,13 +27,13 @@ test('direct Bot output can route a bounded authorized @bot Peer Message', async
       async resume() { throw new Error('not found') },
       async create({ sessionId, agentOptions, meta }) {
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId),
           status: 'idle',
           options: agentOptions ?? {},
           cancel() {},
           followup() {},
-        }
+        })
         agents.set(String(sessionId), agent)
         created.push({ preset, agent })
         return { agent }
@@ -44,7 +45,12 @@ test('direct Bot output can route a bounded authorized @bot Peer Message', async
       telegram: { enabled: false },
       feishu: { enabled: false },
       profiles: { source: {}, target: {} },
-      collaboration: { enabled: true, approvalMode: 'never', peerMaxHops: 2 },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        peerMaxHops: 2,
+        features: { peerMessaging: true },
+      },
     })
     const transport = {
       platform: 'feishu',
@@ -67,20 +73,18 @@ test('direct Bot output can route a bounded authorized @bot Peer Message', async
     const source = created.find(item => item.preset === 'source')?.agent
     assert.ok(source)
 
-    gateway.onSessionEvent(source, {
-      type: 'assistant/message',
-      data: { message: { content: [{ type: 'text', text: '@target please review the source report' }] } },
+    emitMockAgentEvent(gateway, source, 'assistant/message', {
+      message: { content: [{ type: 'text', text: '@target please review the source report' }] },
     })
-    gateway.onSessionEvent(source, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    emitMockAgentEvent(gateway, source, 'turn/end', { reason: { kind: 'completed' } })
 
     await waitUntil(() => created.some(item => item.preset === 'target'))
     const target = created.find(item => item.preset === 'target')?.agent
     assert.ok(target)
-    gateway.onSessionEvent(target, {
-      type: 'assistant/message',
-      data: { message: { content: [{ type: 'text', text: '@source target report' }] } },
+    emitMockAgentEvent(gateway, target, 'assistant/message', {
+      message: { content: [{ type: 'text', text: '@source target report' }] },
     })
-    gateway.onSessionEvent(target, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    emitMockAgentEvent(gateway, target, 'turn/end', { reason: { kind: 'completed' } })
 
     await waitUntil(async () => {
       const status = await gateway.fleetStatus()
@@ -92,6 +96,77 @@ test('direct Bot output can route a bounded authorized @bot Peer Message', async
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'source').length, 1)
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'target')[0]?.status, 'completed')
     assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'source').length, 1)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('direct Bot output cannot route Peer Messages while the feature flag is off', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-peer-route-disabled-'))
+  let gateway
+  const created = []
+  try {
+    const agents = new Map()
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, meta }) {
+        const preset = meta?.agentPreset ?? 'unknown'
+        const agent = withMockSession({
+          id: String(sessionId),
+          status: 'idle',
+          cancel() {},
+          followup() {},
+        })
+        agents.set(String(sessionId), agent)
+        created.push({ preset, agent })
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_user'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: { source: {}, target: {} },
+      collaboration: { enabled: true, approvalMode: 'never' },
+    })
+    gateway.transports = [{
+      platform: 'feishu',
+      async start() {},
+      async stop() {},
+      async send() {},
+    }]
+    gateway.transportByPlatform.set('feishu', gateway.transports[0])
+    await gateway.start()
+
+    const replyTarget = { platform: 'feishu', chatId: 'oc_peer', chatType: 'dm', userId: 'ou_user' }
+    await assert.rejects(() => gateway.sendBotMessage({
+      from: 'source',
+      fromAddress: { id: 'source', type: 'bot' },
+      to: 'target',
+      instruction: 'blocked structured peer request',
+      replyTarget,
+    }), /Peer Messaging is disabled/u)
+    await gateway.sendBotMessage({
+      from: 'user:feishu:ou_user',
+      to: 'source',
+      instruction: 'do not route the mention',
+      replyTarget,
+    })
+    await waitUntil(() => created.some(item => item.preset === 'source'))
+    const source = created.find(item => item.preset === 'source')?.agent
+    assert.ok(source)
+    emitMockAgentEvent(gateway, source, 'assistant/message', {
+      message: { content: [{ type: 'text', text: '@target this must remain plain output' }] },
+    })
+    emitMockAgentEvent(gateway, source, 'turn/end', { reason: { kind: 'completed' } })
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    assert.equal(created.some(item => item.preset === 'target'), false)
+    const status = await gateway.fleetStatus()
+    assert.equal(status.fleet.tasks.filter(task => task.assignedTo === 'target').length, 0)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })

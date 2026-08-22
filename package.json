@@ -32,7 +32,8 @@
     "build:all": "npm run build && npm run build:client",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
-    "pack:check": "npm run build && npm pack --dry-run"
+    "pack:check": "npm run build && npm pack --dry-run",
+    "pack:smoke": "npm run build:all && node scripts/pack-smoke.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

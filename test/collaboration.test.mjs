@@ -165,6 +165,24 @@ test('mailbox recovers expired leases, schedules exact wakeups, and dead-letters
     assert.equal((await mailbox.recoverForeignLeases('new-worker', restartAt + 1))[0]?.state, 'queued')
     assert.equal(await mailbox.complete(oldWorkerLease, restartAt + 2), undefined)
     assert.ok(await mailbox.claim(['researcher'], 'new-worker', new Set(), restartAt + 2))
+
+    const stopEnvelope = createEnvelope({
+      from: 'user', to: 'researcher', taskId: 'task_stop', runId: 'run_stop',
+      attemptId: 'attempt_stop', correlationId: 'corr_stop', payload: {},
+    })
+    await mailbox.enqueue(stopEnvelope, 'stop', restartAt + 3)
+    const stoppingLease = await mailbox.claim(['researcher'], 'same-worker', new Set(), restartAt + 3)
+    assert.ok(stoppingLease)
+    assert.ok(await mailbox.acknowledge(stoppingLease, restartAt + 4))
+    assert.ok(await mailbox.start(stoppingLease, restartAt + 5))
+    const relinquished = await mailbox.relinquishWorkerLeases('same-worker', restartAt + 6)
+    assert.equal(relinquished[0]?.state, 'queued')
+    assert.equal(relinquished[0]?.fencingToken, stoppingLease.fencingToken + 1)
+    assert.equal('leaseId' in relinquished[0], false)
+    assert.equal(await mailbox.complete(stoppingLease, restartAt + 7), undefined)
+    const reclaimed = await mailbox.claim(['researcher'], 'same-worker', new Set(), restartAt + 7)
+    assert.ok(reclaimed)
+    assert.ok(reclaimed.fencingToken > relinquished[0].fencingToken)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

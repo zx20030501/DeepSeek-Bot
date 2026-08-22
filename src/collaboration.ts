@@ -104,6 +104,7 @@ export class BotDirectory {
         sessionScope: profile.sessionScope ?? this.defaultSessionScope,
         allowedUserIds: uniqueIds(profile.allowedUserIds),
         allowedChatIds: uniqueIds(profile.allowedChatIds),
+        allowedPrincipals: uniqueStrings(profile.allowedPrincipals),
         approvalRequired: profile.approvalRequired === true,
         canonicalSessionId: String(stableSessionId(`bot:${profile.name}`, profile.name, 0)),
         enabled: profile.enabled !== false,
@@ -130,8 +131,11 @@ export class BotDirectory {
   public canInvoke(id: string, target: BotTarget): boolean {
     const bot = this.entries.get(id.toLowerCase())
     if (!bot || !bot.enabled) return false
-    if (bot.allowedUserIds.length === 0 && bot.allowedChatIds.length === 0) return true
-    return (target.userId !== undefined && bot.allowedUserIds.includes(target.userId)) || bot.allowedChatIds.includes(target.chatId)
+    if (bot.allowedUserIds.length === 0 && bot.allowedChatIds.length === 0 && bot.allowedPrincipals.length === 0) return true
+    const principal = target.userId === undefined ? undefined : `user:${target.platform}:${target.userId}`
+    return (principal !== undefined && bot.allowedPrincipals.includes(principal))
+      || (target.userId !== undefined && bot.allowedUserIds.includes(target.userId))
+      || bot.allowedChatIds.includes(target.chatId)
   }
 
   /** Resolve a stable DSH session without leaking one requester's context to another. */
@@ -171,6 +175,7 @@ export class BotDirectory {
       skills: [...entry.skills],
       allowedUserIds: [...entry.allowedUserIds],
       allowedChatIds: [...entry.allowedChatIds],
+      allowedPrincipals: [...entry.allowedPrincipals],
     }
   }
 }
@@ -511,6 +516,43 @@ export class BotMailbox {
     return changed
   }
 
+  /**
+   * Gracefully fence and release every in-flight delivery owned by one worker.
+   * This is used by the plugin stop hand-off so restarting the same Gateway
+   * cannot retain an in-memory active-run lock while its mailbox item waits for
+   * a lease that only the stopped worker could renew.
+   */
+  public async relinquishWorkerLeases(workerId: string, at = now()): Promise<MailboxItem[]> {
+    await this.load()
+    const changed: MailboxItem[] = []
+    const ownedPrefix = `${workerId}:`
+    for (const current of [...this.items.values()]) {
+      if (current.state !== 'claimed' && current.state !== 'acknowledged' && current.state !== 'running') continue
+      if (!current.leaseId?.startsWith(ownedPrefix)) continue
+      const { leaseId: _leaseId, leaseExpiresAt: _leaseExpiresAt, ...withoutLease } = current
+      const ttlExpired = current.envelope.expiresAt !== undefined && current.envelope.expiresAt <= at
+      const exhausted = current.attempts >= this.maxAttempts
+      const relinquished: MailboxItem = {
+        ...withoutLease,
+        state: ttlExpired || exhausted ? 'dead-letter' : 'queued',
+        fencingToken: current.fencingToken + 1,
+        lastError: ttlExpired
+          ? 'message TTL expired while its worker was stopping'
+          : exhausted
+            ? 'worker stopped and delivery attempts were exhausted'
+            : 'worker stopped gracefully; returned to queue',
+        updatedAt: at,
+        nextAttemptAt: ttlExpired || exhausted ? Number.MAX_SAFE_INTEGER : at,
+      }
+      await this.record(relinquished)
+      changed.push({
+        ...relinquished,
+        envelope: { ...relinquished.envelope, payload: { ...relinquished.envelope.payload } },
+      })
+    }
+    return changed
+  }
+
   /** Earliest durable wake-up needed for delayed retry, TTL, or lease recovery. */
   public async nextWakeAt(
     targets?: readonly string[],
@@ -780,6 +822,67 @@ export class TaskRunStore {
     }
     await this.audit('run', runId, run.botId, 'run.completed', { taskId: run.taskId, completeTask })
     return { ...next }
+  }
+
+  /**
+   * Commit a direct handoff target Run, parent Task, and Handoff as one visible
+   * state transition. Journal rows retain the recovery-safe Run -> Task ->
+   * Handoff order, while readers see either the old snapshot or all three new
+   * records after the durable writes finish.
+   */
+  public async completeHandoffRun(
+    runId: string,
+    handoffId: string,
+    output: string,
+    actor = 'botfleet',
+  ): Promise<{ readonly run: RunRecord; readonly task: TaskRecord; readonly handoff: HandoffRecord } | undefined> {
+    await this.load()
+    const run = this.runs.get(runId)
+    const handoff = this.handoffs.get(handoffId)
+    if (!run || !handoff || run.parentRunId !== handoff.runId || run.botId !== handoff.toBot || run.taskId !== handoff.taskId) return undefined
+    if (run.status !== 'queued' && run.status !== 'running' && run.status !== 'completed') return undefined
+    if (handoff.status !== 'accepted' && handoff.status !== 'completed') return undefined
+    const task = this.tasks.get(run.taskId)
+    if (!task || task.status === 'failed' || task.status === 'cancelled') return undefined
+    const activeSibling = [...this.runs.values()].find(candidate => (
+      candidate.taskId === run.taskId
+      && candidate.id !== run.id
+      && candidate.id !== handoff.runId
+      && (candidate.status === 'queued' || candidate.status === 'running')
+    ))
+    if (activeSibling !== undefined) return undefined
+    const result = (run.status === 'completed' ? run.output : undefined) ?? output
+    const timestamp = now()
+    const { error: _runError, ...runWithoutError } = run
+    const nextRun: RunRecord = run.status === 'completed'
+      ? run
+      : { ...runWithoutError, status: 'completed', output: result, updatedAt: timestamp }
+    const { error: _taskError, ...taskWithoutError } = task
+    const nextTask: TaskRecord = task.status === 'completed'
+      ? task
+      : { ...taskWithoutError, status: 'completed', result, currentRunId: run.id, updatedAt: timestamp }
+    const nextHandoff: HandoffRecord = handoff.status === 'completed'
+      ? handoff
+      : { ...handoff, status: 'completed', updatedAt: timestamp }
+
+    if (run.status !== 'completed') await this.journal.append({ kind: 'run', run: nextRun })
+    if (task.status !== 'completed') await this.journal.append({ kind: 'task', task: nextTask })
+    if (handoff.status !== 'completed') await this.journal.append({ kind: 'handoff', handoff: nextHandoff })
+    this.runs.set(run.id, nextRun)
+    this.tasks.set(task.id, nextTask)
+    this.handoffs.set(handoff.id, nextHandoff)
+
+    if (run.status !== 'completed') {
+      await this.audit('run', run.id, run.botId, 'run.completed', { taskId: run.taskId, completeTask: true, handoffId })
+    }
+    if (handoff.status !== 'completed') {
+      await this.audit('handoff', handoff.id, actor, 'handoff.completed', { taskId: handoff.taskId, toBot: handoff.toBot })
+    }
+    return {
+      run: { ...nextRun },
+      task: { ...nextTask, acceptanceCriteria: [...nextTask.acceptanceCriteria] },
+      handoff: { ...nextHandoff, replyTarget: { ...nextHandoff.replyTarget } },
+    }
   }
 
   public async failRun(runId: string, error: unknown, failTask = true): Promise<RunRecord | undefined> {
@@ -1262,6 +1365,9 @@ export class FleetApprovalStore {
     readonly requestedBy: string
     readonly summary: string
     readonly entityId: string
+    readonly targetVersion?: number
+    readonly targetRevision?: number
+    readonly targetHash?: string
     readonly ttlMs?: number
   }): Promise<FleetApprovalRecord> {
     const timestamp = now()
@@ -1278,6 +1384,9 @@ export class FleetApprovalStore {
         requestedBy: input.requestedBy,
         summary: input.summary.slice(0, 2_000),
         entityId: input.entityId,
+        ...(input.targetVersion === undefined ? {} : { targetVersion: input.targetVersion }),
+        ...(input.targetRevision === undefined ? {} : { targetRevision: input.targetRevision }),
+        ...(input.targetHash === undefined ? {} : { targetHash: input.targetHash }),
         status: 'pending',
         createdAt: timestamp,
         expiresAt: timestamp + ttl,
@@ -1313,6 +1422,14 @@ export class FleetApprovalStore {
   public async get(id: string, at = now()): Promise<FleetApprovalRecord | undefined> {
     await this.expire(at)
     const approval = (await this.state.load()).approvals[id]
+    return approval && { ...approval }
+  }
+
+  public async getByCode(code: string, at = now()): Promise<FleetApprovalRecord | undefined> {
+    await this.expire(at)
+    const normalized = code.trim().toUpperCase()
+    if (normalized === '') return undefined
+    const approval = Object.values((await this.state.load()).approvals).find(item => item.code === normalized)
     return approval && { ...approval }
   }
 

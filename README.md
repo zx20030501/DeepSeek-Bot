@@ -16,10 +16,13 @@ DeepSeek-Bot 通过 DeepSeek Harness 的公开 Cordis 插件边界接入外部�
 - Bot Fleet：可编辑 roster、能力/SOUL/模型/角色、每 Bot ACL，以及默认按使用者隔离的稳定会话；
 - 结构化 Mailbox、Task/Run/Handoff/Audit、租约续期、fencing、真实退避重试、重启恢复和 dead-letter；
 - Peer Messaging v1：带地址、schemaVersion、correlation/reply/trace、TTL、显式幂等键、大小上限和有界 hop 的结构化 Bot 消息；
-- 直接 Bot 输出中的已授权 @bot 会被转换为新的有界 Peer Task/Run；ACL、审批、visitedBots 和 maxHops 会阻止越权与循环。
+- 开启 Peer Messaging 后，直接 Bot 输出中的已授权 @bot 会被转换为新的有界 Peer Task/Run；ACL、审批、visitedBots 和 maxHops 会阻止越权与循环；
 - `@bot` 路由、2–6 Bot 顺序 Group Room，以及 `/fleet` 并行“执行 → 验证 → 汇总”工作流；
 - `/tasks`、`/task`、`/cancel`、`/replay`、`/approvals`、`/approve`、`/reject`、`/mesh` 和本机 Fleet 控制台；
 - 仅在内部 Bot Session 注册的结构化 Handoff Tool，Gateway 推导任务身份并支持审批后恢复；
+- 可选的动态 Bot Registry：在对话中创建/修改私人 Bot 草稿，经 8 位确认码或本机控制台批准后自动加入该用户的 Fleet roster；
+- 可选的 `@manager` 结构化计划与版本化 Workflow Task DAG；相关功能开关默认关闭并在执行入口强制检查；
+- `/bot create`、`/bot confirm`、`/bot list`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable` 和两步删除；
 - `/model provider:model` 覆盖，以及 DSH 默认模型继承；
 - allowlist 访问控制，按用户 ID 或聊天 ID 授权；
 - 未授权飞书私聊的一次性配对码，平台隔离、过期、限量和撤销；
@@ -37,7 +40,8 @@ Telegram / 飞书事件
         │
         ▼
 普通消息 ─────────────────────────────→ 当前聊天 DSH Session
-@bot / /fleet → Task/Workflow/Run → Typed Mailbox → 隔离的 Bot Session
+创建/确认 Bot → Registry → 用户私有 Fleet roster
+@bot / @manager / /fleet → Task/Workflow/Run → Typed Mailbox → 隔离的 Bot Session
         │
         ▼
 session/event → Audit/Group Room → Outbox → 原平台回复
@@ -45,7 +49,7 @@ session/event → Audit/Group Room → Outbox → 原平台回复
 
 平台适配、可靠投递、会话路由和 Harness 调用彼此分离。新增平台时主要扩展 Transport，不需要重新实现 WAL、Outbox 和 Agent 会话逻辑。
 
-Fleet 使用方式和与 Hermes/Grok 的对应关系见 [docs/FLEET.md](docs/FLEET.md)；底层协议见 [docs/BOTMESH.md](docs/BOTMESH.md)。
+Fleet 使用方式和与 Hermes/Grok 的对应关系见 [docs/FLEET.md](docs/FLEET.md)；动态 Bot 自动加入 Fleet 的架构、上线步骤和长期计划见 [docs/DYNAMIC_BOT_FLEET_V1.md](docs/DYNAMIC_BOT_FLEET_V1.md)；底层协议见 [docs/BOTMESH.md](docs/BOTMESH.md)。
 
 ## 安装和构建
 
@@ -108,8 +112,11 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 ├── outbox.jsonl
 ├── mailbox.jsonl
 ├── tasks.jsonl
+├── workflows.jsonl
 ├── rooms.json
-└── approvals.json
+├── approvals.json
+├── bot-registry.jsonl
+└── teams.jsonl
 ```
 
 该目录可能包含聊天消息和模型回复，不应提交到 GitHub。大体积回放、诊断压缩包、压测日志和构建归档不进入仓库；本次实现没有生成需要上传 Google Drive 的大文件。
@@ -120,13 +127,14 @@ ${DSH_HOME:-~/.dsh}/hermes-bot/
 npm run check
 npm test
 npm run pack:check
+npm run pack:smoke
 ```
 
-测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批崩溃恢复、模型 Handoff、Task 详情/取消/重放、并行状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。
+测试覆盖命令解析、模型覆盖、WAL/Outbox、平台适配、配对、UID 发现、本机设置接口、DSH Settings/Credentials Provider 基类事务集成，以及 Fleet ACL、会话隔离、Mailbox TTL/租约/fencing/恢复、六 Bot 完整轮次、epoch、审批崩溃恢复、模型 Handoff、Task 详情/取消/重放、并行状态、真实失败重试和“执行 → 验证 → 汇总”端到端流程。动态 Fleet 端到端测试还覆盖聊天创建、草稿修改、旧确认码失效、自动加入 roster、跨用户 ACL、直接调用、Bot-to-Bot Peer、Manager、Workflow 和重启恢复；纯数据压测覆盖 500 个逻辑 Bot。`pack:smoke` 会在系统临时目录安装刚生成的 tarball，并验证主入口和客户端入口可导入；它可能使用 npm 网络或本机缓存解析 peer dependencies。
 
 ## 当前边界
 
-这是单机 DeepSeek Harness 内的 Fleet v1，不是 xAI 内部系统的复制品。当前 Planner 是可审计的确定性能力匹配，工作流采用固定的“执行 → 验证 → 汇总”阶段，最多 6 个不同 Bot；结构化 Handoff 已有公开 API、受限模型 Tool 和审批恢复。尚未实现 Grok Build 的数百代理弹性 fan-out、可保存任意工作流脚本、跨机器 Transport、定时 Routine、文件/媒体完整转发、通用 Task DAG 编辑器，以及 Workflow/Group Room 中途动态改图。
+这是单机 DeepSeek Harness 内的受控 Fleet，不是 xAI 内部系统的复制品。聊天创建的 Bot 经用户确认后可自动加入用户私有 roster；确定性 Manager、`/fleet` 和已保存 Workflow 可以在 ACL 与预算内选择它。单次 Group Room/计划和同时运行的 Agent 仍受最多 6 Bot 等配置上限约束；“500 Bot”只表示逻辑 roster 数据路径测试，不表示 500 个模型会话并发。版本化 Workflow 与 task-node DAG 已实现，但 condition/map/reduce/approval/compensation 的全部运行时适配、通用 DAG 编辑器、`@team` Router、跨机器 Transport、定时 Routine、完整文件/媒体转发和运行中任意改图仍未实现。
 
 ## 项目链接
 

@@ -12,12 +12,18 @@ import {
   workflowDispatchKey,
 } from '../dist/fleet-runtime.js'
 import { generateManagerPlan } from '../dist/manager-policy.js'
+import { emitMockAgentEvent, withMockSession } from './mock-agent.mjs'
 
 const target = {
   platform: 'feishu',
   chatId: 'oc_manager',
   chatType: 'dm',
   userId: 'ou_user',
+}
+
+const runtimeFeatures = {
+  managerAgent: true,
+  savedWorkflows: true,
 }
 
 function workflowDraft() {
@@ -113,6 +119,34 @@ test('Workflow compiler preserves dependency order and stable launch keys', () =
   assert.equal(workflowDispatchKey('wf_compiler', 2, 'research'), workflowDispatchKey('wf_compiler', 2, 'research'))
 })
 
+test('Gateway rejects Manager and Saved Workflow entrypoints while their feature flags are off', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-runtime-feature-gates-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: { researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] } },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+    })
+    await assert.rejects(() => gateway.planManagerTask({
+      requester: 'user:feishu:ou_user',
+      replyTarget: target,
+      instruction: 'research this topic',
+      requiredCapabilities: ['research'],
+    }), /Manager Agent is disabled/u)
+    await assert.rejects(
+      () => gateway.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user'),
+      /Saved Workflows are disabled/u,
+    )
+    assert.equal((await gateway.tasks.snapshot()).tasks.length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('Gateway rechecks ACL before Manager dispatch and persists Workflow definitions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-runtime-adapter-'))
   let gateway
@@ -125,7 +159,7 @@ test('Gateway rechecks ACL before Manager dispatch and persists Workflow definit
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     })
     const manager = await gateway.planManagerTask({
       requester: 'user:feishu:ou_user',
@@ -163,7 +197,7 @@ test('Manager approval gates dispatch and resumes through the durable approval p
       profiles: {
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'auto-planned', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'auto-planned', managerBotId: 'manager', features: runtimeFeatures },
     })
     const result = await gateway.planManagerTask({
       requester: 'user:feishu:ou_user',
@@ -179,6 +213,48 @@ test('Manager approval gates dispatch and resumes through the durable approval p
     assert.equal((await gateway.fleetStatus()).fleet.mailbox.queued, 0)
     assert.equal((await gateway.resolveApproval(result.approvalCode, 'approved'))?.status, 'approved')
     assert.equal((await gateway.fleetStatus()).fleet.mailbox.queued, 1)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('disabling Manager admission before approval prevents the delayed delegation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-manager-disable-before-approval-'))
+  let gateway
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false },
+    feishu: { enabled: false },
+    profiles: { researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] } },
+    collaboration: {
+      enabled: true,
+      approvalMode: 'auto-planned',
+      managerBotId: 'manager',
+      features: runtimeFeatures,
+    },
+  }
+  try {
+    gateway = new BotGateway({}, config)
+    const result = await gateway.planManagerTask({
+      requester: 'user:feishu:ou_user',
+      replyTarget: target,
+      instruction: 'research a high-risk topic',
+      requiredCapabilities: ['research'],
+      risk: 'high',
+      maxAssignments: 1,
+    })
+    assert.ok(result.approvalCode)
+    await gateway.reconfigure({
+      ...config,
+      collaboration: {
+        ...config.collaboration,
+        features: { ...runtimeFeatures, managerAgent: false },
+      },
+    })
+    assert.equal((await gateway.resolveApproval(result.approvalCode, 'approved'))?.status, 'approved')
+    assert.equal((await gateway.tasks.task(result.taskId))?.status, 'failed')
+    assert.equal((await gateway.fleetStatus()).fleet.mailbox.queued, 0)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
@@ -201,9 +277,8 @@ test('compiled Workflow resumes its durable DAG after restart and completes the 
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     })
-    await first.stop()
     const workflow = await first.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
     const launch = await first.launchWorkflowDefinition(
       workflow.id,
@@ -225,7 +300,7 @@ test('compiled Workflow resumes its durable DAG after restart and completes the 
       },
       async create({ sessionId, agentOptions, meta }) {
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId),
           status: 'idle',
           options: agentOptions ?? {},
@@ -233,14 +308,13 @@ test('compiled Workflow resumes its durable DAG after restart and completes the 
           followup(prompt) {
             prompts.push({ preset, prompt: typeof prompt === 'string' ? prompt : JSON.stringify(prompt) })
             setTimeout(() => {
-              gateway.onSessionEvent(agent, {
-                type: 'assistant/message',
-                data: { message: { content: [{ type: 'text', text: preset + '-result' }] } },
+              emitMockAgentEvent(gateway, agent, 'assistant/message', {
+                message: { content: [{ type: 'text', text: preset + '-result' }] },
               })
-              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
             }, 0)
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -254,7 +328,7 @@ test('compiled Workflow resumes its durable DAG after restart and completes the 
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     })
     const sent = []
     const transport = {
@@ -306,9 +380,8 @@ test('Workflow launches are isolated by launchId and retain immutable revision h
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     })
-    await gateway.stop()
     const workflow = await gateway.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
     const first = await gateway.launchWorkflowDefinition(workflow.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', { launchId: 'one' })
     const second = await gateway.launchWorkflowDefinition(workflow.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', { launchId: 'two' })
@@ -341,10 +414,9 @@ test('Workflow recovery repairs a Task/Run created before Mailbox enqueue', asyn
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     }
     first = new BotGateway({}, config)
-    await first.stop()
     const workflow = await first.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
     const workflowRunId = 'workflow-run:' + workflow.id + ':1:torn'
     const correlationId = 'workflow:' + workflow.id + ':1:torn'
@@ -388,17 +460,17 @@ test('Workflow recovery repairs a Task/Run created before Mailbox enqueue', asyn
       },
       async create({ sessionId, meta }) {
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId),
           status: 'idle',
           cancel() {},
           followup() {
             setTimeout(() => {
-              gateway.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: preset + '-result' }] } } })
-              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(gateway, agent, 'assistant/message', { message: { content: [{ type: 'text', text: preset + '-result' }] } })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
             }, 0)
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -413,7 +485,10 @@ test('Workflow recovery repairs a Task/Run created before Mailbox enqueue', asyn
     let recovered
     while (Date.now() < deadline) {
       recovered = await gateway.fleetTaskDetail(rootTask.id, 'local-dashboard')
-      if (recovered?.task.status === 'completed') break
+      if (
+        recovered?.task.status === 'completed'
+        && sent.some(item => item.text.includes('Workflow Research then write 完成'))
+      ) break
       await new Promise(resolve => setTimeout(resolve, 20))
     }
     assert.equal(recovered?.task.status, 'completed')
@@ -436,10 +511,9 @@ test('Workflow recovery keeps a delayed retry active instead of failing the root
       feishu: { enabled: false },
       access: { userIds: ['ou_user'] },
       profiles: { researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] } },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     }
     first = new BotGateway({}, config)
-    await first.stop()
     const workflow = await first.createWorkflowDefinition({
       ...workflowDraft(),
       nodes: [workflowDraft().nodes[0]],
@@ -524,10 +598,9 @@ test('Workflow root failure cancels queued child work and fences its delivery', 
         researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
         writer: { capabilities: ['write'], allowedUserIds: ['ou_user'] },
       },
-      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager' },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
     }
     first = new BotGateway({}, config)
-    await first.stop()
     const workflow = await first.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
     const workflowRunId = 'workflow-run:' + workflow.id + ':1:cancel'
     const correlationId = 'workflow:' + workflow.id + ':1:cancel'

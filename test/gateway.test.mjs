@@ -1,10 +1,45 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BotGateway, discoveryCandidateFor, nextModelOverride, normalizeConfig } from '../dist/gateway.js'
-import { createEnvelope } from '../dist/collaboration.js'
+import { BotMailbox, createEnvelope } from '../dist/collaboration.js'
+
+function withMockSession(agent) {
+  const events = []
+  const session = {
+    get events() { return events },
+    get seq() { return events.length },
+    append(type, data) {
+      const event = { type, seq: events.length, time: Date.now(), data }
+      events.push(event)
+      return event
+    },
+  }
+  agent.session = session
+  agent.whenIdle ??= async () => {}
+  const followup = agent.followup.bind(agent)
+  agent.followup = (...args) => {
+    const latestTurn = events.reduce((latest, event) => Math.max(latest, Number(event.data?.turn ?? 0)), 0)
+    agent.__mockTurn = latestTurn + 1
+    session.append('turn/start', { turn: agent.__mockTurn })
+    agent.status = 'running'
+    return followup(...args)
+  }
+  return agent
+}
+
+function emitMockAgentEvent(gateway, agent, type, data) {
+  assert.ok(Number.isSafeInteger(agent.__mockTurn), `mock Agent has no active turn for ${type}`)
+  const eventData = type === 'assistant/message'
+    ? { turn: agent.__mockTurn, step: 1, ...data }
+    : { turn: agent.__mockTurn, ...data }
+  const event = agent.session.append(type, eventData)
+  if (type === 'turn/end') agent.status = 'idle'
+  gateway.onSessionEvent(agent, event)
+  return event
+}
 
 test('discovery accepts only an exact Feishu DM bind command', () => {
   const message = {
@@ -45,6 +80,26 @@ test('new DeepSeek-Bot environment names work while the legacy names remain avai
     if (previousToken === undefined) delete process.env.DEEPSEEK_BOT_TELEGRAM_TOKEN
     else process.env.DEEPSEEK_BOT_TELEGRAM_TOKEN = previousToken
   }
+})
+
+test('Fleet v2 feature flags are secure-off by default and opt in individually', () => {
+  const defaults = normalizeConfig({ feishu: { enabled: false }, telegram: { enabled: false } })
+  assert.deepEqual(defaults.collaboration.features, {
+    dynamicRegistry: false,
+    chatBotCreation: false,
+    peerMessaging: false,
+    managerAgent: false,
+    savedWorkflows: false,
+    externalRuntimes: false,
+  })
+  const enabled = normalizeConfig({
+    feishu: { enabled: false },
+    telegram: { enabled: false },
+    collaboration: { features: { dynamicRegistry: true, peerMessaging: true } },
+  })
+  assert.equal(enabled.collaboration.features.dynamicRegistry, true)
+  assert.equal(enabled.collaboration.features.peerMessaging, true)
+  assert.equal(enabled.collaboration.features.managerAgent, false)
 })
 
 test('typed public Bot API enforces per-Bot ACL and persists handoff approval', async () => {
@@ -173,15 +228,15 @@ test('approved handoff fences a still-running source before the target Bot compl
       },
       async create({ sessionId, agentOptions, meta }) {
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {},
           followup() {
             setTimeout(() => {
-              gateway.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: `${preset}-result` }] } } })
-              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(gateway, agent, 'assistant/message', { message: { content: [{ type: 'text', text: `${preset}-result` }] } })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
             }, preset === 'source' ? 100 : 0)
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -286,21 +341,20 @@ test('Grok-style Fleet runs execute, verify, and synthesize phases end to end', 
       },
       async create({ sessionId, agentOptions, meta }) {
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId),
           status: 'idle',
           options: agentOptions ?? {},
           cancel() {},
           followup() {
             queueMicrotask(() => {
-              gateway.onSessionEvent(agent, {
-                type: 'assistant/message',
-                data: { message: { content: [{ type: 'text', text: `${preset}-result` }] } },
+              emitMockAgentEvent(gateway, agent, 'assistant/message', {
+                message: { content: [{ type: 'text', text: `${preset}-result` }] },
               })
-              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
             })
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -375,21 +429,21 @@ test('Bot model failure creates a fresh Run and really retries after backoff', a
         return { agent }
       },
       async create({ sessionId, agentOptions }) {
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {},
           followup() {
             turns += 1
             const current = turns
             queueMicrotask(() => {
               if (current === 1) {
-                gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'error' } } })
+                emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'error' } })
               } else {
-                gateway.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'retry-success' }] } } })
-                gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+                emitMockAgentEvent(gateway, agent, 'assistant/message', { message: { content: [{ type: 'text', text: 'retry-success' }] } })
+                emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
               }
             })
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -492,16 +546,16 @@ test('restart repairs a mailbox-completed Run whose output commit was interrupte
         return { agent }
       },
       async create({ sessionId, agentOptions }) {
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {},
           followup() {
             turns += 1
             queueMicrotask(() => {
-              recovered.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'recovered-result' }] } } })
-              recovered.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(recovered, agent, 'assistant/message', { message: { content: [{ type: 'text', text: 'recovered-result' }] } })
+              emitMockAgentEvent(recovered, agent, 'turn/end', { reason: { kind: 'completed' } })
             })
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -621,7 +675,7 @@ test('scoped model handoff tool pauses for approval and resumes with the target 
         const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
         if (setup) await setup(agentCtx)
         const preset = meta?.agentPreset ?? 'unknown'
-        const agent = {
+        const agent = withMockSession({
           id,
           ctx: agentCtx,
           status: 'idle',
@@ -642,16 +696,16 @@ test('scoped model handoff tool pauses for approval and resumes with the target 
                     deferContext() {},
                   },
                 )
-                gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+                emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
               })
               return
             }
             queueMicrotask(() => {
-              gateway.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'target-finished' }] } } })
-              gateway.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(gateway, agent, 'assistant/message', { message: { content: [{ type: 'text', text: 'target-finished' }] } })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
             })
           },
-        }
+        })
         agents.set(id, agent)
         return { agent }
       },
@@ -679,7 +733,9 @@ test('scoped model handoff tool pauses for approval and resumes with the target 
     let approval
     while (Date.now() < pausedDeadline) {
       approval = (await gateway.approvals.pending())[0]
-      if (approval && (await gateway.tasks.run(source.runId))?.status === 'cancelled') break
+      if (approval
+        && (await gateway.tasks.run(source.runId))?.status === 'cancelled'
+        && (await gateway.tasks.task(source.taskId))?.status === 'waiting') break
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     assert.equal(toolResult?.status, 'pending-approval')
@@ -755,15 +811,15 @@ test('restart replays an approved workflow decision exactly once after the side 
         return { agent }
       },
       async create({ sessionId, agentOptions }) {
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {},
           followup() {
             queueMicrotask(() => {
-              recovered.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'workflow-recovered' }] } } })
-              recovered.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(recovered, agent, 'assistant/message', { message: { content: [{ type: 'text', text: 'workflow-recovered' }] } })
+              emitMockAgentEvent(recovered, agent, 'turn/end', { reason: { kind: 'completed' } })
             })
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -842,15 +898,15 @@ test('restart replays an approved handoff once without resetting its target Run'
         return { agent }
       },
       async create({ sessionId, agentOptions }) {
-        const agent = {
+        const agent = withMockSession({
           id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {},
           followup() {
             queueMicrotask(() => {
-              recovered.onSessionEvent(agent, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'handoff-recovered' }] } } })
-              recovered.onSessionEvent(agent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+              emitMockAgentEvent(recovered, agent, 'assistant/message', { message: { content: [{ type: 'text', text: 'handoff-recovered' }] } })
+              emitMockAgentEvent(recovered, agent, 'turn/end', { reason: { kind: 'completed' } })
             })
           },
-        }
+        })
         agents.set(String(sessionId), agent)
         return { agent }
       },
@@ -880,6 +936,1124 @@ test('restart replays an approved handoff once without resetting its target Run'
   } finally {
     if (initial) await initial.stop()
     if (recovered) await recovered.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('dynamic Bot activation is owner-scoped, restart-safe, and does not replay over a later disable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-dynamic-restart-'))
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    profiles: { staticbot: { title: 'Static Bot' } },
+    collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+  }
+  const ownerTarget = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  const otherTarget = { platform: 'feishu', chatId: 'oc_other', chatType: 'dm', userId: 'ou_other' }
+  let initial
+  let recovered
+  let conflicted
+  try {
+    initial = new BotGateway({}, config)
+    await initial.start()
+    const draft = await initial.createDynamicBotDraft({
+      handle: 'analyst',
+      title: 'Data Analyst',
+      capabilities: ['analysis'],
+      role: 'worker',
+    }, ownerTarget)
+    assert.equal(draft.status, 'draft')
+    assert.match(draft.confirmationCode, /^[A-Z0-9]{8}$/u)
+    assert.equal(initial.directory.get('analyst'), undefined)
+    await assert.rejects(
+      initial.createDynamicBotDraft({ handle: 'staticbot', title: 'Conflict' }, ownerTarget),
+      /静态配置占用/u,
+    )
+
+    const duplicate = await initial.createDynamicBotDraft({ handle: 'analyst', title: 'Ignored Retry' }, ownerTarget)
+    assert.equal(duplicate.botId, draft.botId)
+    assert.equal(duplicate.confirmationCode, draft.confirmationCode)
+    await assert.rejects(
+      initial.createDynamicBotDraft({ handle: 'analyst', title: 'Hijack' }, otherTarget),
+      /already|占用/u,
+    )
+
+    const approved = await initial.resolveApproval(draft.confirmationCode, 'approved', 'user:feishu:ou_owner')
+    assert.equal(approved?.kind, 'bot-activation')
+    assert.equal(initial.directory.canInvoke('analyst', ownerTarget), true)
+    assert.equal(initial.directory.canInvoke('analyst', otherTarget), false)
+    const sameRawIdOtherPlatform = { platform: 'telegram', chatId: 'ou_owner', chatType: 'dm', userId: 'ou_owner' }
+    assert.equal(initial.directory.canInvoke('analyst', sameRawIdOtherPlatform), false)
+    await assert.rejects(initial.sendBotMessage({
+      from: 'user:telegram:ou_owner', to: 'analyst', instruction: 'cross-platform attempt', replyTarget: sameRawIdOtherPlatform,
+    }), /not authorized/u)
+    assert.ok(initial.status().bots.some(bot => bot.id === 'analyst'))
+    const analystRuntime = (await initial.fleetStatus()).fleet.registryBots.find(bot => bot.id === draft.botId)
+    assert.equal(analystRuntime.runtimeReady, true)
+    assert.equal(analystRuntime.runtimeSource, 'dynamic')
+    assert.equal(analystRuntime.runtimeDefinitionId, draft.botId)
+    await assert.rejects(initial.reconfigure({
+      ...config,
+      profiles: { ...config.profiles, analyst: { title: 'Static Analyst' } },
+    }), /动态 Bot|墓碑|占用/u)
+    assert.equal(initial.directory.get('analyst')?.title, 'Data Analyst')
+
+    const activeWork = await initial.sendBotMessage({
+      from: 'user:feishu:ou_owner', to: 'analyst', instruction: 'hold this task', replyTarget: ownerTarget,
+    })
+    await assert.rejects(
+      initial.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner'),
+      /未结束任务|正在运行任务/u,
+    )
+    assert.equal((await initial.cancelFleetTask(activeWork.taskId, 'user:feishu:ou_owner'))?.status, 'cancelled')
+
+    const pendingTask = await initial.tasks.createTask({
+      title: 'pending reservation', instruction: 'not dispatched yet', createdBy: 'user:feishu:ou_owner', assignedTo: 'analyst',
+    })
+    await assert.rejects(
+      initial.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner'),
+      /未结束任务/u,
+    )
+    await initial.tasks.cancelTask(pendingTask.id, 'user:feishu:ou_owner')
+
+    const createTask = initial.tasks.createTask.bind(initial.tasks)
+    let releaseAdmission
+    const admissionReleased = new Promise(resolve => { releaseAdmission = resolve })
+    let reachedAdmission
+    const admissionReached = new Promise(resolve => { reachedAdmission = resolve })
+    initial.tasks.createTask = async input => {
+      reachedAdmission()
+      await admissionReleased
+      return createTask(input)
+    }
+    const racingSend = initial.sendBotMessage({
+      from: 'user:feishu:ou_owner', to: 'analyst', instruction: 'race with disable', replyTarget: ownerTarget,
+    })
+    await admissionReached
+    await initial.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner')
+    releaseAdmission()
+    await assert.rejects(racingSend, /no longer active/u)
+    initial.tasks.createTask = createTask
+    const racedTask = (await initial.tasks.snapshot()).tasks.find(task => task.instruction === 'race with disable')
+    assert.equal(racedTask?.status, 'cancelled')
+    await initial.setDynamicBotStatus(draft.botId, 'active', 'user:feishu:ou_owner')
+
+    const recoverDraft = await initial.createDynamicBotDraft({ handle: 'recoverbot', title: 'Recover Bot' }, ownerTarget)
+    assert.equal((await initial.approvals.resolveByCode(recoverDraft.confirmationCode, 'approved', 'user:feishu:ou_owner'))?.status, 'approved')
+    assert.equal((await initial.registry.get(recoverDraft.botId))?.definition.status, 'draft')
+
+    const changedDraft = await initial.createDynamicBotDraft({ handle: 'changedbot', title: 'Approved Title' }, ownerTarget)
+    assert.equal((await initial.approvals.resolveByCode(changedDraft.confirmationCode, 'approved', 'user:feishu:ou_owner'))?.status, 'approved')
+    const changedRevision = await initial.updateDynamicBotDraft({ handle: 'changedbot', title: 'Changed After Approval' }, ownerTarget)
+    assert.notEqual(changedRevision.confirmationCode, changedDraft.confirmationCode)
+    assert.equal((await initial.registry.get(changedDraft.botId))?.definition.status, 'draft')
+
+    await initial.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner')
+    assert.equal(initial.directory.get('analyst'), undefined)
+    await initial.stop()
+    initial = undefined
+
+    recovered = new BotGateway({}, config)
+    await recovered.start()
+    assert.equal((await recovered.registry.get(draft.botId))?.definition.status, 'disabled')
+    assert.equal(recovered.directory.get('analyst'), undefined)
+    assert.equal((await recovered.registry.get(recoverDraft.botId))?.definition.status, 'active')
+    assert.equal(recovered.directory.canInvoke('recoverbot', ownerTarget), true)
+    assert.equal((await recovered.registry.get(changedDraft.botId))?.definition.status, 'draft')
+    assert.equal((await recovered.registry.get(changedDraft.botId))?.revision.title, 'Changed After Approval')
+    assert.equal(recovered.directory.get('changedbot'), undefined)
+    assert.equal((await recovered.resolveApproval(changedRevision.confirmationCode, 'approved', 'user:feishu:ou_owner'))?.status, 'approved')
+    assert.equal((await recovered.registry.get(changedDraft.botId))?.definition.status, 'active')
+    await recovered.setDynamicBotStatus(draft.botId, 'active', 'user:feishu:ou_owner')
+    assert.equal(recovered.directory.canInvoke('analyst', ownerTarget), true)
+
+    const grave = await recovered.createDynamicBotDraft({ handle: 'grave', title: 'Tombstone' }, ownerTarget)
+    await recovered.resolveApproval(grave.confirmationCode, 'approved', 'user:feishu:ou_owner')
+    await recovered.setDynamicBotStatus(grave.botId, 'deleted', 'user:feishu:ou_owner')
+    await assert.rejects(recovered.validateStaticProfileHandles(['grave']), /墓碑|占用/u)
+
+    await recovered.stop()
+    recovered = undefined
+    conflicted = new BotGateway({}, {
+      ...config,
+      profiles: { ...config.profiles, analyst: { title: 'Static Analyst' } },
+    })
+    await assert.rejects(conflicted.start(), /动态 Bot|墓碑|占用/u)
+  } finally {
+    if (initial) await initial.stop()
+    if (recovered) await recovered.stop()
+    if (conflicted) await conflicted.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('dynamic Bot namespace changes serialize with static reconfigure and roll back partial failures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-namespace-transaction-'))
+  const baseConfig = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+  }
+  const ownerTarget = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  let gateway
+  try {
+    gateway = new BotGateway({}, baseConfig)
+    await gateway.start()
+
+    const validateStaticProfiles = gateway.validateStaticProfileHandles.bind(gateway)
+    let releaseValidation
+    const validationReleased = new Promise(resolve => { releaseValidation = resolve })
+    let validationReached
+    const reachedValidation = new Promise(resolve => { validationReached = resolve })
+    let pauseValidation = true
+    gateway.validateStaticProfileHandles = async handles => {
+      await validateStaticProfiles(handles)
+      if (pauseValidation && handles.includes('racebot')) {
+        pauseValidation = false
+        validationReached()
+        await validationReleased
+      }
+    }
+    const staticReconfigure = gateway.reconfigure({
+      ...baseConfig,
+      profiles: { racebot: { title: 'Static Race Bot' } },
+    })
+    await reachedValidation
+    const dynamicCreateAssertion = assert.rejects(
+      gateway.createDynamicBotDraft({ handle: 'racebot', title: 'Dynamic Race Bot' }, ownerTarget),
+      /静态配置占用/u,
+    )
+    releaseValidation()
+    await Promise.all([staticReconfigure, dynamicCreateAssertion])
+    gateway.validateStaticProfileHandles = validateStaticProfiles
+    assert.equal(await gateway.registry.getByHandle('racebot'), undefined)
+    assert.equal(gateway.directory.get('racebot')?.title, 'Static Race Bot')
+
+    const loadFleetV2State = gateway.loadFleetV2State.bind(gateway)
+    let injectApplyFailure = true
+    gateway.loadFleetV2State = async () => {
+      if (injectApplyFailure && gateway.directory.get('unstable') !== undefined) {
+        injectApplyFailure = false
+        throw new Error('controlled post-apply failure')
+      }
+      await loadFleetV2State()
+    }
+    await assert.rejects(gateway.reconfigure({
+      ...baseConfig,
+      profiles: {
+        racebot: { title: 'Static Race Bot' },
+        unstable: { title: 'Must Roll Back' },
+      },
+    }), /controlled post-apply failure/u)
+    gateway.loadFleetV2State = loadFleetV2State
+    assert.equal(gateway.directory.get('racebot')?.title, 'Static Race Bot')
+    assert.equal(gateway.directory.get('unstable'), undefined)
+
+    let persisted = false
+    await assert.rejects(gateway.reconfigureAndCommit({
+      ...baseConfig,
+      profiles: {
+        racebot: { title: 'Static Race Bot' },
+        commitbot: { title: 'Commit Must Roll Back' },
+      },
+    }, async () => {
+      persisted = true
+      throw new Error('controlled settings persistence failure')
+    }, async () => {
+      persisted = false
+    }), /controlled settings persistence failure/u)
+    assert.equal(persisted, false)
+    assert.equal(gateway.directory.get('commitbot'), undefined)
+    assert.equal(gateway.directory.get('racebot')?.title, 'Static Race Bot')
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('direct dynamic Agent lifecycle survives a transport-free plugin reload and prunes stale session history', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-direct-agent-lifecycle-'))
+  const agents = new Map()
+  const agentRegistry = {
+    get(id) { return agents.get(String(id)) },
+    async resume() { throw new Error('not found') },
+    async create() { throw new Error('not used') },
+  }
+  const target = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  let gateway
+  try {
+    gateway = new BotGateway({ get: name => name === 'agents' ? agentRegistry : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+    })
+    const transport = { platform: 'feishu', async start() {}, async stop() {}, async send() {} }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    const draft = await gateway.createDynamicBotDraft({ handle: 'livebot', title: 'Live Bot' }, target)
+    await gateway.resolveApproval(draft.confirmationCode, 'approved', 'user:feishu:ou_owner')
+    const originalBinding = await gateway.bindingFor(target)
+    const binding = await gateway.rotateBinding(target, originalBinding, 'livebot', null)
+    let cancelCount = 0
+    const inbox = { hasPending: false }
+    const agent = {
+      id: binding.sessionId,
+      status: 'idle',
+      inbox,
+      options: {},
+      followup() {
+        inbox.hasPending = true
+        this.status = 'running'
+      },
+      cancel() { cancelCount += 1 },
+    }
+    agents.set(binding.sessionId, agent)
+    await gateway.rememberDirectProfileSession('livebot', binding.sessionId)
+    await gateway.bridge.followup(agent, 'keep running')
+    assert.equal(agent.status, 'running')
+    assert.equal(inbox.hasPending, true)
+    await gateway.rotateBinding(target, binding, 'default', null)
+
+    await gateway.stop()
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+    })
+    await gateway.start()
+    assert.equal(gateway.bridge, undefined)
+    await assert.rejects(
+      gateway.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner'),
+      /状态暂时无法确认/u,
+    )
+    const persistedWhileUnknown = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'))
+    assert.deepEqual(persistedWhileUnknown.directProfileSessions.livebot, [binding.sessionId])
+    await gateway.stop()
+
+    gateway = new BotGateway({ get: name => name === 'agents' ? agentRegistry : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+    })
+    await gateway.start()
+    assert.ok(gateway.bridge, 'Agent lifecycle bridge must initialize without an enabled transport')
+
+    const persistedBefore = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'))
+    assert.deepEqual(persistedBefore.directProfileSessions.livebot, [binding.sessionId])
+
+    await assert.rejects(
+      gateway.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner'),
+      /对应会话发送 \/stop/u,
+    )
+    await assert.rejects(
+      gateway.setDynamicBotStatus(draft.botId, 'deleted', 'user:feishu:ou_owner'),
+      /对应会话发送 \/stop/u,
+    )
+    assert.equal((await gateway.registry.get(draft.botId))?.definition.status, 'active')
+    assert.equal(cancelCount, 0)
+
+    agent.status = 'idle'
+    inbox.hasPending = false
+    await gateway.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner')
+    assert.equal((await gateway.registry.get(draft.botId))?.definition.status, 'disabled')
+    assert.equal(cancelCount, 0)
+    const persistedAfter = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'))
+    assert.deepEqual(persistedAfter.directProfileSessions, {})
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stop closes Bot mutation admission and drains lifecycle plus namespace tails before reload', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-stop-drain-'))
+  const agents = new Map()
+  const agentRegistry = {
+    get(id) { return agents.get(String(id)) },
+    async resume() { throw new Error('not found') },
+    async create() { throw new Error('not used') },
+  }
+  const ctx = { get: name => name === 'agents' ? agentRegistry : undefined }
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+  }
+  const firstTarget = { platform: 'feishu', chatId: 'oc_first', chatType: 'dm', userId: 'ou_owner' }
+  const secondTarget = { platform: 'feishu', chatId: 'oc_second', chatType: 'dm', userId: 'ou_owner' }
+  let gateway
+  let reloaded
+  let releasePersist
+  let releaseCommit
+  try {
+    gateway = new BotGateway(ctx, config)
+    const transport = { platform: 'feishu', async start() {}, async stop() {}, async send() {} }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    const draft = await gateway.createDynamicBotDraft({ handle: 'drainbot', title: 'Drain Bot' }, firstTarget)
+    await gateway.resolveApproval(draft.confirmationCode, 'approved', 'user:feishu:ou_owner')
+    const initial = await gateway.bindingFor(firstTarget)
+    const direct = await gateway.rotateBinding(firstTarget, initial, 'drainbot', null)
+    const agent = {
+      id: direct.sessionId,
+      status: 'idle',
+      inbox: { hasPending: false },
+      options: {},
+      cancel() {},
+    }
+    agents.set(direct.sessionId, agent)
+    await gateway.rememberDirectProfileSession('drainbot', direct.sessionId)
+
+    const persistDirectProfileSessions = gateway.persistDirectProfileSessions.bind(gateway)
+    const persistReleased = new Promise(resolve => { releasePersist = resolve })
+    let persistReached
+    const reachedPersist = new Promise(resolve => { persistReached = resolve })
+    let blockPersist = true
+    gateway.persistDirectProfileSessions = async () => {
+      if (blockPersist) {
+        blockPersist = false
+        persistReached()
+        await persistReleased
+      }
+      await persistDirectProfileSessions()
+    }
+    const disabling = gateway.setDynamicBotStatus(draft.botId, 'disabled', 'user:feishu:ou_owner')
+    await reachedPersist
+    const stopping = gateway.stop()
+    assert.equal(await Promise.race([
+      stopping.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    await assert.rejects(
+      gateway.createDynamicBotDraft({ handle: 'latebot', title: 'Too Late' }, secondTarget),
+      /Gateway is stopping/u,
+    )
+    releasePersist()
+    await Promise.all([disabling, stopping])
+    gateway = undefined
+
+    reloaded = new BotGateway(ctx, config)
+    await reloaded.start()
+    const secondBinding = await reloaded.bindingFor(secondTarget)
+    await new Promise(resolve => setImmediate(resolve))
+    const stateAfterReload = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'))
+    assert.ok(stateAfterReload.bindings[secondBinding.key], 'old instance overwrote the reloaded binding')
+
+    const commitReleased = new Promise(resolve => { releaseCommit = resolve })
+    let commitReached
+    const reachedCommit = new Promise(resolve => { commitReached = resolve })
+    const namespaceMutation = reloaded.reconfigureAndCommit(config, async () => {
+      commitReached()
+      await commitReleased
+    })
+    await reachedCommit
+    const secondStop = reloaded.stop()
+    assert.equal(await Promise.race([
+      secondStop.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    await assert.rejects(reloaded.reconfigure(config), /Gateway is stopping/u)
+    releaseCommit()
+    await Promise.all([namespaceMutation, secondStop])
+    reloaded = undefined
+  } finally {
+    if (gateway) {
+      releasePersist?.()
+      await gateway.stop()
+    }
+    if (reloaded) {
+      releaseCommit?.()
+      await reloaded.stop()
+    }
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stop drains draft-update and approval leases before a replacement Gateway can observe durable state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-unified-mutation-drain-'))
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+  }
+  const target = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  const actor = 'user:feishu:ou_owner'
+  let gateway
+  let reloaded
+  let cold
+  let releaseRevision
+  let releaseApproval
+  try {
+    gateway = new BotGateway({}, config)
+    await gateway.start()
+    const draft = await gateway.createDynamicBotDraft({ handle: 'leasebot', title: 'Lease Bot v1' }, target)
+
+    const revise = gateway.registry.revise.bind(gateway.registry)
+    const revisionReleased = new Promise(resolve => { releaseRevision = resolve })
+    let revisionReached
+    const reachedRevision = new Promise(resolve => { revisionReached = resolve })
+    gateway.registry.revise = async (...args) => {
+      revisionReached()
+      await revisionReleased
+      return revise(...args)
+    }
+    const updating = gateway.updateDynamicBotDraft({ handle: 'leasebot', title: 'Lease Bot v2' }, target)
+    await reachedRevision
+    const stoppingAfterUpdate = gateway.stop()
+    assert.equal(await Promise.race([
+      stoppingAfterUpdate.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    await assert.rejects(
+      gateway.updateDynamicBotDraft({ handle: 'leasebot', title: 'Too Late' }, target),
+      /Gateway is stopping/u,
+    )
+    releaseRevision()
+    const [updated] = await Promise.all([updating, stoppingAfterUpdate])
+    gateway = undefined
+
+    reloaded = new BotGateway({}, config)
+    await reloaded.start()
+    assert.equal((await reloaded.registry.get(draft.botId))?.definition.version, 2)
+    assert.equal((await reloaded.registry.get(draft.botId))?.revision.title, 'Lease Bot v2')
+
+    const resolveByCode = reloaded.approvals.resolveByCode.bind(reloaded.approvals)
+    const approvalReleased = new Promise(resolve => { releaseApproval = resolve })
+    let approvalReached
+    const reachedApproval = new Promise(resolve => { approvalReached = resolve })
+    reloaded.approvals.resolveByCode = async (...args) => {
+      approvalReached()
+      await approvalReleased
+      return resolveByCode(...args)
+    }
+    const resolving = reloaded.resolveApproval(updated.confirmationCode, 'approved', actor)
+    await reachedApproval
+    const stoppingAfterApproval = reloaded.stop()
+    assert.equal(await Promise.race([
+      stoppingAfterApproval.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    await assert.rejects(
+      reloaded.resolveApproval(updated.confirmationCode, 'approved', actor),
+      /Gateway is stopping/u,
+    )
+    releaseApproval()
+    await Promise.all([resolving, stoppingAfterApproval])
+    reloaded = undefined
+
+    cold = new BotGateway({}, config)
+    await cold.start()
+    assert.equal((await cold.registry.get(draft.botId))?.definition.status, 'active')
+    assert.equal((await cold.registry.get(draft.botId))?.definition.version, 3)
+    assert.equal((await cold.registry.get(draft.botId))?.revision.title, 'Lease Bot v2')
+  } finally {
+    releaseRevision?.()
+    releaseApproval?.()
+    if (gateway) await gateway.stop()
+    if (reloaded) await reloaded.stop()
+    if (cold) await cold.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('all durable public, model-tool, and Transport entrypoints reject admission after stop begins', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-mutation-admission-'))
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    collaboration: {
+      features: {
+        dynamicRegistry: true,
+        chatBotCreation: true,
+        managerAgent: true,
+        savedWorkflows: true,
+      },
+    },
+  }
+  const target = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  let inbound
+  const agents = {
+    get() { return undefined },
+    async resume() { throw new Error('not found') },
+    async create() { throw new Error('not used') },
+  }
+  const gateway = new BotGateway({ get: name => name === 'agents' ? agents : undefined }, config)
+  const transport = {
+    platform: 'feishu',
+    async start(handler) { inbound = handler },
+    async stop() {},
+    async send() {},
+  }
+  gateway.transports = [transport]
+  gateway.transportByPlatform.set('feishu', transport)
+  try {
+    await gateway.start()
+    await gateway.stop()
+    const attempts = [
+      () => gateway.fleetStatus(),
+      () => gateway.sendBotMessage({ from: 'tester', to: 'missing', instruction: 'x', replyTarget: target }),
+      () => gateway.planManagerTask({ requester: 'tester', instruction: 'x', replyTarget: target }),
+      () => gateway.createWorkflowDefinition({}),
+      () => gateway.compileWorkflowDefinition({}),
+      () => gateway.launchWorkflowDefinition('missing', 'tester', target),
+      () => gateway.requestHandoff({ taskId: 'task', runId: 'run', fromBot: 'a', toBot: 'b', reason: 'x', requestedBy: 'tester', replyTarget: target }),
+      () => gateway.createDynamicBotDraft({ handle: 'late', title: 'Late' }, target),
+      () => gateway.setDynamicBotStatus('missing', 'disabled'),
+      () => gateway.updateDynamicBotDraft({ handle: 'late', title: 'Later' }, target),
+      () => gateway.resolveApproval('ABCDEFGH', 'approved'),
+      () => gateway.cancelFleetTask('task'),
+      () => gateway.replayFleetTask('task'),
+      () => gateway.approvePairing('123456'),
+      () => gateway.revokePairing('feishu', 'ou_owner'),
+      () => gateway.reconfigure(config),
+      () => gateway.reconfigureAndCommit(config, async () => {}),
+      () => gateway.requestModelHandoff('missing-session', { toBot: 'b', reason: 'x' }),
+      () => inbound({ id: 'late-inbound', target, text: 'late', receivedAt: Date.now() }),
+    ]
+    for (const attempt of attempts) await assert.rejects(attempt, /Gateway is stopping/u)
+  } finally {
+    await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('reconfigureAndCommit never commits a configuration that stop prevented from applying', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-reconfigure-stop-'))
+  const baseConfig = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+  }
+  const gateway = new BotGateway({}, baseConfig)
+  let releaseBoot
+  let bootReached
+  const reachedBoot = new Promise(resolve => { bootReached = resolve })
+  const bootReleased = new Promise(resolve => { releaseBoot = resolve })
+  const originalBoot = gateway.boot.bind(gateway)
+  gateway.boot = async () => {
+    bootReached()
+    await bootReleased
+    return originalBoot()
+  }
+  let namespaceChecks = 0
+  let namespaceChecked
+  const reachedNamespaceCheck = new Promise(resolve => { namespaceChecked = resolve })
+  const originalNamespaceCheck = gateway.assertStaticProfileNamespace.bind(gateway)
+  gateway.assertStaticProfileNamespace = async config => {
+    await originalNamespaceCheck(config)
+    namespaceChecks += 1
+    if (namespaceChecks === 1) namespaceChecked()
+  }
+  let commitCalls = 0
+  try {
+    const starting = gateway.start()
+    await reachedBoot
+    const reconfiguring = gateway.reconfigureAndCommit({
+      ...baseConfig,
+      profiles: { commitbot: { title: 'Must not be committed' } },
+    }, async () => { commitCalls += 1 })
+    await reachedNamespaceCheck
+    await new Promise(resolve => setImmediate(resolve))
+    const stopping = gateway.stop()
+    releaseBoot()
+
+    await starting
+    await assert.rejects(reconfiguring, /stopped before the configuration could be applied/u)
+    await stopping
+    assert.equal(commitCalls, 0)
+    assert.equal(gateway.directory.get('commitbot'), undefined)
+    assert.equal('commitbot' in (gateway.config.profiles ?? {}), false)
+  } finally {
+    releaseBoot?.()
+    await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stop drains an already-entered Mailbox heartbeat and prevents it from rescheduling', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-heartbeat-drain-'))
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    profiles: { researcher: { capabilities: ['research'] } },
+    collaboration: { enabled: true, mailboxLeaseMs: 30_000 },
+  }
+  let gateway
+  let fresh
+  let releaseRenew
+  const originalSetTimeout = globalThis.setTimeout
+  try {
+    gateway = new BotGateway({}, config)
+    await gateway.start()
+    const task = await gateway.tasks.createTask({
+      title: 'heartbeat', instruction: 'hold the lease', createdBy: 'tester', assignedTo: 'researcher',
+    })
+    const run = await gateway.tasks.createRun(task.id, 'researcher', 1)
+    const envelope = createEnvelope({
+      from: 'tester', to: 'researcher', taskId: task.id, runId: run.id,
+      attemptId: run.attemptId, correlationId: task.id, payload: { instruction: task.instruction },
+    })
+    await gateway.mailbox.enqueue(envelope, `heartbeat:${run.id}`)
+    const claimed = await gateway.mailbox.claim(['researcher'], 'heartbeat-worker')
+    assert.ok(claimed)
+    const acknowledged = await gateway.mailbox.acknowledge(claimed)
+    assert.ok(acknowledged)
+    const running = await gateway.mailbox.start({ ...claimed, item: acknowledged })
+    assert.ok(running)
+    const internal = {
+      runId: run.id,
+      botId: 'researcher',
+      sessionId: 'heartbeat-session',
+      lease: { ...claimed, item: running },
+      envelope,
+      texts: [],
+    }
+    gateway.internalRuns.set(run.id, internal)
+
+    const renew = gateway.mailbox.renew.bind(gateway.mailbox)
+    const renewReleased = new Promise(resolve => { releaseRenew = resolve })
+    let renewReached
+    const reachedRenew = new Promise(resolve => { renewReached = resolve })
+    gateway.mailbox.renew = async (...args) => {
+      renewReached()
+      await renewReleased
+      return renew(...args)
+    }
+
+    let heartbeatCallback
+    let scheduledHeartbeats = 0
+    globalThis.setTimeout = callback => {
+      scheduledHeartbeats += 1
+      heartbeatCallback = callback
+      return { unref() {} }
+    }
+    gateway.scheduleLeaseHeartbeat(internal)
+    globalThis.setTimeout = originalSetTimeout
+    assert.equal(typeof heartbeatCallback, 'function')
+    heartbeatCallback()
+    await reachedRenew
+
+    const stopping = gateway.stop()
+    assert.equal(await Promise.race([
+      stopping.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    gateway.scheduleLeaseHeartbeat(internal)
+    assert.equal(scheduledHeartbeats, 1, 'stop admitted a new heartbeat timer')
+    releaseRenew()
+    await stopping
+
+    const oldItem = await gateway.mailbox.get(envelope.id)
+    fresh = new BotGateway({}, config)
+    await fresh.start()
+    const freshItem = await fresh.mailbox.get(envelope.id)
+    const coldMailbox = new BotMailbox(join(root, 'mailbox.jsonl'), config.collaboration)
+    const coldItem = await coldMailbox.get(envelope.id)
+    for (const item of [oldItem, freshItem, coldItem]) {
+      assert.equal(item?.state, 'running')
+      assert.equal(item?.fencingToken, oldItem?.fencingToken)
+      assert.equal(item?.leaseExpiresAt, oldItem?.leaseExpiresAt)
+    }
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    releaseRenew?.()
+    if (gateway) await gateway.stop()
+    if (fresh) await fresh.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the same Gateway fences and reclaims an active Run across stop and restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-active-run-restart-'))
+  const agents = new Map()
+  let followupCalls = 0
+  let cancelCalls = 0
+  let cancelledTurnEnd
+  const makeAgent = sessionId => {
+    const events = []
+    const session = {
+      get events() { return events },
+      get seq() { return events.length },
+      append(type, data) {
+        const event = { type, seq: events.length, time: Date.now(), data }
+        events.push(event)
+        return event
+      },
+    }
+    const agent = {
+      id: String(sessionId),
+      session,
+      status: 'idle',
+      inbox: { hasPending: false },
+      followup() {
+        followupCalls += 1
+        const latestTurn = events.reduce((latest, event) => Math.max(latest, Number(event.data?.turn ?? 0)), 0)
+        session.append('turn/start', { turn: latestTurn + 1 })
+        agent.status = 'running'
+      },
+      cancel() {
+        cancelCalls += 1
+        const latestTurn = events.reduce((latest, event) => Math.max(latest, Number(event.data?.turn ?? 0)), 0)
+        if (agent.status === 'running') {
+          cancelledTurnEnd = session.append('turn/end', { turn: latestTurn, reason: { kind: 'aborted' } })
+        }
+        agent.status = 'idle'
+      },
+      async whenIdle() {},
+    }
+    agents.set(String(sessionId), agent)
+    return agent
+  }
+  const registry = {
+    get(sessionId) { return agents.get(String(sessionId)) },
+    async resume() { throw new Error('not found') },
+    async create({ sessionId }) { return { agent: makeAgent(sessionId) } },
+  }
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+    profiles: { researcher: { capabilities: ['research'] } },
+    collaboration: { enabled: true, mailboxLeaseMs: 30_000 },
+  }
+  const gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, config)
+  const makeTransport = () => ({
+    platform: 'feishu', async start() {}, async stop() {}, async send() {},
+  })
+  const install = () => {
+    const transport = makeTransport()
+    gateway.transports = [transport]
+    gateway.transportByPlatform.clear()
+    gateway.transportByPlatform.set('feishu', transport)
+  }
+  try {
+    install()
+    gateway.installTransports = install
+    await gateway.start()
+
+    const task = await gateway.tasks.createTask({
+      title: 'restart active run', instruction: 'continue after restart', createdBy: 'tester', assignedTo: 'researcher',
+    })
+    const run = await gateway.tasks.createRun(task.id, 'researcher', 1)
+    await gateway.tasks.startRun(run.id)
+    const envelope = createEnvelope({
+      from: 'tester', to: 'researcher', taskId: task.id, runId: run.id,
+      attemptId: run.attemptId, correlationId: task.id, payload: { instruction: task.instruction },
+    })
+    await gateway.mailbox.enqueue(envelope, `restart:${run.id}`)
+    const claimed = await gateway.mailbox.claim(['researcher'], gateway.collaborationWorkerId)
+    assert.ok(claimed)
+    const acknowledged = await gateway.mailbox.acknowledge(claimed)
+    assert.ok(acknowledged)
+    const running = await gateway.mailbox.start({ ...claimed, item: acknowledged })
+    assert.ok(running)
+    const oldLease = { ...claimed, item: running }
+    const oldSessionId = gateway.directory.sessionIdFor('researcher', {
+      requester: 'tester',
+      target: { platform: 'internal', chatId: task.id },
+      taskId: task.id,
+    })
+    assert.ok(oldSessionId)
+    const oldAgent = makeAgent(oldSessionId)
+    oldAgent.session.append('turn/start', { turn: 1 })
+    const staleAssistant = oldAgent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: { content: [{ type: 'text', text: 'STALE_OLD_TURN_RESULT' }] },
+    })
+    oldAgent.status = 'running'
+    const internal = {
+      runId: run.id,
+      botId: 'researcher',
+      sessionId: oldSessionId,
+      lease: oldLease,
+      envelope,
+      texts: [],
+    }
+    gateway.internalRuns.set(run.id, internal)
+    gateway.internalRunBySession.set(oldSessionId, run.id)
+    gateway.activeBotRuns.set('researcher', run.id)
+
+    await gateway.stop()
+    const released = await gateway.mailbox.get(envelope.id)
+    assert.equal(released?.state, 'queued')
+    assert.equal(released?.fencingToken, oldLease.fencingToken + 1)
+    assert.equal('leaseId' in released, false)
+    assert.equal(await gateway.mailbox.complete(oldLease), undefined)
+    assert.equal(gateway.internalRuns.size, 0)
+    assert.equal(gateway.internalRunBySession.size, 0)
+    assert.equal(gateway.activeBotRuns.size, 0)
+
+    await gateway.start()
+    await gateway.drainCollaboration()
+    const reclaimed = await gateway.mailbox.get(envelope.id)
+    assert.equal(reclaimed?.state, 'running')
+    assert.ok(reclaimed.fencingToken > released.fencingToken)
+    assert.equal(gateway.internalRuns.has(run.id), true)
+    assert.equal(gateway.activeBotRuns.get('researcher'), run.id)
+    assert.equal(followupCalls, 1)
+    assert.ok(cancelCalls >= 1)
+    const restartedInternal = gateway.internalRuns.get(run.id)
+    assert.equal(restartedInternal?.sessionId, oldSessionId)
+    assert.equal(restartedInternal?.expectedTurn, 2)
+    assert.ok(cancelledTurnEnd)
+
+    gateway.onSessionEvent(oldAgent, staleAssistant)
+    gateway.onSessionEvent(oldAgent, cancelledTurnEnd)
+    gateway.onSessionEvent(oldAgent, {
+      ...cancelledTurnEnd,
+      seq: cancelledTurnEnd.seq + 100,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })
+    gateway.onSessionEvent(oldAgent, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: 'MISSING_EVENT_IDENTITY' }] } },
+    })
+    gateway.onSessionEvent(oldAgent, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    await Promise.all([...gateway.sessionEventTasks])
+    assert.equal((await gateway.mailbox.get(envelope.id))?.state, 'running')
+    assert.equal((await gateway.tasks.run(run.id))?.status, 'running')
+    assert.equal((await gateway.tasks.task(task.id))?.status, 'running')
+    assert.deepEqual(restartedInternal?.texts, [])
+    const staleAudits = (await gateway.tasks.snapshot()).audits.filter(audit => (
+      audit.action === 'message.stale_session_event' && audit.data?.runId === run.id
+    ))
+    assert.equal(staleAudits.length, 5)
+
+    const freshAssistant = oldAgent.session.append('assistant/message', {
+      turn: 2,
+      step: 1,
+      message: { content: [{ type: 'text', text: 'FRESH_NEW_TURN_RESULT' }] },
+    })
+    const freshEnd = oldAgent.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    oldAgent.status = 'idle'
+    gateway.onSessionEvent(oldAgent, freshAssistant)
+    gateway.onSessionEvent(oldAgent, freshEnd)
+    await Promise.all([...gateway.sessionEventTasks])
+    assert.equal((await gateway.mailbox.get(envelope.id))?.state, 'completed')
+    assert.equal((await gateway.tasks.run(run.id))?.status, 'completed')
+    assert.equal((await gateway.tasks.task(task.id))?.result, 'FRESH_NEW_TURN_RESULT')
+    assert.equal(gateway.internalRuns.size, 0)
+  } finally {
+    await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the same Gateway reinstalls exactly one Transport after concurrent stop and restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-transport-restart-'))
+  const agents = {
+    get() { return undefined },
+    async resume() { throw new Error('not found') },
+    async create() { throw new Error('not used') },
+  }
+  const gateway = new BotGateway({ get: name => name === 'agents' ? agents : undefined }, {
+    stateDir: root,
+    telegram: { enabled: false }, feishu: { enabled: false },
+  })
+  let startCalls = 0
+  let stopCalls = 0
+  let installCalls = 0
+  let releaseFirstStop
+  let firstStopReached
+  const reachedFirstStop = new Promise(resolve => { firstStopReached = resolve })
+  const firstStopReleased = new Promise(resolve => { releaseFirstStop = resolve })
+  const makeTransport = (blockStop = false) => ({
+    platform: 'feishu',
+    async start() { startCalls += 1 },
+    async stop() {
+      stopCalls += 1
+      if (blockStop) {
+        firstStopReached()
+        await firstStopReleased
+      }
+    },
+    async send() {},
+  })
+  const install = () => {
+    installCalls += 1
+    const transport = makeTransport(false)
+    gateway.transports = [transport]
+    gateway.transportByPlatform.clear()
+    gateway.transportByPlatform.set('feishu', transport)
+  }
+  try {
+    const firstTransport = makeTransport(true)
+    gateway.transports = [firstTransport]
+    gateway.transportByPlatform.set('feishu', firstTransport)
+    gateway.installTransports = install
+    await gateway.start()
+    assert.equal(startCalls, 1)
+
+    const stopping = gateway.stop()
+    await reachedFirstStop
+    const restarting = gateway.start()
+    assert.equal(await Promise.race([
+      restarting.then(() => 'settled'),
+      new Promise(resolve => setImmediate(() => resolve('pending'))),
+    ]), 'pending')
+    releaseFirstStop()
+    await Promise.all([stopping, restarting])
+    assert.equal(gateway.running, true)
+    assert.equal(gateway.transports.length, 1)
+    assert.equal(installCalls, 1)
+    assert.equal(startCalls, 2)
+    assert.equal(stopCalls, 1)
+
+    await gateway.start()
+    assert.equal(startCalls, 2, 'start while already running duplicated the Transport')
+    await gateway.stop()
+    assert.equal(stopCalls, 2)
+    await gateway.start()
+    assert.equal(installCalls, 2)
+    assert.equal(startCalls, 3)
+    assert.equal(gateway.transports.length, 1)
+  } finally {
+    releaseFirstStop?.()
+    await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('chat commands create, confirm, edit, isolate, disable, enable, and delete a dynamic Bot', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-dynamic-commands-'))
+  let gateway
+  try {
+    const agents = {
+      get() { return undefined },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('commands should not create an Agent') },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? agents : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_a', 'ou_b'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+    })
+    const sent = []
+    let inbound
+    const transport = {
+      platform: 'feishu', async start(handler) { inbound = handler }, async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    const send = async (id, userId, text) => {
+      const before = sent.length
+      await inbound({
+        id,
+        target: { platform: 'feishu', chatId: `oc_${userId}`, chatType: 'dm', userId },
+        text,
+        receivedAt: Date.now(),
+      })
+      const deadline = Date.now() + 2_000
+      while (sent.length === before && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      assert.ok(sent.length > before, `no reply for ${text}`)
+      return sent.at(-1).text
+    }
+
+    const created = await send('dynamic-create', 'ou_a', '/bot create analyst 数据分析师')
+    const code = /\/bot confirm ([A-Z0-9]{8})/u.exec(created)?.[1]
+    assert.ok(code)
+    assert.match(await send('dynamic-wrong-confirm', 'ou_b', `/bot confirm ${code}`), /不属于当前用户/u)
+    assert.equal((await gateway.registry.getByHandle('analyst'))?.definition.status, 'draft')
+    assert.match(await send('dynamic-confirm', 'ou_a', `/bot confirm ${code}`), /已确认并激活 @analyst/u)
+    assert.match(await send('dynamic-owner-roster', 'ou_a', '/bots'), /@analyst/u)
+    assert.doesNotMatch(await send('dynamic-other-roster', 'ou_b', '/bots'), /@analyst/u)
+    assert.match(await send('dynamic-other-switch', 'ou_b', '/bot analyst'), /没有使用 @analyst 的权限/u)
+    assert.match(await send('dynamic-edit', 'ou_a', '/bot edit analyst title 高级数据分析师'), /已更新 @analyst/u)
+    assert.equal((await gateway.registry.getByHandle('analyst'))?.revision.title, '高级数据分析师')
+    assert.match(await send('dynamic-disable', 'ou_a', '/bot disable analyst'), /已停用 @analyst/u)
+    assert.equal(gateway.directory.get('analyst'), undefined)
+    assert.match(await send('dynamic-enable', 'ou_a', '/bot enable analyst'), /已重新启用 @analyst/u)
+    assert.ok(gateway.directory.get('analyst'))
+    assert.match(await send('dynamic-delete-warning', 'ou_a', '/bot delete analyst'), /确定后发送/u)
+    assert.match(await send('dynamic-delete', 'ou_a', '/bot delete analyst confirm'), /已删除 @analyst/u)
+    assert.equal((await gateway.registry.getByHandle('analyst'))?.definition.status, 'deleted')
+    assert.equal(gateway.directory.get('analyst'), undefined)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('normal Hermes Agent receives a scoped natural-language Bot draft tool with no owner or ACL arguments', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-dynamic-tool-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registeredTools = new Map()
+    let liveAgent
+    const agentRegistry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, agentOptions, setup }) {
+        const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
+        const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
+        if (setup) await setup(agentCtx)
+        liveAgent = {
+          id: String(sessionId), ctx: agentCtx, status: 'idle', options: agentOptions ?? {}, cancel() {}, followup() {},
+        }
+        agents.set(String(sessionId), liveAgent)
+        return { agent: liveAgent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? agentRegistry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_tool'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+    })
+    let inbound
+    const transport = {
+      platform: 'feishu', async start(handler) { inbound = handler }, async stop() {}, async send() {},
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    await inbound({
+      id: 'dynamic-tool-message',
+      target: { platform: 'feishu', chatId: 'oc_tool', chatType: 'dm', userId: 'ou_tool' },
+      text: '帮我创建一个专门做研究的 Bot',
+      receivedAt: Date.now(),
+    })
+    const deadline = Date.now() + 2_000
+    while (!registeredTools.has('bot_create_draft') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    const createTool = registeredTools.get('bot_create_draft')
+    const updateTool = registeredTools.get('bot_update_draft')
+    assert.ok(createTool)
+    assert.ok(updateTool)
+    assert.equal('ownerId' in createTool.parameters.properties, false)
+    assert.equal('allowedUserIds' in createTool.parameters.properties, false)
+    assert.equal('ownerId' in updateTool.parameters.properties, false)
+    const execution = {
+      signal: new AbortController().signal,
+      agent: liveAgent,
+      concludeTurn() {},
+      deferContext() {},
+    }
+    const result = await createTool.execute({
+      handle: 'research-helper', title: '研究助手', role: 'worker', capabilities: ['research'],
+    }, execution)
+    assert.equal(result.status, 'draft')
+    assert.match(result.confirmationCode, /^[A-Z0-9]{8}$/u)
+    assert.deepEqual((await gateway.registry.get(result.botId))?.revision.allowedUserIds, ['ou_tool'])
+    const updated = await updateTool.execute({
+      handle: 'research-helper', title: '高级研究助手', capabilities: ['research', 'review'],
+    }, execution)
+    assert.equal(updated.version, 2)
+    assert.notEqual(updated.confirmationCode, result.confirmationCode)
+    assert.equal((await gateway.registry.get(result.botId))?.revision.title, '高级研究助手')
+    await assert.rejects(createTool.execute({
+      handle: 'unsafe-bot', title: 'Unsafe', soul: `Use ${'sk-' + 'x'.repeat(32)}`,
+    }, execution), /credential|API keys/u)
+    assert.equal(await gateway.resolveApproval(result.confirmationCode, 'approved', 'user:feishu:ou_tool'), undefined)
+    assert.equal((await gateway.registry.get(result.botId))?.definition.status, 'draft')
+    await gateway.resolveApproval(updated.confirmationCode, 'approved', 'user:feishu:ou_tool')
+    assert.equal(gateway.directory.canInvoke('research-helper', { platform: 'feishu', chatId: 'oc_tool', userId: 'ou_tool' }), true)
+  } finally {
+    if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
   }
 })
