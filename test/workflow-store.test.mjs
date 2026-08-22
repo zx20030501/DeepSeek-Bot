@@ -59,6 +59,7 @@ test('persists immutable revisions across reload and repairs a torn JSONL tail',
     await appendFile(file, '{"schemaVersion":1,"eventId":"torn"', 'utf8')
     const recovered = new WorkflowStore(file)
     assert.equal((await recovered.get(created.id, { actorId: 'user:a' }))?.revision, updated.revision)
+    assert.equal((await recovered.getRevision(created.id, 1, { actorId: 'user:a' }))?.description, created.description)
     const repaired = await recovered.update(created.id, { description: 'revision three' }, 'user:a', 2, 'update-3', 300)
     assert.equal(repaired.revision, 3)
   })

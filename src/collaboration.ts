@@ -637,10 +637,12 @@ export interface CreateTaskInput {
   readonly roomId?: string
   /** Durable linkage for a compiled Workflow task DAG. */
   readonly workflowDefinitionId?: string
+  readonly workflowRevision?: number
   readonly workflowRunId?: string
   readonly workflowNodeId?: string
   readonly workflowReplyTarget?: BotTarget
   readonly workflowTraceId?: string
+  readonly workflowInputs?: Record<string, unknown>
 }
 
 /** Durable Task/Run/Handoff state machine and append-only audit trail. */
@@ -683,10 +685,12 @@ export class TaskRunStore {
       priority: Math.max(0, Math.min(100, Math.floor(input.priority ?? 50))),
       ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
       ...(input.workflowDefinitionId === undefined ? {} : { workflowDefinitionId: input.workflowDefinitionId }),
+      ...(input.workflowRevision === undefined ? {} : { workflowRevision: input.workflowRevision }),
       ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
       ...(input.workflowNodeId === undefined ? {} : { workflowNodeId: input.workflowNodeId }),
       ...(input.workflowReplyTarget === undefined ? {} : { workflowReplyTarget: { ...input.workflowReplyTarget } }),
       ...(input.workflowTraceId === undefined ? {} : { workflowTraceId: input.workflowTraceId }),
+      ...(input.workflowInputs === undefined ? {} : { workflowInputs: structuredClone(input.workflowInputs) }),
       status: 'pending',
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -1070,7 +1074,7 @@ export class TaskRunStore {
   public async task(id: string): Promise<TaskRecord | undefined> {
     await this.load()
     const task = this.tasks.get(id)
-    return task && { ...task, acceptanceCriteria: [...task.acceptanceCriteria] }
+    return task && this.cloneTask(task)
   }
 
   public async run(id: string): Promise<RunRecord | undefined> {
@@ -1122,7 +1126,7 @@ export class TaskRunStore {
   }> {
     await this.load()
     return {
-      tasks: [...this.tasks.values()].map(task => ({ ...task, acceptanceCriteria: [...task.acceptanceCriteria] })),
+      tasks: [...this.tasks.values()].map(task => this.cloneTask(task)),
       runs: [...this.runs.values()],
       handoffs: [...this.handoffs.values()].map(handoff => ({ ...handoff, replyTarget: { ...handoff.replyTarget } })),
       workflows: [...this.workflows.values()].map(workflow => this.cloneWorkflow(workflow)),
@@ -1183,6 +1187,15 @@ export class TaskRunStore {
   private async recordTask(task: TaskRecord): Promise<void> {
     this.tasks.set(task.id, task)
     await this.journal.append({ kind: 'task', task })
+  }
+
+  private cloneTask(task: TaskRecord): TaskRecord {
+    return {
+      ...task,
+      acceptanceCriteria: [...task.acceptanceCriteria],
+      ...(task.workflowReplyTarget === undefined ? {} : { workflowReplyTarget: { ...task.workflowReplyTarget } }),
+      ...(task.workflowInputs === undefined ? {} : { workflowInputs: structuredClone(task.workflowInputs) }),
+    }
   }
 
   private async recordRun(run: RunRecord): Promise<void> {

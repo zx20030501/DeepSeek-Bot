@@ -84,6 +84,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
 }
 
 export { BotGateway, discoveryCandidateFor } from './gateway.js'
+export type { WorkflowLaunchOptions } from './gateway.js'
 export { InboundWal, Outbox } from './durable.js'
 export {
   BotDirectory,

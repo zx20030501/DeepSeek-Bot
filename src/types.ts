@@ -341,10 +341,14 @@ export interface TaskRecord {
   readonly roomId?: string
   /** Durable linkage for the compiled Workflow task runtime. */
   readonly workflowDefinitionId?: string
+  /** Definition revision pinned when this Workflow run was launched. */
+  readonly workflowRevision?: number
   readonly workflowRunId?: string
   readonly workflowNodeId?: string
   readonly workflowReplyTarget?: BotTarget
   readonly workflowTraceId?: string
+  /** JSON-safe launch inputs retained for restart-safe data-flow resolution. */
+  readonly workflowInputs?: Record<string, unknown>
   readonly status: TaskStatus
   readonly currentRunId?: string
   readonly createdAt: number
