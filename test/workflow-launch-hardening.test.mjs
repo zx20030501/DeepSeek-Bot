@@ -81,8 +81,8 @@ test('initial workflow entry dispatch honors maxParallel', async () => {
     ], 'root', { maxParallel: 1, maxFanOut: 2 }), owner)
     const launch = await gateway.launchWorkflowDefinition(definition.id, owner, target, owner, { launchId: 'parallel-entry' })
     assert.equal(launch.dispatched.length, 1)
-    const status = await gateway.fleetStatus()
-    const nodeTasks = status.fleet.tasks.filter(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId !== '__root__')
+    const snapshot = await gateway.tasks.snapshot()
+    const nodeTasks = snapshot.tasks.filter(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId !== '__root__')
     assert.equal(nodeTasks.length, 1)
   })
 })
@@ -100,8 +100,8 @@ test('same workflow launchId creates one durable root and one delivery', async (
     assert.equal(launches[0].rootTaskId, launches[1].rootTaskId)
     assert.equal(launches[0].dispatched.length, 1)
     assert.equal(launches[1].dispatched.length, 1)
-    const status = await gateway.fleetStatus()
-    const roots = status.fleet.tasks.filter(task => (
+    const snapshot = await gateway.tasks.snapshot()
+    const roots = snapshot.tasks.filter(task => (
       task.workflowRunId === launches[0].workflowRunId && task.workflowNodeId === '__root__'
     ))
     assert.equal(roots.length, 1)
