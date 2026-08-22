@@ -165,7 +165,7 @@ BotMesh 内部 Bot Session 还会获得受限 DSH Tool `bot_fleet_handoff`。模
 - `/bots`：可用 roster；
 - `/bot create <id> [名称]`：创建当前用户私有草稿；
 - `/bot confirm <code>`：确认并激活草稿；
-- `/bot list`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable`、`/bot delete`：管理动态 Bot；
+- `/bot list`、`/bot status`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable`、`/bot delete`：管理动态 Bot；`/bot status` 会返回 Fleet membership、当前 Revision、忙碌 Run 和最近失败原因；
 - `/fleet <任务>`：自动工作流；
 - `/tasks`：最近 Task；
 - `/task <id>`：按需查看自己 Task 的完整详情、Run、Handoff 和 Workflow；
@@ -175,7 +175,7 @@ BotMesh 内部 Bot Session 还会获得受限 DSH Tool `bot_fleet_handoff`。模
 - `/approve`、`/reject`：处理审批；
 - `/mesh`：Mailbox、Task、Run、Handoff、Workflow 和运行数量。
 
-本机控制台显示 Bot、动态 Bot Registry、活动 Run、Workflow、Task、审批和 dead-letter。动态 Bot 草稿可一键确认激活，已激活 Bot 可停用、重新启用或删除。普通停用/删除不会强制取消工作：只要该 Bot 仍有未结束 Task、Mailbox、Workflow、Handoff、Room，或直接聊天 Agent 正在运行/排队，操作就会被拒绝；Fleet Task 应先等待或用 `/cancel <任务ID>`，直接聊天回合应在对应会话发送 `/stop`。动态 Bot 的直接会话索引会保存在 `state.json`，所以插件重载后仍能保护已切走但尚未结束的回合，即使当前未启用消息 Transport；如果 Agent 服务暂时不可用，系统会保守拒绝停用/删除，而不会把未知状态当作空闲。已解绑且不再忙的旧索引会在下一次相关生命周期检查时自动清理。插件停止会先关闭所有新的持久化变更入口并取消尚未触发的 Mailbox 心跳，再排空已进入的心跳和其他统一 mutation lease、生命周期/命名空间事务及各任务 lane；完成后旧实例不再写入 Registry、审批、Task、Mailbox、配对或设置。同一 Gateway 再次启动时会按当前配置重建 Transport。Task 行可按需展开详情、取消或重放；取消和删除前会二次确认。常规 2 秒状态刷新只携带短标题和状态，不携带完整指令、结果、SOUL 或模型输出；只有点击任务详情时才读取完整内容。重放会创建全新身份并重新检查当前 ACL；聊天发起的重放继续遵守审批策略，本机管理员的明确点击本身视为人工批准，不会复活旧 Run。本机控制台是受信管理员入口；聊天命令只允许原请求者操作自己的 Task 和动态 Bot。持久化文件位于：
+本机控制台显示 Bot、动态 Bot Registry、活动 Run、Workflow、Task、审批和 dead-letter；动态 Registry 支持按已加入、受阻、忙碌、草稿、停用和删除状态筛选。动态 Bot 草稿可一键确认激活，已激活 Bot 可停用、重新启用或删除。普通停用/删除不会强制取消工作：只要该 Bot 仍有未结束 Task、Mailbox、Workflow、Handoff、Room，或直接聊天 Agent 正在运行/排队，操作就会被拒绝；Fleet Task 应先等待或用 `/cancel <任务ID>`，直接聊天回合应在对应会话发送 `/stop`。动态 Bot 的直接会话索引会保存在 `state.json`，所以插件重载后仍能保护已切走但尚未结束的回合，即使当前未启用消息 Transport；如果 Agent 服务暂时不可用，系统会保守拒绝停用/删除，而不会把未知状态当作空闲。已解绑且不再忙的旧索引会在下一次相关生命周期检查时自动清理。插件停止会先关闭所有新的持久化变更入口并取消尚未触发的 Mailbox 心跳，再排空已进入的心跳和其他统一 mutation lease、生命周期/命名空间事务及各任务 lane；完成后旧实例不再写入 Registry、审批、Task、Mailbox、配对或设置。同一 Gateway 再次启动时会按当前配置重建 Transport。Task 行可按需展开详情、取消或重放；取消和删除前会二次确认。常规 2 秒状态刷新只携带短标题和状态，不携带完整指令、结果、SOUL 或模型输出；只有点击任务详情时才读取完整内容。重放会创建全新身份并重新检查当前 ACL；聊天发起的重放继续遵守审批策略，本机管理员的明确点击本身视为人工批准，不会复活旧 Run。本机控制台是受信管理员入口；聊天命令只允许原请求者操作自己的 Task 和动态 Bot。持久化文件位于：
 
 ```text
 ${DSH_HOME:-~/.dsh}/hermes-bot/

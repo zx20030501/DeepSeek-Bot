@@ -13,7 +13,7 @@ The implemented product path is:
 5. The Bot is immediately eligible for direct `@bot` routing, `/fleet` planning, `@manager` delegation, enabled Peer Messaging, and enabled saved Workflow capability selection.
 6. The same Fleet membership is reconstructed from local durable state after restart.
 
-This is a complete single-node dynamic-enrollment path. It is not a claim that the project already provides xAI's unpublished infrastructure, hundreds of simultaneous model sessions, or distributed execution.
+As of main after PR #18, the local console and owner chat also expose Fleet membership reason, bounded active-Run health, recent failure context, and roster filters. This is a complete single-node dynamic-enrollment path. It is not a claim that the project already provides xAI's unpublished infrastructure, hundreds of simultaneous model sessions, or distributed execution.
 
 ## Architecture
 
@@ -125,7 +125,7 @@ Google Drive is only for large development artifacts such as disposable stress l
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Chat create/edit/clone/confirm/disable/enable/delete | Implemented | Draft-first and owner-confirmed |
-| Automatic Fleet enrollment | Implemented | Owner-scoped runtime projection with status and audit |
+| Automatic Fleet enrollment | Implemented | Owner-scoped runtime projection with status and audit |\n| Fleet health projection and roster filters | Implemented | Membership reason, bounded active Runs, latest failure, and local-console filters |
 | Direct dynamic `@bot` invocation | Implemented | Uses the same Task/Run/Mailbox path as static Bots |
 | Dynamic Bot to authorized Bot `@mention` | Implemented behind gate | TTL, hop, visited, ACL, approval, idempotency, and size bounds |
 | User `@manager` planning | Implemented behind gate | Deterministic policy; plan first, then bounded dispatch |
@@ -199,6 +199,8 @@ Rollback: disable new Workflow admission. Let already-admitted pinned revisions 
 ## Long-running development plan
 
 ### Phase A — Product hardening
+
+Progress on main: PR #18 delivered membership reasons, bounded Bot activity and failure projection, roster filters, and owner-facing `/bot status <id>`. Remaining Phase A work is explicit Team membership commands, complete help/setup gate explanations, and manual Feishu/Telegram acceptance.
 
 Deliverables:
 
@@ -299,7 +301,7 @@ Exit gate: operators can detect, contain, recover, and explain a failed Fleet ru
 
 ## 当前结论
 
-当前集成方案已经打通“聊天创建草稿 → 用户确认 → 激活不可变 Revision → 自动投影到用户私有 Fleet roster → 参与直接调用、Peer、Manager、`/fleet` 和 Workflow → 重启恢复”的单机完整链路。
+当前集成方案已经打通“聊天创建草稿 → 用户确认 → 激活不可变 Revision → 自动投影到用户私有 Fleet roster → 参与直接调用、Peer、Manager、`/fleet` 和 Workflow → 重启恢复”的单机完整链路。PR #18 又补充了加入原因、忙碌 Run、最近失败信息、Roster 筛选和聊天 `/bot status <id>`，使用户可以直接核实 Fleet 状态。
 
 这里的“自动加入 Fleet”不是把 Bot 强制加入所有 Team，而是加入该所有者可见、受 ACL 约束的逻辑 Bot 目录。Team 是最多六名成员的任务治理对象，仍需显式维护；这样不会因为创建一个 Bot 而偷偷扩大既有 Team 的权限和并发范围。
 
