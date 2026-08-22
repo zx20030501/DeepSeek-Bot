@@ -276,6 +276,6 @@ export function workflowNode(plan: WorkflowLaunchPlan, nodeId: string): Workflow
   return plan.nodes.find(node => node.nodeId === nodeId)
 }
 
-export function workflowDispatchKey(workflowId: string, revision: number, nodeId: string): string {
-  return 'workflow:' + normalizeId(workflowId, 'workflowId') + ':revision:' + revision + ':node:' + normalizeId(nodeId, 'nodeId') + ':' + stableHash({ workflowId, revision, nodeId })
+export function workflowDispatchKey(workflowId: string, revision: number, nodeId: string, workflowRunId = 'legacy'): string {
+  return 'workflow:' + normalizeId(workflowId, 'workflowId') + ':revision:' + revision + ':run:' + normalizeId(workflowRunId, 'workflowRunId') + ':node:' + normalizeId(nodeId, 'nodeId') + ':' + stableHash({ workflowId, revision, workflowRunId, nodeId })
 }

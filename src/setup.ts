@@ -33,6 +33,14 @@ export interface HermesBotSettings {
     maxGroupMessages: number
     maxParallelRuns: number
     botRunMaxAttempts: number
+    features: {
+      dynamicRegistry: boolean
+      chatBotCreation: boolean
+      peerMessaging: boolean
+      managerAgent: boolean
+      savedWorkflows: boolean
+      externalRuntimes: boolean
+    }
   }
   profiles: HermesBotProfileSettings[]
 }
@@ -95,6 +103,21 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
     maxGroupMessages: z.number().default(10),
     maxParallelRuns: z.number().default(6),
     botRunMaxAttempts: z.number().default(3),
+    features: z.object({
+      dynamicRegistry: z.boolean().default(false),
+      chatBotCreation: z.boolean().default(false),
+      peerMessaging: z.boolean().default(false),
+      managerAgent: z.boolean().default(false),
+      savedWorkflows: z.boolean().default(false),
+      externalRuntimes: z.boolean().default(false),
+    }).default({
+      dynamicRegistry: false,
+      chatBotCreation: false,
+      peerMessaging: false,
+      managerAgent: false,
+      savedWorkflows: false,
+      externalRuntimes: false,
+    }),
   }),
   profiles: z.array(ProfileSettingsSchema).default([]),
 })
@@ -151,6 +174,15 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
       maxGroupMessages: config.collaboration?.maxGroupMessages ?? 10,
       maxParallelRuns: config.collaboration?.maxParallelRuns ?? 6,
       botRunMaxAttempts: config.collaboration?.botRunMaxAttempts ?? 3,
+      features: {
+        dynamicRegistry: config.collaboration?.features?.dynamicRegistry === true,
+        chatBotCreation: config.collaboration?.features?.dynamicRegistry === true
+          && config.collaboration?.features?.chatBotCreation === true,
+        peerMessaging: config.collaboration?.features?.peerMessaging === true,
+        managerAgent: config.collaboration?.features?.managerAgent === true,
+        savedWorkflows: config.collaboration?.features?.savedWorkflows === true,
+        externalRuntimes: config.collaboration?.features?.externalRuntimes === true,
+      },
     },
     profiles: Object.entries(config.profiles ?? {}).map(([id, profile]) => profileSettings(id, profile)),
   }
@@ -165,6 +197,7 @@ export function gatewayConfigFromSettings(
   // Saved settings from pre-Fleet versions do not contain these sections.
   const projected = settingsFromGatewayConfig(base)
   const collaboration = settings.collaboration ?? projected.collaboration
+  const collaborationFeatures = collaboration.features ?? projected.collaboration.features
   const profileRows = settings.profiles ?? projected.profiles
   const profiles: Record<string, Omit<BotProfile, 'name'>> = {}
   for (const profile of profileRows) {
@@ -218,6 +251,15 @@ export function gatewayConfigFromSettings(
       maxGroupMessages: Math.max(2, Math.min(100, Math.floor(collaboration.maxGroupMessages))),
       maxParallelRuns: Math.max(1, Math.min(6, Math.floor(collaboration.maxParallelRuns))),
       botRunMaxAttempts: Math.max(1, Math.min(10, Math.floor(collaboration.botRunMaxAttempts))),
+      features: {
+        ...base.collaboration?.features,
+        dynamicRegistry: collaborationFeatures.dynamicRegistry,
+        chatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.chatBotCreation,
+        peerMessaging: collaborationFeatures.peerMessaging,
+        managerAgent: collaborationFeatures.managerAgent,
+        savedWorkflows: collaborationFeatures.savedWorkflows,
+        externalRuntimes: collaborationFeatures.externalRuntimes,
+      },
     },
   }
 }

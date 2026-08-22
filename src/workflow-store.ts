@@ -99,6 +99,8 @@ function isStoreEvent(value: unknown): value is WorkflowStoreEvent {
 export class WorkflowStore {
   private readonly journal: JsonlJournal<WorkflowStoreEvent>
   private readonly workflows = new Map<string, WorkflowDefinition>()
+  /** Immutable revision index used by in-flight Workflow runs. */
+  private readonly revisions = new Map<string, Map<number, WorkflowDefinition>>()
   private readonly operations = new Map<string, OperationRecord>()
   private readonly eventIds = new Set<string>()
   private loaded = false
@@ -183,6 +185,23 @@ export class WorkflowStore {
   ): Promise<WorkflowDefinition | undefined> {
     await this.load()
     const workflow = this.workflows.get(workflowId)
+    if (workflow === undefined || (!includeDeleted && workflow.status === 'deleted')) return undefined
+    if (context !== undefined && !visibleTo(workflow, context)) return undefined
+    return clone(workflow)
+  }
+
+  /**
+   * Resolve the exact immutable revision captured by a Workflow run. This is
+   * intentionally separate from get(), which returns the current revision.
+   */
+  public async getRevision(
+    workflowId: string,
+    revision: number,
+    context?: WorkflowVisibilityContext,
+    includeDeleted = false,
+  ): Promise<WorkflowDefinition | undefined> {
+    await this.load()
+    const workflow = this.revisions.get(workflowId)?.get(revision)
     if (workflow === undefined || (!includeDeleted && workflow.status === 'deleted')) return undefined
     if (context !== undefined && !visibleTo(workflow, context)) return undefined
     return clone(workflow)
@@ -354,6 +373,12 @@ export class WorkflowStore {
 
   private apply(event: WorkflowStoreEvent): void {
     if (this.eventIds.has(event.eventId)) return
+    let history = this.revisions.get(event.workflow.id)
+    if (history === undefined) {
+      history = new Map<number, WorkflowDefinition>()
+      this.revisions.set(event.workflow.id, history)
+    }
+    if (!history.has(event.workflow.revision)) history.set(event.workflow.revision, clone(event.workflow))
     const current = this.workflows.get(event.workflow.id)
     if (current !== undefined && current.revision >= event.workflow.revision) {
       this.eventIds.add(event.eventId)
@@ -379,7 +404,7 @@ export class WorkflowStore {
     const existing = this.operations.get(key)
     if (existing === undefined) return undefined
     if (existing.fingerprint !== fingerprint) throw new WorkflowStoreError('WORKFLOW_IDEMPOTENCY_CONFLICT', 'Idempotency key was already used for a different operation')
-    return this.workflows.get(existing.workflowId)
+    return this.revisions.get(existing.workflowId)?.get(existing.revision) ?? this.workflows.get(existing.workflowId)
   }
 
   private requireCurrent(workflowId: string): WorkflowDefinition {

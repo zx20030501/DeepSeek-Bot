@@ -19,6 +19,13 @@ interface AgentRegistryLike {
 
 type AgentSetupLike = (agentCtx: Context) => void | Promise<void>
 
+export interface AgentDispatchIdentity {
+  /** Turn that the next ordinary follow-up will open. */
+  readonly turn: number
+  /** Events appended before dispatch are stale even if delivered later. */
+  readonly eventSeqFloor: number
+}
+
 interface CommandRuntimeLike {
   execute(agent: Agent, line: string, signal: AbortSignal): Promise<{
     result: { kind: string; text?: string }
@@ -101,6 +108,15 @@ export class HarnessBridge {
     return this.agents.get(sessionId)
   }
 
+  /** A running turn or queued inbox item is lifecycle-active work. */
+  public isBusy(sessionId: SessionId): boolean {
+    const agent = this.agents.get(sessionId) as unknown as {
+      readonly status?: unknown
+      readonly inbox?: { readonly hasPending?: unknown }
+    } | undefined
+    return agent?.status === 'running' || agent?.inbox?.hasPending === true
+  }
+
   public async resumeOrCreate(
     sessionId: SessionId,
     profile: BotProfile,
@@ -162,8 +178,31 @@ export class HarnessBridge {
     legacy.send(message, { kind: 'next-turn' }, true)
   }
 
+  /** Bind one Fleet delivery to the next concrete DSH turn before followup(). */
+  public dispatchIdentity(agent: Agent): AgentDispatchIdentity {
+    const session = agent.session
+    let latestTurn = 0
+    for (let index = session.events.length - 1; index >= 0; index -= 1) {
+      const event = session.events[index]
+      if (event === null || typeof event !== 'object') continue
+      const data = (event as { readonly data?: unknown }).data
+      if (data === null || typeof data !== 'object') continue
+      const turn = (data as { readonly turn?: unknown }).turn
+      if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn >= 1) {
+        latestTurn = turn
+        break
+      }
+    }
+    return { turn: latestTurn + 1, eventSeqFloor: session.seq }
+  }
+
   public stop(agent: Agent): void {
     agent.cancel({ kind: 'user' })
+  }
+
+  public async waitUntilIdle(agent: Agent): Promise<void> {
+    const candidate = agent as unknown as { whenIdle?: () => Promise<void> }
+    if (typeof candidate.whenIdle === 'function') await candidate.whenIdle()
   }
 
   public async executeDshCommand(agent: Agent, line: string, signal: AbortSignal): Promise<string | undefined> {

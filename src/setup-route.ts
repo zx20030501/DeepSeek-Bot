@@ -15,6 +15,7 @@ import type {
   FleetTaskDetail,
   GatewayDiscoveryCandidate,
   GatewayDiscoveryStatus,
+  BotRegistryEntry,
   TaskRecord,
 } from './types.js'
 import { isTrustedLocalRequest } from './setup-security.js'
@@ -42,6 +43,9 @@ export interface SetupRouteActions {
   fleetTaskDetail?: (taskId: string) => Promise<FleetTaskDetail | undefined>
   cancelFleetTask?: (taskId: string) => Promise<TaskRecord | undefined>
   replayFleetTask?: (taskId: string) => Promise<FleetReplayResult | undefined>
+  setDynamicBotStatus?: (botId: string, status: 'active' | 'disabled' | 'deleted') => Promise<BotRegistryEntry | undefined>
+  validateStaticProfiles?: (handles: readonly string[]) => Promise<void>
+  saveAndApplySettings?: (settings: HermesBotSettings, appSecret?: string) => Promise<void>
 }
 
 class SetupRequestError extends Error {
@@ -146,6 +150,7 @@ async function handleRequest(
     && action !== 'fleet_task_detail'
     && action !== 'fleet_task_cancel'
     && action !== 'fleet_task_replay'
+    && action !== 'bot_registry_status'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -182,9 +187,18 @@ async function handleRequest(
     const approval = await actions.resolveFleetApproval(code, decision)
     if (approval === undefined) throw new SetupRequestError(404, '审批不存在、已处理或已过期。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
+    const fleet = snapshot.diagnostics.fleet as { registryBots?: Array<{ id?: string; status?: string; runtimeReady?: boolean }> } | undefined
+    const activationTarget = approval.kind === 'bot-activation'
+      ? fleet?.registryBots?.find(bot => bot.id === approval.entityId)
+      : undefined
+    const activationApplied = activationTarget?.status === 'active' && activationTarget.runtimeReady === true
     sendJson(res, 200, {
       ...snapshot,
-      message: approval.status === 'approved' ? '已批准，Fleet 正在继续执行。' : approval.status === 'rejected' ? '已拒绝该 Fleet 操作。' : '该审批已过期。',
+      message: approval.kind === 'bot-activation'
+        ? approval.status === 'approved'
+          ? activationApplied ? '已确认并激活动态 Bot。' : '该批准对应的草稿版本已变化，因此没有激活。请刷新后确认新的 8 位码。'
+          : approval.status === 'rejected' ? '已拒绝激活；Bot 仍保留为草稿。' : '该 Bot 激活码已过期。'
+        : approval.status === 'approved' ? '已批准，Fleet 正在继续执行。' : approval.status === 'rejected' ? '已拒绝该 Fleet 操作。' : '该审批已过期。',
     })
     return
   }
@@ -221,6 +235,23 @@ async function handleRequest(
     })
     return
   }
+  if (action === 'bot_registry_status') {
+    const botId = typeof body.botId === 'string' ? body.botId.trim() : ''
+    const status = body.status === 'active' || body.status === 'disabled' || body.status === 'deleted' ? body.status : undefined
+    if (botId === '' || status === undefined) throw new SetupRequestError(400, '缺少动态 Bot ID 或目标状态。')
+    if (actions.setDynamicBotStatus === undefined) throw new SetupRequestError(503, '动态 Bot 管理服务还没有准备好。')
+    let bot: BotRegistryEntry | undefined
+    try {
+      bot = await actions.setDynamicBotStatus(botId, status)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    if (bot === undefined) throw new SetupRequestError(404, '没有找到这个动态 Bot。')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    const verb = status === 'active' ? '启用' : status === 'disabled' ? '停用' : '删除'
+    sendJson(res, 200, { ...snapshot, message: `已${verb} @${bot.definition.handle}。` })
+    return
+  }
   let settings: HermesBotSettings
   try {
     settings = HermesBotSettingsSchema(body.settings as HermesBotSettings)
@@ -235,6 +266,13 @@ async function handleRequest(
     }
     if (profileIds.has(id)) throw new SetupRequestError(400, `Bot ID 重复：${id}`)
     profileIds.add(id)
+  }
+  if (actions.validateStaticProfiles !== undefined) {
+    try {
+      await actions.validateStaticProfiles([...profileIds])
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
   }
   const appSecret = typeof body.appSecret === 'string' ? body.appSecret.trim() : ''
   if (settings.feishu.appId.trim() === '') {
@@ -279,10 +317,14 @@ async function handleRequest(
     throw new SetupRequestError(503, 'DSH 凭据服务不可用。')
   }
 
-  if (appSecret !== '') {
-    await credentials!.set(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any, appSecret)
+  try {
+    if (actions.saveAndApplySettings === undefined) throw new Error('设置事务服务还没有准备好，请稍后再试。')
+    await actions.saveAndApplySettings(settings, appSecret === '' ? undefined : appSecret)
+  } catch {
+    // Provider/runtime errors are not safe response text: an implementation may
+    // include the submitted or previous credential in its Error.message.
+    throw new SetupRequestError(409, '设置没有生效，也没有保留半完成配置。请检查 App ID、App Secret 和本机服务状态后重试。')
   }
-  await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, settings)
   const discovery = action === 'diagnose' ? actions.beginDiscovery!() : undefined
   if (action === 'save') actions.clearDiscovery?.()
   const snapshot = await readSnapshot(ctx, source, diagnostics)

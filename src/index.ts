@@ -27,17 +27,91 @@ export function apply(ctx: Context, config: unknown = {}): void {
   const gateway = new BotGateway(ctx, baseConfig)
 
   const logger = (ctx as unknown as { logger?: { error?: (message: string) => void } }).logger
-  let refreshTail = Promise.resolve()
-  const refreshGateway = (): void => {
-    refreshTail = refreshTail.then(async () => {
-      const credentials = ctx.get('credentials')
-      const secret = credentials === undefined
-        ? undefined
-        : (await credentials.resolve(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any))?.value
-      await gateway.reconfigure(gatewayConfigFromSettings(baseConfig, settingsSource(), secret))
-    }).catch(error => {
+  let refreshTail: Promise<void> = Promise.resolve()
+  let refreshSuppression = 0
+  let refreshRequested = false
+  const runGatewayRefresh = async (): Promise<void> => {
+    const credentials = ctx.get('credentials')
+    const secret = credentials === undefined
+      ? undefined
+      : (await credentials.resolve(credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any))?.value
+    await gateway.reconfigure(gatewayConfigFromSettings(baseConfig, settingsSource(), secret))
+  }
+  const enqueueGatewayRefresh = (): Promise<void> => {
+    const run = refreshTail.catch(() => undefined).then(runGatewayRefresh)
+    refreshTail = run.then(() => undefined, () => undefined)
+    return run
+  }
+  const requestGatewayRefresh = (): void => {
+    if (refreshSuppression > 0) {
+      refreshRequested = true
+      return
+    }
+    void enqueueGatewayRefresh().catch(error => {
       logger?.error?.(`[dsh-hermes-bot] settings apply failed: ${String(error)}`)
     })
+  }
+
+  let settingsCommitTail: Promise<void> = Promise.resolve()
+  const saveAndApplySettings = (nextSettings: HermesBotSettings, appSecret?: string): Promise<void> => {
+    const run = settingsCommitTail.catch(() => undefined).then(async () => {
+      const settingsProvider = ctx.get('settings')
+      const credentials = ctx.get('credentials')
+      if (settingsProvider === undefined || credentials === undefined) throw new Error('DSH 设置或凭据服务不可用。')
+      const secretRef = credentialRef(HERMES_BOT_FEISHU_SECRET_REF) as any
+      const previousSettings = structuredClone(settingsSource())
+      const previousCredential = await credentials.resolve(secretRef)
+      const previousSecret = previousCredential?.value
+      const nextSecret = appSecret ?? previousSecret
+      const nextConfig = gatewayConfigFromSettings(baseConfig, nextSettings, nextSecret)
+      let settingsWriteAttempted = false
+      let secretWriteAttempted = false
+      refreshSuppression += 1
+      try {
+        await gateway.reconfigureAndCommit(
+          nextConfig,
+          async () => {
+            if (appSecret !== undefined && appSecret !== previousSecret) {
+              secretWriteAttempted = true
+              await credentials.set(secretRef, appSecret)
+            }
+            settingsWriteAttempted = true
+            await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, nextSettings)
+          },
+          async () => {
+            const rollbackErrors: unknown[] = []
+            if (settingsWriteAttempted) {
+              try {
+                await settingsProvider.replace(HERMES_BOT_SETTINGS_NAMESPACE, previousSettings)
+              } catch (error: unknown) {
+                rollbackErrors.push(error)
+              }
+            }
+            if (secretWriteAttempted) {
+              try {
+                if (previousSecret === undefined) await credentials.unset(secretRef)
+                else await credentials.set(secretRef, previousSecret)
+              } catch (error: unknown) {
+                rollbackErrors.push(error)
+              }
+            }
+            if (rollbackErrors.length > 0) throw new AggregateError(rollbackErrors, '持久设置回滚失败。')
+          },
+        )
+      } catch (error: unknown) {
+        // reconfigureAndCommit already restored the previous runtime and invokes
+        // the durable rollback callback before releasing the namespace lane.
+        throw error
+      } finally {
+        refreshSuppression -= 1
+        if (refreshSuppression === 0 && refreshRequested) {
+          refreshRequested = false
+          requestGatewayRefresh()
+        }
+      }
+    })
+    settingsCommitTail = run.then(() => undefined, () => undefined)
+    return run
   }
 
   installSettingsSection(
@@ -47,7 +121,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
     settingsFromGatewayConfig(baseConfig),
     {
       setSource: (source: () => HermesBotSettings) => { settingsSource = source },
-      onChange: () => { refreshGateway() },
+      onChange: () => { requestGatewayRefresh() },
     },
   )
   installSetupRoute(ctx, () => settingsSource(), () => gateway.fleetStatus(), {
@@ -60,18 +134,21 @@ export function apply(ctx: Context, config: unknown = {}): void {
     fleetTaskDetail: taskId => gateway.fleetTaskDetail(taskId),
     cancelFleetTask: taskId => gateway.cancelFleetTask(taskId),
     replayFleetTask: taskId => gateway.replayFleetTask(taskId),
+    setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
+    validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
+    saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
     const credentialEvents = credentialsCtx as unknown as {
       on: (event: string, listener: (ref: unknown) => void) => unknown
     }
     credentialEvents.on('credentials/updated', (ref) => {
-      if (String(ref) === HERMES_BOT_FEISHU_SECRET_REF) refreshGateway()
+      if (String(ref) === HERMES_BOT_FEISHU_SECRET_REF) requestGatewayRefresh()
     })
     // The settings scope can attach before the credential service finishes
     // becoming available. Re-apply once here so a saved App Secret also
     // starts the transport after a DSH restart, not only after a form save.
-    refreshGateway()
+    requestGatewayRefresh()
   })
 
   ctx.on('session/event', (session, event) => gateway.onSessionEvent(session, event))
@@ -84,6 +161,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
 }
 
 export { BotGateway, discoveryCandidateFor } from './gateway.js'
+export type { WorkflowLaunchOptions } from './gateway.js'
 export { InboundWal, Outbox } from './durable.js'
 export {
   BotDirectory,
@@ -136,6 +214,16 @@ export {
 } from './workflow-schema.js'
 export { WorkflowStore } from './workflow-store.js'
 export type * from './fleet-v2-types.js'
+export { BotRegistry } from './bot-registry.js'
+export type { BotRegistryStats } from './bot-registry.js'
+export { TeamStore } from './team-store.js'
+export type {
+  CreateAgentThreadInput,
+  CreateTeamInput,
+  TeamStoreStats,
+  UpdateAgentThreadInput,
+  UpdateTeamInput,
+} from './team-store.js'
 export { parseBotCommand, splitText } from './commands.js'
 export { TelegramTransport } from './telegram.js'
 export { FeishuTransport, toFeishuInbound } from './feishu.js'

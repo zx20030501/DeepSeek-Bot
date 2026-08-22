@@ -40,6 +40,14 @@ interface FleetSettings {
   maxGroupMessages: number
   maxParallelRuns: number
   botRunMaxAttempts: number
+  features: {
+    dynamicRegistry: boolean
+    chatBotCreation: boolean
+    peerMessaging: boolean
+    managerAgent: boolean
+    savedWorkflows: boolean
+    externalRuntimes: boolean
+  }
 }
 
 interface FleetProfileBase {
@@ -166,6 +174,26 @@ interface Diagnostics {
     approvals?: Array<{ id?: string; code?: string; kind?: string; summary?: string; status?: string; expiresAt?: number }>
     handoffs?: Array<{ id?: string; fromBot?: string; toBot?: string; status?: string; reason?: string }>
     deadLetters?: Array<{ id?: string; state?: string; lastError?: string; envelope?: { to?: string; taskId?: string } }>
+    registryBots?: Array<{
+      id?: string
+      handle?: string
+      title?: string
+      status?: string
+      scope?: string
+      source?: string
+      version?: number
+      revision?: number
+      fleetRole?: string
+      capabilities?: string[]
+      runtimeReady?: boolean
+      fleetMembership?: 'joined' | 'blocked' | 'not-joined'
+      runtimeSource?: string
+      runtimeDefinitionId?: string
+      runtimeRevision?: number
+      blockedReason?: string
+      activationCode?: string
+      updatedAt?: number
+    }>
   }
 }
 
@@ -203,6 +231,7 @@ interface SetupState {
   readonly pairingApproving: boolean
   readonly fleetApproving: boolean
   readonly fleetTaskAction?: string | undefined
+  readonly botRegistryAction?: string | undefined
   readonly fleetTaskDetail?: FleetTaskDetailView | undefined
   readonly message?: string | undefined
   readonly error?: string | undefined
@@ -258,7 +287,7 @@ function updateRowValue(values: readonly string[], index: number, value: string)
 }
 
 function draftOf(settings: HermesBotSettings): Draft {
-  const collaboration = settings.collaboration ?? {
+  const collaborationDefaults: FleetSettings = {
     enabled: true,
     autoPlanner: true,
     approvalMode: 'auto-planned',
@@ -268,7 +297,22 @@ function draftOf(settings: HermesBotSettings): Draft {
     maxGroupMessages: 10,
     maxParallelRuns: 6,
     botRunMaxAttempts: 3,
+    features: {
+      dynamicRegistry: false,
+      chatBotCreation: false,
+      peerMessaging: false,
+      managerAgent: false,
+      savedWorkflows: false,
+      externalRuntimes: false,
+    },
   }
+  const collaboration = settings.collaboration === undefined
+    ? collaborationDefaults
+    : {
+        ...collaborationDefaults,
+        ...settings.collaboration,
+        features: { ...collaborationDefaults.features, ...settings.collaboration.features },
+      }
   const profiles = settings.profiles ?? []
   return {
     enabled: settings.enabled,
@@ -280,7 +324,7 @@ function draftOf(settings: HermesBotSettings): Draft {
     userIds: [...settings.access.userIds],
     chatIds: [...settings.access.chatIds],
     pairingEnabled: settings.access.pairing !== false,
-    collaboration: { ...collaboration },
+    collaboration: { ...collaboration, features: { ...collaboration.features } },
     profiles: profiles.map(profile => ({
       id: profile.id,
       title: profile.title,
@@ -625,6 +669,27 @@ class FeishuSetupController {
     }
   }
 
+  public async updateDynamicBotStatus(botId: string, status: 'active' | 'disabled' | 'deleted'): Promise<boolean> {
+    this.publish({ botRegistryAction: `${status}:${botId}`, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'bot_registry_status', botId, status }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ diagnostics: data.diagnostics, message: data.message ?? '动态 Bot 状态已更新。', diagnosticsError: undefined })
+      return true
+    } catch (error) {
+      this.publish({ error: `动态 Bot 操作失败：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ botRegistryAction: undefined })
+    }
+  }
+
   public async loadFleetTask(taskId: string): Promise<void> {
     this.publish({ fleetTaskAction: `detail:${taskId}`, error: undefined })
     try {
@@ -879,29 +944,34 @@ function FleetStatusPanel({
   approving,
   taskAction,
   taskDetail,
+  registryAction,
   onResolve,
   onRefresh,
   onDetail,
   onCancel,
   onReplay,
   onCloseDetail,
+  onRegistryStatus,
 }: {
   diagnostics: Diagnostics
   approving: boolean
   taskAction?: string | undefined
   taskDetail?: FleetTaskDetailView | undefined
+  registryAction?: string | undefined
   onResolve: (code: string, decision: 'approved' | 'rejected') => void
   onRefresh: () => void
   onDetail: (taskId: string) => void
   onCancel: (taskId: string) => void
   onReplay: (taskId: string) => void
   onCloseDetail: () => void
+  onRegistryStatus: (botId: string, status: 'active' | 'disabled' | 'deleted') => void
 }) {
   const fleet = diagnostics.fleet
   const approvals = (fleet?.approvals ?? []).filter(approval => approval.status === 'pending')
   const workflows = fleet?.workflows ?? []
   const tasks = fleet?.tasks ?? []
   const deadLetters = fleet?.deadLetters ?? []
+  const registryBots = fleet?.registryBots ?? []
   return (
     <section className="dsh-hermes-panel">
       <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 控制台</h3><p className="dsh-hermes-muted">统一查看 Bot、任务、工作流、审批和死信；数据来自本机持久化状态。</p></div><button type="button" className="dsh-hermes-secondary" onClick={onRefresh}>刷新 Fleet</button></div>
@@ -913,6 +983,20 @@ function FleetStatusPanel({
       </div>
       <div className="dsh-hermes-fleet-roster">
         {(diagnostics.bots ?? []).map(bot => <div key={bot.id} className="dsh-hermes-fleet-chip"><strong>@{bot.id}</strong><span>{bot.fleetRole ?? 'generalist'} · {bot.sessionScope ?? 'requester'}</span></div>)}
+      </div>
+      <div className="dsh-hermes-dynamic-bots">
+        <div><strong>动态 Bot 注册表</strong><span className="dsh-hermes-muted">对话创建的 Bot 会先成为草稿；确认后才进入上面的可用 roster。</span></div>
+        {registryBots.length === 0 ? <span className="dsh-hermes-muted">暂无动态 Bot。启用对话创建后，可在飞书发送 <code>/bot create analyst 数据分析师</code>。</span> : registryBots.map(bot => {
+          const botId = bot.id ?? ''
+          const handle = bot.handle ?? 'bot'
+          const busy = registryAction !== undefined || approving
+          return <div className="dsh-hermes-fleet-row" key={botId || handle}><div><strong>@{handle} · {bot.title ?? handle}</strong><span>{bot.status} · {bot.fleetRole ?? 'generalist'} · v{String(bot.version ?? 1)} / r{String(bot.revision ?? 1)} · {bot.runtimeReady ? `已自动加入 Fleet（dynamic r${String(bot.runtimeRevision ?? bot.revision ?? 1)}）` : bot.blockedReason ?? '尚未加入 Fleet'}</span></div><div className="dsh-hermes-action-row">
+            {bot.status === 'draft' && bot.activationCode !== undefined ? <button type="button" className="dsh-hermes-secondary" disabled={busy} onClick={() => { onResolve(bot.activationCode!, 'approved') }}>确认并激活</button> : null}
+            {bot.status === 'active' ? <button type="button" className="dsh-hermes-secondary" disabled={busy || botId === ''} onClick={() => { onRegistryStatus(botId, 'disabled') }}>停用</button> : null}
+            {bot.status === 'disabled' ? <button type="button" className="dsh-hermes-secondary" disabled={busy || botId === ''} onClick={() => { onRegistryStatus(botId, 'active') }}>重新启用</button> : null}
+            {bot.status !== 'deleted' ? <button type="button" className="dsh-hermes-danger" disabled={busy || botId === ''} onClick={() => { if (window.confirm(`确定删除 @${handle}？该 ID 将不能重新使用，但审计历史会保留。`)) onRegistryStatus(botId, 'deleted') }}>删除</button> : null}
+          </div></div>
+        })}
       </div>
       <div className="dsh-hermes-fleet-columns">
         <div><strong>待审批</strong>{approvals.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : approvals.map(approval => <div className="dsh-hermes-fleet-row" key={approval.id}><div><code>{approval.code}</code><span>{approval.summary ?? approval.kind}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'approved') }}>批准</button><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'rejected') }}>拒绝</button></div></div>)}</div>
@@ -1049,6 +1133,16 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
     setDraft(current => current === undefined ? current : { ...current, collaboration: { ...current.collaboration, [key]: value } })
     setDraftError(undefined)
   }
+  const updateFleetFeature = (key: keyof FleetSettings['features'], value: boolean): void => {
+    setDraft(current => current === undefined ? current : {
+      ...current,
+      collaboration: {
+        ...current.collaboration,
+        features: { ...current.collaboration.features, [key]: value },
+      },
+    })
+    setDraftError(undefined)
+  }
   const approvePairing = (): void => {
     void controller.approvePairing(pairingCode).then(candidate => {
       if (candidate?.userId !== undefined) {
@@ -1158,6 +1252,11 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         <div className="dsh-hermes-grid">
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.enabled} onChange={event => { updateCollaboration('enabled', event.target.checked) }} /><span>启用 Bot Fleet</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.autoPlanner} onChange={event => { updateCollaboration('autoPlanner', event.target.checked) }} /><span>启用自动 Planner</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.dynamicRegistry} onChange={event => { updateFleetFeature('dynamicRegistry', event.target.checked); if (!event.target.checked) updateFleetFeature('chatBotCreation', false) }} /><span>启用动态 Bot 注册表</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.chatBotCreation} disabled={!draft.collaboration.features.dynamicRegistry} onChange={event => { updateFleetFeature('chatBotCreation', event.target.checked) }} /><span>允许在对话中创建 Bot</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.peerMessaging} onChange={event => { updateFleetFeature('peerMessaging', event.target.checked) }} /><span>允许 Bot 间受控 @协作</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.managerAgent} onChange={event => { updateFleetFeature('managerAgent', event.target.checked) }} /><span>允许 @manager 规划委派</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.savedWorkflows} onChange={event => { updateFleetFeature('savedWorkflows', event.target.checked) }} /><span>启用版本化 Workflow API</span></label>
           <Field label="审批策略"><select value={draft.collaboration.approvalMode} onChange={event => { updateCollaboration('approvalMode', event.target.value as FleetSettings['approvalMode']) }}><option value="auto-planned">自动计划需要批准（推荐）</option><option value="multi-bot">多 Bot 才需要批准</option><option value="always">所有 Fleet 操作都批准</option><option value="never">不需要批准</option></select></Field>
           <Field label="默认会话隔离"><select value={draft.collaboration.defaultSessionScope} onChange={event => { updateCollaboration('defaultSessionScope', event.target.value as FleetSettings['defaultSessionScope']) }}><option value="requester">按使用者隔离（推荐）</option><option value="chat">按聊天隔离</option><option value="task">按任务隔离</option><option value="shared">共享上下文（有串话风险）</option></select></Field>
           <Field label="协作 Bot 上限"><input type="number" min="2" max="6" value={draft.collaboration.maxGroupBots} onChange={event => { updateCollaboration('maxGroupBots', Number(event.target.value)) }} /></Field>
@@ -1178,12 +1277,14 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         approving={state.fleetApproving}
         taskAction={state.fleetTaskAction}
         taskDetail={state.fleetTaskDetail}
+        registryAction={state.botRegistryAction}
         onResolve={(code, decision) => { void controller.resolveFleetApproval(code, decision) }}
         onRefresh={() => { void controller.refreshDiagnostics() }}
         onDetail={taskId => { void controller.loadFleetTask(taskId) }}
         onCancel={taskId => { void controller.cancelFleetTask(taskId) }}
         onReplay={taskId => { void controller.replayFleetTask(taskId) }}
         onCloseDetail={() => { controller.clearFleetTaskDetail() }}
+        onRegistryStatus={(botId, status) => { void controller.updateDynamicBotStatus(botId, status) }}
       />
 
       <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
@@ -1204,7 +1305,7 @@ const CSS = `
 .dsh-hermes-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}.dsh-hermes-panel h3{font-size:14px;margin:0}.dsh-hermes-muted{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:0}.dsh-hermes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dsh-hermes-field{display:grid;gap:6px;align-content:start}.dsh-hermes-field>span{font-size:11px;font-weight:600}.dsh-hermes-field>small{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.4}.dsh-hermes-field input,.dsh-hermes-field select,.dsh-hermes-field textarea{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-field input,.dsh-hermes-field select{height:36px}.dsh-hermes-field textarea{resize:vertical;min-height:76px}.dsh-hermes-check{display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;font-size:12px;cursor:pointer}.dsh-hermes-check input{accent-color:#6758d4}.dsh-hermes-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}.dsh-hermes-primary{border:0;border-radius:999px;background:#6758d4;color:#fff;padding:9px 16px;font:inherit;font-size:12px;font-weight:650;cursor:pointer}.dsh-hermes-primary:disabled{opacity:.5;cursor:not-allowed}@media(max-width:720px){.dsh-hermes-header{display:grid}.dsh-hermes-grid{grid-template-columns:1fr}.dsh-hermes-actions{align-items:stretch;flex-direction:column}}
  .dsh-hermes-action-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.dsh-hermes-action-row .dsh-hermes-muted{flex:1 1 260px}.dsh-hermes-pairing-input{height:36px;min-width:220px;flex:1 1 240px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px;text-transform:uppercase}.dsh-hermes-pairing-approved{display:grid;gap:7px}.dsh-hermes-pairing-approved-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-pairing-approved-row code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-danger{border:1px solid rgba(190,60,60,.35);border-radius:999px;background:rgba(205,72,72,.08);color:#aa3939;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-secondary:disabled,.dsh-hermes-danger:disabled{opacity:.5;cursor:not-allowed}
  .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-authorized-user{display:grid;gap:3px;min-width:0}.dsh-hermes-authorized-user code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-authorized-user span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
-  .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}.dsh-hermes-task-detail{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-task-detail h4{margin:0 0 3px;font-size:13px}.dsh-hermes-task-detail small{display:block;margin-bottom:5px;font-size:10px;font-weight:650;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-task-detail pre{max-height:260px;margin:0;padding:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.dsh-hermes-task-meta{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-task-meta span{padding:4px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10px}.dsh-hermes-task-run{display:grid;gap:3px;padding:7px 0;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-task-run code,.dsh-hermes-task-run span,.dsh-hermes-task-run em{font-size:10px;overflow-wrap:anywhere}.dsh-hermes-task-run em{color:#aa3939;font-style:normal}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}}
+  .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-dynamic-bots{display:grid;gap:8px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-dynamic-bots>div:first-child{display:flex;align-items:baseline;justify-content:space-between;gap:10px}.dsh-hermes-dynamic-bots strong{font-size:11px}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}.dsh-hermes-task-detail{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-task-detail h4{margin:0 0 3px;font-size:13px}.dsh-hermes-task-detail small{display:block;margin-bottom:5px;font-size:10px;font-weight:650;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-task-detail pre{max-height:260px;margin:0;padding:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.dsh-hermes-task-meta{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-task-meta span{padding:4px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10px}.dsh-hermes-task-run{display:grid;gap:3px;padding:7px 0;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-task-run code,.dsh-hermes-task-run span,.dsh-hermes-task-run em{font-size:10px;overflow-wrap:anywhere}.dsh-hermes-task-run em{color:#aa3939;font-style:normal}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}.dsh-hermes-dynamic-bots>div:first-child{display:grid}}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 
