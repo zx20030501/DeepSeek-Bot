@@ -244,8 +244,7 @@ test('chained asks correlate across teams via parentAskId and correlationId', as
 test('botAsk is rejected while Peer Messaging is disabled or the target is unknown', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-ask-guard-'))
   let gateway
-  try {
-    gateway = await makeGateway(root, {})
+  try {    gateway = await makeGateway(root, {})
     await assert.rejects(() => gateway.botAsk({
       from: 'asker',
       to: ['answerer'],
@@ -260,6 +259,83 @@ test('botAsk is rejected while Peer Messaging is disabled or the target is unkno
       question: 'nobody',
       replyTarget,
     }), /Bot is unavailable or not authorized/u)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('/ask chat command asks a Bot and delivers the answer', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-ask-command-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, meta }) {
+        const agent = withMockSession({
+          id: String(sessionId),
+          status: 'idle',
+          cancel() {},
+          followup() {},
+        })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_user'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: { answerer: { capabilities: ['answer'] } },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { peerMessaging: true },
+      },
+    })
+    let inbound
+    const sent = []
+    gateway.transports = [{
+      platform: 'feishu',
+      async start(handler) { inbound = handler },
+      async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }]
+    gateway.transportByPlatform.set('feishu', gateway.transports[0])
+    await gateway.start()
+
+    await inbound({
+      id: 'ask-cmd-1',
+      target: { platform: 'feishu', chatId: 'oc_ask', chatType: 'dm', userId: 'ou_user' },
+      text: '/ask @answerer What is the answer?',
+      receivedAt: Date.now(),
+    })
+
+    // Confirmation is sent and the Ask is durably registered.
+    let pending = []
+    const deadline = Date.now() + 2_000
+    while (Date.now() < deadline) {
+      pending = await gateway.askRegistry.pending()
+      if (pending.length >= 1 && sent.some(item => item.text.includes('已向 @answerer 提问'))) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(pending.length, 1)
+    assert.deepEqual([...pending[0].to], ['answerer'])
+    assert.equal(pending[0].question, 'What is the answer?')
+    const askId = pending[0].askId
+    assert.ok(sent.some(item => item.text.includes('已向 @answerer 提问')))
+    // The target Bot's reply completes the Ask; the /ask waiter delivers it.
+    await gateway.askRegistry.recordReply(askId, { from: 'answerer', text: 'forty-two', messageId: 'reply-1' })
+
+    const answerDeadline = Date.now() + 3_000
+    while (Date.now() < answerDeadline && !sent.some(entry => entry.text.includes('forty-two'))) {
+      await new Promise(resolve => setTimeout(resolve, 30))
+    }
+    assert.ok(sent.some(entry => entry.text.includes('forty-two')), 'the answer should be delivered to the chat')
+    assert.ok(sent.some(entry => entry.text.includes(askId)))
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })

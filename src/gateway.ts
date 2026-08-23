@@ -110,6 +110,7 @@ import type {
   ManagerPlan,
   WorkflowDefinition,
   WorkflowDraft,
+  WorkflowManifest,
   WorkflowRetrySpec,
   WorkflowValueType,
 } from './fleet-v2-types.js'
@@ -1737,6 +1738,18 @@ export class BotGateway {
       }
       return cancelled
     })
+  }
+
+  /** Export a Workflow as a checksummed manifest for backup or cross-machine sharing. */
+  public async exportWorkflowManifest(workflowId: string, actor = 'local-dashboard', workspaceId?: string): Promise<WorkflowManifest> {
+    this.assertSavedWorkflowsEnabled()
+    return this.workflows.exportManifest(workflowId, { actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
+  }
+
+  /** Import a checksummed Workflow manifest; the imported definition is owned by the actor. */
+  public async importWorkflowManifest(manifest: WorkflowManifest, actor = 'local-dashboard'): Promise<WorkflowDefinition> {
+    this.assertSavedWorkflowsEnabled()
+    return this.workflows.importManifest(manifest, actor)
   }
 
   private async getPinnedWorkflowDefinition(root: TaskRecord): Promise<WorkflowDefinition | undefined> {
@@ -6842,7 +6855,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf', 'ask'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -7074,11 +7087,69 @@ export class BotGateway {
           await this.completeWithText(message, walId, binding, cancelled > 0 ? '已停止 ' + cancelled + ' 个运行中的 Workflow 实例。' : '没有找到运行中的 Workflow 实例。')
           return true
         }
-        await this.completeWithText(message, walId, binding, '用法：/wf list | /wf run <id> [JSON输入] | /wf stop <id>')
+        if (action === 'export') {
+          const workflowId = parts[1] ?? ''
+          if (workflowId === '') throw new Error('缺少 Workflow ID。')
+          const manifest = await this.exportWorkflowManifest(workflowId, actor)
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            'Workflow 清单（可 /wf import 到本机或其他节点）：\n' + JSON.stringify(manifest).slice(0, 30_000),
+          )
+          return true
+        }
+        if (action === 'import') {
+          const json = args.slice('import'.length).trim()
+          if (json === '') throw new Error('缺少 Workflow 清单 JSON。')
+          const parsed: unknown = JSON.parse(json)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('清单必须是对象')
+          const imported = await this.importWorkflowManifest(parsed as WorkflowManifest, actor)
+          await this.completeWithText(message, walId, binding, '已导入 Workflow：' + imported.id + ' · ' + imported.name + ' · v' + imported.revision)
+          return true
+        }
+        await this.completeWithText(message, walId, binding, '用法：/wf list | /wf run <id> [JSON输入] | /wf stop <id> | /wf export <id> | /wf import <清单JSON>')
       } catch (error: unknown) {
         await this.completeWithText(message, walId, binding, 'Workflow 操作失败：' + (error instanceof Error ? error.message : String(error)))
       }
       return true
+    }
+    if (name === 'ask') {
+      const actor = actorForTarget(message.target)
+      const firstSpace = args.indexOf(' ')
+      const rawBot = firstSpace < 0 ? args : args.slice(0, firstSpace)
+      const question = (firstSpace < 0 ? '' : args.slice(firstSpace + 1)).trim()
+      const botId = rawBot.replace(/^@/u, '').trim().toLowerCase()
+      if (botId === '' || question === '') {
+        await this.completeWithText(message, walId, binding, '用法：/ask @bot <问题>。例如 /ask @analyst 帮我分析这组数据。')
+        return true
+      }
+      const bot = this.directory.get(botId)
+      if (!bot) {
+        await this.completeWithText(message, walId, binding, '没有找到这个 Bot：' + botId)
+        return true
+      }
+      try {
+        const ask = await this.botAsk({
+          from: actor,
+          to: [botId],
+          question,
+          replyTarget: message.target,
+        })
+        await this.completeWithText(message, walId, binding, '已向 @' + botId + ' 提问。askId：' + ask.askId)
+        void this.botWait(ask.askId, { timeoutMs: 60_000, pollMs: 300 }).then(async result => {
+          if (result.status === 'answered') {
+            const answer = result.replies.map(reply => '@' + reply.from + '：\n' + reply.text).join('\n\n')
+            await this.sendText(message.target, '回答 ' + ask.askId + '：\n' + answer, 'ask-answer:' + ask.askId)
+          } else {
+            await this.sendText(message.target, '问题 ' + ask.askId + ' 未在时限内得到回复（' + result.status + '）。', 'ask-timeout:' + ask.askId)
+          }
+        }).catch(error => this.log('warn', 'bot ask answer delivery failed: ' + String(error)))
+        return true
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, '提问失败：' + (error instanceof Error ? error.message : String(error)))
+        return true
+      }
     }
     if (name === 'tasks') {
       const snapshot = await this.tasks.snapshot()
