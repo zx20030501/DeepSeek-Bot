@@ -8,6 +8,7 @@ export interface BotCreateDraftToolInput {
   readonly skills?: readonly string[]
   readonly role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
   readonly model?: string
+  readonly runtimeAdapter?: 'dsh' | 'hermes' | 'grok'
   readonly soul?: string
 }
 
@@ -33,6 +34,7 @@ export interface BotUpdateDraftToolInput {
   readonly skills?: readonly string[]
   readonly role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
   readonly model?: string
+  readonly runtimeAdapter?: 'dsh' | 'hermes' | 'grok'
   readonly soul?: string
 }
 
@@ -87,6 +89,11 @@ export function createBotCreateDraftTool(handler: BotCreateDraftToolHandler) {
         description: 'Fleet role. Manager Bots are not enabled in this phase.',
       },
       model: { type: 'string', description: 'Optional model name; omit to inherit the DSH default.' },
+      runtimeAdapter: {
+        type: 'string',
+        enum: ['dsh', 'hermes', 'grok'],
+        description: 'Execution runtime. Hermes and Grok require the corresponding host adapter and feature flag.',
+      },
       soul: { type: 'string', description: 'Optional short identity and behavior prompt. Never include credentials.' },
     },
     output: {
@@ -124,6 +131,11 @@ export function createBotUpdateDraftTool(handler: BotUpdateDraftToolHandler) {
       skills: { type: 'array', items: { type: 'string' }, description: 'Replacement skill names.' },
       role: { type: 'string', enum: ['worker', 'verifier', 'synthesizer', 'generalist'], description: 'Replacement Fleet role.' },
       model: { type: 'string', description: 'Replacement model name.' },
+      runtimeAdapter: {
+        type: 'string',
+        enum: ['dsh', 'hermes', 'grok'],
+        description: 'Replacement execution runtime.',
+      },
       soul: { type: 'string', description: 'Replacement identity prompt. Never include credentials.' },
     },
     output: {

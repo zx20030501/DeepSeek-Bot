@@ -63,6 +63,8 @@ Call \`await scheduler.stop()\` during Gateway shutdown. On startup, load the
 store and start the scheduler only after Workflow recovery and the normal
 admission services are ready.
 
-The current slice provides the parser, durable store, lease/retry semantics,
-and scheduler. Gateway commands, settings UI, and the concrete
-\`launchWorkflowFromRoutine\` integration are the next migration slice.
+The Gateway integration provides /routine commands, settings flags, ownership
+checks, and a concrete launch path through the existing Workflow admission
+runtime. The scheduler still emits only structured launches; ACL, approval,
+budget, revision pinning, and mailbox delivery remain the Workflow runtime's
+responsibility.

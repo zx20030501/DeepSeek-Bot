@@ -98,6 +98,7 @@ test('Fleet roster settings round-trip roles, ACLs, session isolation, and limit
     managerAgent: true,
     savedWorkflows: true,
     externalRuntimes: false,
+    routines: false,
   })
   settings.profiles[0].approvalRequired = true
   settings.collaboration.features.chatBotCreation = true
@@ -114,6 +115,7 @@ test('Fleet roster settings round-trip roles, ACLs, session isolation, and limit
     managerAgent: true,
     savedWorkflows: true,
     externalRuntimes: false,
+    routines: false,
   })
 })
 
@@ -132,5 +134,6 @@ test('pre-Phase-2 saved Fleet settings inherit secure-off dynamic Bot features',
     managerAgent: false,
     savedWorkflows: false,
     externalRuntimes: false,
+    routines: false,
   })
 })

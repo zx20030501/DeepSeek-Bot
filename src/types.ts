@@ -100,6 +100,8 @@ export interface BotProfile {
   readonly soul?: string
   /** Fleet responsibility used by the deterministic planner. */
   readonly fleetRole?: BotFleetRole
+  /** Runtime provider used for BotMesh task execution. Defaults to the local DSH runtime. */
+  readonly runtimeAdapter?: 'dsh' | 'hermes' | 'grok'
   /** Safe default isolates long-term Bot context by requester. */
   readonly sessionScope?: BotSessionScope
   /** Optional Bot-level ACL applied after the gateway allowlist/pairing check. */
@@ -222,6 +224,8 @@ export interface BotFleetFeatureFlags {
   readonly managerAgent?: boolean
   readonly savedWorkflows?: boolean
   readonly externalRuntimes?: boolean
+  /** Durable cron triggers for saved Workflow definitions. */
+  readonly routines?: boolean
 }
 
 export interface BotDescriptor {
@@ -273,6 +277,7 @@ export interface BotRevision {
   readonly provider?: string
   readonly model?: string
   readonly maxTokens?: number
+  readonly runtimeAdapter?: 'dsh' | 'hermes' | 'grok'
   readonly capabilities: readonly string[]
   readonly skills: readonly string[]
   readonly soul?: string
@@ -292,6 +297,7 @@ export interface BotRevisionDraft {
   readonly provider?: string
   readonly model?: string
   readonly maxTokens?: number
+  readonly runtimeAdapter?: 'dsh' | 'hermes' | 'grok'
   readonly capabilities?: readonly string[]
   readonly skills?: readonly string[]
   readonly soul?: string

@@ -91,6 +91,7 @@ test('Fleet v2 feature flags are secure-off by default and opt in individually',
     managerAgent: false,
     savedWorkflows: false,
     externalRuntimes: false,
+    routines: false,
   })
   const enabled = normalizeConfig({
     feishu: { enabled: false },
