@@ -111,7 +111,7 @@ test('HTTP handler authenticates, durably fences, and deduplicates deliveries', 
     assert.equal(staleResponse.status, 409)
     assert.equal((await staleResponse.json()).errorCode, 'stale-fence')
 
-    const badSignature = await handler(requestFor(message, 'wrong-secret'))
+    const badSignature = await handler(requestFor(message, 'wrong-remote-secret'))
     assert.equal(badSignature.status, 401)
     assert.equal((await badSignature.json()).errorCode, 'invalid-signature')
 

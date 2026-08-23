@@ -123,7 +123,14 @@ function envelopeFrom(value: unknown, policy: RemoteTransportPolicy): BotMessage
   const correlationId = requiredString(input.correlationId, 'envelope.correlationId')
   const payload = record(input.payload)
   if (!payload) throw new RemoteTransportValidationError('invalid-envelope-payload', 'envelope.payload must be an object')
-  validatePeerPayload(payload, policy.maxPayloadBytes)
+  try {
+    validatePeerPayload(payload, policy.maxPayloadBytes)
+  } catch (error: unknown) {
+    throw new RemoteTransportValidationError(
+      'invalid-envelope-payload',
+      error instanceof Error ? error.message : 'envelope.payload failed Peer Message validation',
+    )
+  }
   if (input.createdAt !== undefined) integer(input.createdAt, 'envelope.createdAt', 0)
   if (input.expiresAt !== undefined) integer(input.expiresAt, 'envelope.expiresAt', 1)
   if (typeof input.expiresAt === 'number' && typeof input.createdAt === 'number' && input.expiresAt <= input.createdAt) {
