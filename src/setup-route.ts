@@ -16,8 +16,10 @@ import type {
   GatewayDiscoveryCandidate,
   GatewayDiscoveryStatus,
   BotRegistryEntry,
+  BotTarget,
   TaskRecord,
 } from './types.js'
+import type { WorkflowDefinition } from './fleet-v2-types.js'
 import { isTrustedLocalRequest } from './setup-security.js'
 
 const MAX_BODY_BYTES = 64 * 1024
@@ -46,6 +48,14 @@ export interface SetupRouteActions {
   setDynamicBotStatus?: (botId: string, status: 'active' | 'disabled' | 'deleted') => Promise<BotRegistryEntry | undefined>
   validateStaticProfiles?: (handles: readonly string[]) => Promise<void>
   saveAndApplySettings?: (settings: HermesBotSettings, appSecret?: string) => Promise<void>
+  listWorkflows?: (actor: string) => Promise<WorkflowDefinition[]>
+  launchWorkflow?: (workflowId: string, target: BotTarget, actor: string) => Promise<{
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly dispatched: readonly unknown[]
+  }>
+  stopWorkflow?: (workflowId: string, actor: string) => Promise<number>
+  deleteWorkflow?: (workflowId: string, actor: string) => Promise<boolean>
 }
 
 class SetupRequestError extends Error {
@@ -151,6 +161,10 @@ async function handleRequest(
     && action !== 'fleet_task_cancel'
     && action !== 'fleet_task_replay'
     && action !== 'bot_registry_status'
+    && action !== 'workflow_list'
+    && action !== 'workflow_launch'
+    && action !== 'workflow_stop'
+    && action !== 'workflow_delete'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -250,6 +264,44 @@ async function handleRequest(
     const snapshot = await readSnapshot(ctx, source, diagnostics)
     const verb = status === 'active' ? '启用' : status === 'disabled' ? '停用' : '删除'
     sendJson(res, 200, { ...snapshot, message: `已${verb} @${bot.definition.handle}。` })
+    return
+  }
+  if (action === 'workflow_list') {
+    if (actions.listWorkflows === undefined) throw new SetupRequestError(503, 'Workflow 服务还没有准备好。')
+    const workflows = await actions.listWorkflows('local-dashboard')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, workflows, message: '已读取 Workflow 列表。' })
+    return
+  }
+  if (action === 'workflow_launch') {
+    const workflowId = typeof body.workflowId === 'string' ? body.workflowId.trim() : ''
+    if (workflowId === '') throw new SetupRequestError(400, '缺少 Workflow ID。')
+    if (actions.launchWorkflow === undefined) throw new SetupRequestError(503, 'Workflow 服务还没有准备好。')
+    const rawTarget = body.replyTarget
+    const target = rawTarget !== null && typeof rawTarget === 'object' && !Array.isArray(rawTarget)
+      ? rawTarget as BotTarget
+      : { platform: 'internal' as const, chatId: 'workflow:' + workflowId }
+    const result = await actions.launchWorkflow(workflowId, target, 'local-dashboard')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: `已启动 Workflow，运行 ID：${result.workflowRunId}` })
+    return
+  }
+  if (action === 'workflow_stop') {
+    const workflowId = typeof body.workflowId === 'string' ? body.workflowId.trim() : ''
+    if (workflowId === '') throw new SetupRequestError(400, '缺少 Workflow ID。')
+    if (actions.stopWorkflow === undefined) throw new SetupRequestError(503, 'Workflow 服务还没有准备好。')
+    const stopped = await actions.stopWorkflow(workflowId, 'local-dashboard')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: stopped > 0 ? `已停止 ${stopped} 个运行中的实例。` : '没有运行中的实例。' })
+    return
+  }
+  if (action === 'workflow_delete') {
+    const workflowId = typeof body.workflowId === 'string' ? body.workflowId.trim() : ''
+    if (workflowId === '') throw new SetupRequestError(400, '缺少 Workflow ID。')
+    if (actions.deleteWorkflow === undefined) throw new SetupRequestError(503, 'Workflow 服务还没有准备好。')
+    const deleted = await actions.deleteWorkflow(workflowId, 'local-dashboard')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: deleted ? '已停用该 Workflow。' : 'Workflow 不存在或已停用。' })
     return
   }
   let settings: HermesBotSettings

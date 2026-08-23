@@ -1695,6 +1695,50 @@ export class BotGateway {
     return this.workflows.get(workflowId, { actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
   }
 
+  /** Save an edited revision of a saved Workflow. */
+  public async updateWorkflowDefinition(
+    workflowId: string,
+    input: WorkflowDraft,
+    actor = input.ownerId,
+    expectedRevision?: number,
+  ): Promise<WorkflowDefinition> {
+    return this.withDurableMutation(async () => {
+      this.assertSavedWorkflowsEnabled()
+      const current = await this.workflows.get(workflowId, { actorId: actor })
+      if (current === undefined) throw new Error('Workflow not found: ' + workflowId)
+      return this.workflows.update(workflowId, input, actor, expectedRevision ?? current.revision)
+    })
+  }
+
+  /** Soft-delete a saved Workflow so it stops appearing in lists and launches. */
+  public async deleteWorkflowDefinition(workflowId: string, actor = 'local-dashboard'): Promise<boolean> {
+    return this.withDurableMutation(async () => {
+      this.assertSavedWorkflowsEnabled()
+      const current = await this.workflows.get(workflowId, { actorId: actor })
+      if (current === undefined || current.status === 'deleted') return false
+      await this.workflows.softDelete(workflowId, actor, current.revision)
+      return true
+    })
+  }
+
+  /** Stop every running instance of a saved Workflow; returns the count stopped. */
+  public async cancelWorkflowRuns(workflowId: string, actor = 'local-dashboard'): Promise<number> {
+    return this.withDurableMutation(async () => {
+      const snapshot = await this.tasks.snapshot()
+      const roots = snapshot.tasks.filter(task => (
+        task.workflowDefinitionId === workflowId
+        && task.workflowNodeId === '__root__'
+        && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+      ))
+      let cancelled = 0
+      for (const root of roots) {
+        const stopped = await this.cancelFleetTaskUnlocked(root.id, actor)
+        if (stopped !== undefined) cancelled += 1
+      }
+      return cancelled
+    })
+  }
+
   private async getPinnedWorkflowDefinition(root: TaskRecord): Promise<WorkflowDefinition | undefined> {
     if (root.workflowDefinitionId === undefined) return undefined
     const revision = root.workflowRevision ?? legacyWorkflowRevision(root.workflowRunId)

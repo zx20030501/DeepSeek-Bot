@@ -136,6 +136,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
     replayFleetTask: taskId => gateway.replayFleetTask(taskId),
     setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
+    listWorkflows: () => gateway.listWorkflowDefinitions('local-dashboard'),
+    launchWorkflow: (workflowId, target) => gateway.launchWorkflowDefinition(workflowId, 'local-dashboard', target, 'local-dashboard'),
+    stopWorkflow: workflowId => gateway.cancelWorkflowRuns(workflowId, 'local-dashboard'),
+    deleteWorkflow: workflowId => gateway.deleteWorkflowDefinition(workflowId, 'local-dashboard'),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {

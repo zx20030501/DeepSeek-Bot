@@ -375,3 +375,58 @@ test('sequential container passes through after its children complete', async ()
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('saved Workflows support update, cancelWorkflowRuns and delete management', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-wf-manage-'))
+  let gateway
+  try {
+    const setup = await makeGateway(root, {
+      starter: (attempt, respond) => respond('ok', '["go"]'),
+      // worker has no behaviour: the run stays active until cancelWorkflowRuns.
+    })
+    gateway = setup.gateway
+    const created = await gateway.createWorkflowDefinition({
+      name: 'Manageable flow',
+      description: 'v1',
+      ownerId: 'user:feishu:ou_user',
+      scope: 'user',
+      entryNodeId: 'start',
+      inputs: [],
+      outputs: [],
+      nodes: [
+        node('start', 'task', { capability: 'start' }),
+        node('finish', 'task', { capability: 'work' }),
+      ],
+      edges: [{ from: 'start', to: 'finish' }],
+      policy: policy(['start', 'work']),
+    }, 'user:feishu:ou_user')
+
+    // update revises the definition.
+    const updated = await gateway.updateWorkflowDefinition(created.id, {
+      ...created,
+      name: 'Manageable flow v2',
+      description: 'v2',
+    }, 'user:feishu:ou_user', created.revision)
+    assert.equal(updated.revision, created.revision + 1)
+    assert.equal(updated.name, 'Manageable flow v2')
+
+    // launch an instance, then cancelWorkflowRuns stops it.
+    const launch = await gateway.launchWorkflowDefinition(updated.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', { launchId: 'manage-run' })
+    await waitUntil(async () => {
+      const snapshot = await gateway.tasks.snapshot()
+      return snapshot.tasks.some(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'finish')
+    })
+    const stopped = await gateway.cancelWorkflowRuns(updated.id, 'user:feishu:ou_user')
+    assert.ok(stopped >= 1)
+    const cancelledTask = await gateway.tasks.task(launch.rootTaskId)
+    assert.equal(cancelledTask.status, 'cancelled')
+
+    // delete soft-deletes the definition so it no longer resolves publicly.
+    assert.equal(await gateway.deleteWorkflowDefinition(updated.id, 'user:feishu:ou_user'), true)
+    const afterDelete = await gateway.getWorkflowDefinition(updated.id, 'user:feishu:ou_user')
+    assert.equal(afterDelete, undefined)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
