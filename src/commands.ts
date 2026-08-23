@@ -56,6 +56,7 @@ export function formatHelp(): string {
     '/bot status <id> — 查看动态 Bot 的 Fleet 加入、忙碌和最近失败状态',
     '动态 Bot 流程：设置页同时开启“动态 Bot 注册表”和“允许在对话中创建 Bot”，发送 /new → /bot create → /bot confirm。',
     'Team 不会自动扩权：用 /teams 和 /team add/remove 显式维护成员。',
+    '@team:<team-id> <任务> — 按 Team 成员快照启动有界协作 Thread/Room；只有一个可见 Team 时可省略 ID。',
     '/bot edit|disable|enable|delete|clone … — 管理自己的动态 Bot',
     '/teams — 查看当前用户可见的 Team',
     '/team create|add|remove|manager|status … — 显式管理 Team 成员和状态',

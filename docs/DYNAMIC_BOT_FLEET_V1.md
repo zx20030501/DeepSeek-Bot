@@ -133,7 +133,7 @@ Google Drive is only for large development artifacts such as disposable stress l
 | Versioned saved Workflow definitions | Implemented behind gate | Immutable revisions, validation, import/export |
 | Durable task-node DAG continuation | Implemented subset | Task nodes, dependency outputs, concurrency/fan-out, restart recovery |
 | Full condition/map/reduce/approval/compensation execution | Not complete | Schema exists; runtime adapters remain future work |
-| Team-wide `@team` routing | Not complete | Explicit Team membership commands now exist; canonical Router integration remains future work |
+| Team-wide `@team` routing | Phase B in progress | `@team:<team-id>` now resolves visible membership and starts a durable Thread/Group Room; cross-machine routing remains future work |
 | 500 logical Bot roster | Data-path tested | Not 500 simultaneous model sessions |
 | Distributed workers and cross-machine transport | Not implemented | Single-node runtime only |
 

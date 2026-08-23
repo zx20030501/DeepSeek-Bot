@@ -217,6 +217,8 @@ export type * from './fleet-v2-types.js'
 export { BotRegistry } from './bot-registry.js'
 export type { BotRegistryStats } from './bot-registry.js'
 export { TeamStore } from './team-store.js'
+export { TeamRouter, teamMentionHandle } from './team-router.js'
+export type { TeamRoutePlan, TeamRouteRequest } from './team-router.js'
 export type {
   CreateAgentThreadInput,
   CreateTeamInput,
