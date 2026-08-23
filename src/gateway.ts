@@ -21,6 +21,12 @@ import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool
 import { generateManagerPlan } from './manager-policy.js'
 import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
+import {
+  RemoteDeliveryLedger,
+  validateRemoteTransportMessage,
+  type RemoteBotTransportMessage,
+  type RemoteTransportReceipt,
+} from './remote-transport.js'
 import { WorkflowStore } from './workflow-store.js'
 import {
   compileManagerDispatches,
@@ -269,6 +275,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
   const feishu = asRecord(input.feishu)
   const access = asRecord(input.access)
   const collaboration = asRecord(input.collaboration)
+  const remoteTransport = asRecord(input.remoteTransport)
   const fleetFeatures = asRecord(collaboration.features)
   const envUsers = (firstEnv('DEEPSEEK_BOT_ALLOWED_USERS', 'DSH_HERMES_BOT_ALLOWED_USERS') ?? '').split(',').map(item => item.trim()).filter(Boolean)
   const envChats = (firstEnv('DEEPSEEK_BOT_ALLOWED_CHATS', 'DSH_HERMES_BOT_ALLOWED_CHATS') ?? '').split(',').map(item => item.trim()).filter(Boolean)
@@ -285,6 +292,18 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
   const maxGroupRounds = typeof collaboration.maxGroupRounds === 'number'
     ? collaboration.maxGroupRounds
     : typeof collaboration.maxGroupTurns === 'number' ? collaboration.maxGroupTurns : 3
+  const remoteRoutes: Record<string, { readonly nodeId: string; readonly endpoint: string; readonly enabled?: boolean }> = {}
+  for (const [handle, rawRoute] of Object.entries(asRecord(remoteTransport.routes))) {
+    const route = asRecord(rawRoute)
+    if (typeof route.nodeId !== 'string' || typeof route.endpoint !== 'string') continue
+    const normalizedHandle = handle.trim().toLowerCase()
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(normalizedHandle)) continue
+    remoteRoutes[normalizedHandle] = {
+      nodeId: route.nodeId,
+      endpoint: route.endpoint,
+      ...(route.enabled === false ? { enabled: false } : {}),
+    }
+  }
   const profiles: Record<string, Omit<BotProfile, 'name'>> = {}
   const rawProfiles = asRecord(input.profiles)
   for (const [name, value] of Object.entries(rawProfiles)) profiles[name] = asRecord(value) as Omit<BotProfile, 'name'>
@@ -315,6 +334,16 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       requireMention: feishu.requireMention !== false,
       handshakeTimeoutMs: typeof feishu.handshakeTimeoutMs === 'number' ? feishu.handshakeTimeoutMs : 15_000,
       maxMessageChars: typeof feishu.maxMessageChars === 'number' ? feishu.maxMessageChars : 4_000,
+    },
+    remoteTransport: {
+      enabled: remoteTransport.enabled === true,
+      ...(typeof remoteTransport.nodeId === 'string' ? { nodeId: remoteTransport.nodeId } : {}),
+      ...(typeof remoteTransport.sharedSecretEnv === 'string' ? { sharedSecretEnv: remoteTransport.sharedSecretEnv } : {}),
+      routes: remoteRoutes,
+      ...(typeof remoteTransport.defaultLeaseMs === 'number' ? { defaultLeaseMs: remoteTransport.defaultLeaseMs } : {}),
+      ...(typeof remoteTransport.timeoutMs === 'number' ? { timeoutMs: remoteTransport.timeoutMs } : {}),
+      ...(typeof remoteTransport.maxPayloadBytes === 'number' ? { maxPayloadBytes: remoteTransport.maxPayloadBytes } : {}),
+      ...(typeof remoteTransport.clockSkewMs === 'number' ? { clockSkewMs: remoteTransport.clockSkewMs } : {}),
     },
     maxInboundAttempts: typeof input.maxInboundAttempts === 'number' ? input.maxInboundAttempts : 3,
     outboxMaxAttempts: typeof input.outboxMaxAttempts === 'number' ? input.outboxMaxAttempts : 5,
@@ -374,6 +403,7 @@ export class BotGateway {
   private readonly wal: InboundWal
   private readonly outbox: Outbox
   private readonly mailbox: BotMailbox
+  private readonly remoteDeliveryLedger: RemoteDeliveryLedger
   private readonly tasks: TaskRunStore
   private readonly rooms: GroupRoomStore
   private readonly approvals: FleetApprovalStore
@@ -444,6 +474,7 @@ export class BotGateway {
     this.pairing = new PairingStore(join(stateDir, 'pairing.json'))
     this.wal = new InboundWal(join(stateDir, 'inbound-wal.jsonl'), this.config.maxInboundAttempts ?? 3)
     this.mailbox = new BotMailbox(join(stateDir, 'mailbox.jsonl'), this.config.collaboration)
+    this.remoteDeliveryLedger = new RemoteDeliveryLedger(join(stateDir, 'remote-inbox.jsonl'))
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
     this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
     this.rooms = new GroupRoomStore(join(stateDir, 'rooms.json'), this.config.collaboration)
@@ -1492,6 +1523,94 @@ export class BotGateway {
     return envelope
   }
 
+  /**
+   * Admit a message received from another Fleet node. The HTTP signature and
+   * durable remote fence are host-owned; this method performs the local
+   * target/ACL/Task/Run/Mailbox admission.
+   */
+  public async receiveRemoteBotMessage(
+    rawMessage: RemoteBotTransportMessage,
+  ): Promise<RemoteTransportReceipt> {
+    return this.withDurableMutation(async () => {
+      const message = validateRemoteTransportMessage(rawMessage, this.config.remoteTransport ?? {})
+      const configuredNodeId = this.config.remoteTransport?.nodeId
+      if (this.config.remoteTransport?.enabled !== true) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-transport-disabled' }
+      }
+      if (configuredNodeId !== undefined && configuredNodeId !== message.targetNodeId) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'target-node-mismatch' }
+      }
+      if (message.envelope.kind === 'cancel') {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-cancel-not-supported' }
+      }
+      const bot = this.directory.get(message.envelope.to)
+      if (!bot || !bot.enabled) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'target-bot-unavailable' }
+      }
+      const replyTarget = this.replyTarget(message.envelope)
+      if (!replyTarget || !this.directory.canInvoke(bot.id, replyTarget)) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'target-acl-denied' }
+      }
+      const instruction = typeof message.envelope.payload.instruction === 'string'
+        ? message.envelope.payload.instruction.trim()
+        : ''
+      if (instruction.length === 0) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'instruction-missing' }
+      }
+      const requester = typeof message.envelope.payload.requester === 'string'
+        ? message.envelope.payload.requester
+        : message.envelope.from
+      const acceptanceCriteria = Array.isArray(message.envelope.payload.acceptanceCriteria)
+        ? message.envelope.payload.acceptanceCriteria.filter((value): value is string => typeof value === 'string').slice(0, 20)
+        : []
+      const title = typeof message.envelope.payload.title === 'string'
+        ? message.envelope.payload.title
+        : instruction
+      const idempotencyKey = peerMessageIdempotencyKey(message.envelope)
+      const existing = await this.mailbox.getByIdempotencyKey(idempotencyKey)
+      const reconciled = await this.tasks.ensureRemoteTaskRun({
+        taskId: message.envelope.taskId,
+        runId: message.envelope.runId,
+        attemptId: message.envelope.attemptId,
+        botId: bot.id,
+        createdBy: requester,
+        title,
+        instruction,
+        acceptanceCriteria,
+        attempt: typeof message.envelope.payload.attempt === 'number' ? message.envelope.payload.attempt : 1,
+      })
+      if (reconciled.task.status === 'completed' || reconciled.task.status === 'failed' || reconciled.task.status === 'cancelled') {
+        return {
+          accepted: true,
+          duplicate: true,
+          deliveryId: message.deliveryId,
+          leaseUntil: message.expiresAt,
+        }
+      }
+      const item = await this.mailbox.enqueue(message.envelope, idempotencyKey)
+      await this.tasks.audit('message', message.envelope.id, 'remote:' + message.sourceNodeId, 'message.remote_queued', {
+        sourceNodeId: message.sourceNodeId,
+        targetNodeId: message.targetNodeId,
+        taskId: message.envelope.taskId,
+        runId: message.envelope.runId,
+        fencingToken: message.fencingToken,
+        duplicate: existing !== undefined || reconciled.duplicate || item.id !== message.envelope.id,
+      }, message.envelope.correlationId)
+      void this.drainCollaboration().catch(error => this.log('warn', 'remote Bot message dispatch failed: ' + String(error)))
+      return {
+        accepted: true,
+        ...(existing !== undefined || reconciled.duplicate || item.id !== message.envelope.id ? { duplicate: true } : {}),
+        deliveryId: message.deliveryId,
+        leaseUntil: message.expiresAt,
+      }
+    })
+  }
+
+  /** Exposes the durable inbox fence for the host HTTP route. */
+  public remoteInboxLedger(): RemoteDeliveryLedger {
+    return this.remoteDeliveryLedger
+  }
+
   public async requestHandoff(input: HandoffRequestInput): Promise<HandoffRecord> {
     return this.withDurableMutation(() => this.createHandoffRequest(input, true))
   }
@@ -2257,6 +2376,7 @@ export class BotGateway {
     await this.wal.load()
     await this.outbox.load()
     await this.mailbox.load()
+    await this.remoteDeliveryLedger.load()
     await this.tasks.load()
     await this.workflows.load()
     await this.approvals.snapshot()

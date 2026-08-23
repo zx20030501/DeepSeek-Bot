@@ -742,6 +742,95 @@ export class TaskRunStore {
     return { ...task, acceptanceCriteria: [...task.acceptanceCriteria] }
   }
 
+  /**
+   * Reconcile a Task/Run whose envelope was accepted by a remote Fleet node.
+   * IDs are supplied by the sender so a retried HTTP delivery can reuse the
+   * same local records without inventing a second attempt.
+   */
+  public async ensureRemoteTaskRun(input: {
+    readonly taskId: string
+    readonly runId: string
+    readonly attemptId: string
+    readonly botId: string
+    readonly createdBy: string
+    readonly title: string
+    readonly instruction: string
+    readonly acceptanceCriteria?: readonly string[]
+    readonly attempt?: number
+  }): Promise<{
+    readonly task: TaskRecord
+    readonly run: RunRecord
+    readonly duplicate: boolean
+  }> {
+    await this.load()
+    const existingTask = this.tasks.get(input.taskId)
+    const existingRun = this.runs.get(input.runId)
+    if (existingRun !== undefined) {
+      if (
+        existingTask === undefined
+        || existingRun.taskId !== input.taskId
+        || existingRun.attemptId !== input.attemptId
+        || existingRun.botId !== input.botId
+      ) {
+        throw new Error('remote Task/Run identity conflict: ' + input.taskId)
+      }
+      return {
+        task: this.cloneTask(existingTask),
+        run: { ...existingRun },
+        duplicate: true,
+      }
+    }
+    if (existingTask !== undefined && existingTask.assignedTo !== input.botId) {
+      throw new Error('remote Task assignment conflict: ' + input.taskId)
+    }
+    const timestamp = now()
+    const task: TaskRecord = existingTask ?? {
+      id: input.taskId,
+      title: input.title.slice(0, 240),
+      instruction: input.instruction,
+      createdBy: input.createdBy,
+      assignedTo: input.botId,
+      acceptanceCriteria: [...(input.acceptanceCriteria ?? [])].slice(0, 20),
+      priority: 50,
+      currentRunId: input.runId,
+      status: 'pending',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const taskWithRun: TaskRecord = {
+      ...task,
+      currentRunId: input.runId,
+      updatedAt: timestamp,
+    }
+    const run: RunRecord = {
+      id: input.runId,
+      taskId: input.taskId,
+      botId: input.botId,
+      attemptId: input.attemptId,
+      attempt: Math.max(1, Math.floor(input.attempt ?? 1)),
+      status: 'queued',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    await this.recordTask(taskWithRun)
+    await this.recordRun(run)
+    if (existingTask === undefined) {
+      await this.audit('task', task.id, input.createdBy, 'task.remote_created', {
+        assignedTo: task.assignedTo,
+        sourceRunId: run.id,
+      }, input.taskId)
+    }
+    await this.audit('run', run.id, input.botId, 'run.remote_created', {
+      taskId: input.taskId,
+      attempt: run.attempt,
+    }, input.taskId)
+    return {
+      task: this.cloneTask(taskWithRun),
+      run: { ...run },
+      duplicate: false,
+    }
+  }
+
   public async attachRoom(taskId: string, roomId: string, actor = 'botmesh'): Promise<TaskRecord | undefined> {
     await this.load()
     const task = this.tasks.get(taskId)
