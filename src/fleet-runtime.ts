@@ -189,6 +189,11 @@ function topologicalOrder(definition: WorkflowDefinition, dependencies: Map<stri
 
 function entryTaskNodeIds(definition: WorkflowDefinition): string[] {
   const byId = new Map(definition.nodes.map(node => [node.id, node]))
+  const compensationTargets = new Set(
+    definition.nodes
+      .filter(node => node.compensation !== undefined)
+      .map(node => node.compensation!.nodeId),
+  )
   const seen = new Set<string>()
   const result: string[] = []
   const visit = (nodeId: string): void => {
@@ -197,7 +202,7 @@ function entryTaskNodeIds(definition: WorkflowDefinition): string[] {
     const node = byId.get(nodeId)
     if (!node) return
     if (node.kind === 'task') {
-      result.push(node.id)
+      if (!compensationTargets.has(node.id)) result.push(node.id)
       return
     }
     if (node.kind === 'condition' || node.kind === 'approval') return
