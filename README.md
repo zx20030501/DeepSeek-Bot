@@ -135,7 +135,7 @@ npm run pack:smoke
 
 ## 当前边界
 
-这是单机 DeepSeek Harness 内的受控 Fleet，不是 xAI 内部系统的复制品。聊天创建的 Bot 经用户确认后可自动加入用户私有 roster；确定性 Manager、`/fleet` 和已保存 Workflow 可以在 ACL 与预算内选择它。单次 Group Room/计划和同时运行的 Agent 仍受最多 6 Bot 等配置上限约束；“500 Bot”只表示逻辑 roster 数据路径测试，不表示 500 个模型会话并发。版本化 Workflow 与 task-node DAG 已实现，但 condition/map/reduce/approval/compensation 的全部运行时适配、通用 DAG 编辑器、`@team` Router、跨机器 Transport、定时 Routine、完整文件/媒体转发和运行中任意改图仍未实现。
+这是单机 DeepSeek Harness 内的受控 Fleet，不是 xAI 内部系统的复制品。聊天创建的 Bot 经用户确认后可自动加入用户私有 roster；确定性 Manager、`/fleet` 和已保存 Workflow 可以在 ACL 与预算内选择它。单次 Group Room/计划和同时运行的 Agent 仍受最多 6 Bot 等配置上限约束；“500 Bot”只表示逻辑 roster 数据路径测试，不表示 500 个模型会话并发。版本化 Workflow 与 task-node DAG 已实现，但 condition/map/reduce/approval/compensation 的全部运行时适配、通用 DAG 编辑器、跨机器 Transport、定时 Routine、完整文件/媒体转发和运行中任意改图仍未实现；`@team:<team-id>` Router 已进入 Phase B，继续受成员 ACL、6 Bot 和 Group Room 上限约束。
 
 ## 项目链接
 

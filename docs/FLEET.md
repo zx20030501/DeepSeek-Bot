@@ -204,7 +204,7 @@ Peer Messaging 目前接通的是有界、已授权的直接 Bot 输出 `@bot` �
 - Grok Build 式数百个模型会话弹性 fan-out；当前只验证了 500 个逻辑 Bot 的 roster 数据路径；
 - condition、map/reduce、approval、compensation 等全部 Workflow 节点的真实运行时适配；
 - 通用 DAG 编辑器、聊天 Workflow 管理命令和运行中动态阶段；
-- `@team` 到 canonical Team/Thread Router 的完整接入；
+- `@team:<team-id>` 到 canonical Team/Thread Router 的本机接入已完成；跨机器 Team Transport 仍在后续阶段；
 - 跨机器 Fleet Transport 与分布式一致性；
 - Routine/cron 触发器；
 - Workflow 或 Group Room 运行中的任意动态 Handoff/DAG 改图；

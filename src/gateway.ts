@@ -41,6 +41,7 @@ import {
 } from './bot-registry-tool.js'
 import { botActivationFingerprint, BotRegistry, runtimeProfileFor } from './bot-registry.js'
 import { TeamStore } from './team-store.js'
+import { TeamRouter } from './team-router.js'
 import {
   BotDirectory,
   BotMailbox,
@@ -361,6 +362,7 @@ export class BotGateway {
   private readonly workflows: WorkflowStore
   private readonly registry: BotRegistry
   private readonly teams: TeamStore
+  private readonly teamRouter: TeamRouter
   private readonly planner = new FleetPlanner()
   private transports: BotTransport[]
   private readonly transportByPlatform: Map<string, BotTransport>
@@ -430,6 +432,7 @@ export class BotGateway {
     this.approvals = new FleetApprovalStore(join(stateDir, 'approvals.json'), this.config.collaboration?.approvalTtlMs)
     this.registry = new BotRegistry(join(stateDir, 'bot-registry.jsonl'))
     this.teams = new TeamStore(join(stateDir, 'teams.jsonl'))
+    this.teamRouter = new TeamRouter(this.teams, this.directory)
     this.transports = []
     this.transportByPlatform = new Map()
     this.installTransports(this.config)
@@ -2617,17 +2620,33 @@ export class BotGateway {
     if (command && await this.handleLocalCommand(message, walId, binding, command.name, command.args)) return
     if (this.config.collaboration?.enabled !== false) {
       const maxTargets = this.config.collaboration?.maxGroupBots ?? 6
+      const requester = actorForTarget(message.target)
+      const visibleTeams = await this.teams.listTeams({
+        actorId: requester,
+        sessionId: binding.sessionId,
+      })
+      const teamHandles = visibleTeams.flatMap(team => [
+        team.id,
+        teamMentionHandle(team),
+      ])
+      if (visibleTeams.length === 1) teamHandles.push('team')
       const mentions = parseFleetMentions(message.text, {
         knownBots: this.directory.ids(),
+        knownTeams: teamHandles,
         managerIds: [this.config.collaboration?.managerBotId ?? 'manager'],
         selfId: profile.name,
         maxTargets,
         mentionBudget: maxTargets,
       })
+      const teamMention = mentions.routableTargets.find(target => target.kind === 'team')
       const managerMention = mentions.routableTargets.find(target => target.kind === 'manager')
       const botIds = mentions.routableTargets
         .filter(target => target.kind === 'bot')
         .map(target => target.id)
+      if (teamMention) {
+        await this.handleTeamMention(message, walId, binding, teamMention.id, mentions.instruction)
+        return
+      }
       if (managerMention) {
         await this.handleManagerMention(message, walId, binding, mentions.instruction)
         return
@@ -2679,6 +2698,165 @@ export class BotGateway {
     } catch (error: unknown) {
       await this.handleInboundFailure(message, walId, error)
     }
+  }
+
+  private async handleTeamMention(
+    message: InboundMessage,
+    walId: string,
+    binding: ChatBinding,
+    teamReference: string,
+    instruction: string,
+  ): Promise<void> {
+    const claimed = await this.wal.claim(walId, binding.sessionId)
+    if (!claimed) return
+    const requester = actorForTarget(message.target)
+    let createdTaskId: string | undefined
+    let threadId: string | undefined
+    try {
+      const route = await this.teamRouter.resolve({
+        reference: teamReference,
+        requester,
+        replyTarget: message.target,
+        sessionId: binding.sessionId,
+        maxParticipants: this.config.collaboration?.maxGroupBots ?? 6,
+      })
+      if (this.requiresFleetApproval(route.participantBotIds, false)) {
+        const workflow = await this.createFleetWorkflow(
+          message,
+          walId,
+          requester,
+          instruction,
+          this.planForExplicitBots(route.participantBotIds),
+          true,
+        )
+        const thread = await this.teamRouter.openThread(route, workflow.taskId)
+        await this.tasks.audit('team', route.team.id, requester, 'team.workflow_created', {
+          teamThreadId: thread.id,
+          workflowId: workflow.id,
+          taskId: workflow.taskId,
+          memberBotIds: route.participantBotIds,
+        }, thread.contextId)
+        return
+      }
+
+      const task = await this.tasks.createTask({
+        title: 'Team ' + route.team.name + ': ' + (instruction || '协作任务'),
+        instruction: instruction || '请根据当前 Team 上下文协作处理。',
+        createdBy: requester,
+        assignedTo: route.participantBotIds[0]!,
+        acceptanceCriteria: [],
+        priority: 50,
+      })
+      createdTaskId = task.id
+      const thread = await this.teamRouter.openThread(route, task.id)
+      threadId = thread.id
+      let roomId: string | undefined
+      let roomEpoch: number | undefined
+      let assignedBot = route.participantBotIds[0]!
+      if (route.participantBotIds.length > 1) {
+        const room = await this.rooms.open(message.target, task.id, route.participantBotIds)
+        roomId = room.id
+        roomEpoch = room.epoch
+        await this.tasks.attachRoom(task.id, room.id, requester)
+        await this.rooms.append(room.id, requester, instruction || '请根据当前 Team 上下文协作处理。')
+        const first = await this.rooms.reserveNext(room.id)
+        if (!first) throw new Error('无法为 Team Room 保留第一轮')
+        assignedBot = first.botId
+      }
+      try {
+        await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork(route.participantBotIds))
+      } catch (error: unknown) {
+        if (roomId !== undefined) await this.rooms.close(roomId)
+        await this.setTeamThreadStatus(thread.id, 'cancelled')
+        await this.tasks.cancelTask(task.id, 'system:admission')
+        throw error
+      }
+      const run = await this.tasks.createRun(task.id, assignedBot, 1)
+      const envelope = createEnvelope({
+        from: requester,
+        to: assignedBot,
+        taskId: task.id,
+        runId: run.id,
+        attemptId: run.attemptId,
+        correlationId: thread.contextId,
+        conversationId: thread.contextId,
+        ...(roomId === undefined ? {} : { roomId }),
+        ...(roomEpoch === undefined ? {} : { epoch: roomEpoch }),
+        payload: {
+          instruction: instruction || '请根据当前 Team 上下文协作处理。',
+          acceptanceCriteria: [],
+          requester,
+          replyTarget: message.target,
+          teamId: route.team.id,
+          teamName: route.team.name,
+          teamThreadId: thread.id,
+          teamContextId: thread.contextId,
+          teamVersion: route.team.version,
+          teamMemberBotIds: [...route.participantBotIds],
+          ...(roomId === undefined ? {} : { transcript: await this.rooms.transcript(roomId) }),
+        },
+      })
+      await this.mailbox.enqueue(envelope, 'team:' + thread.id + ':run:' + run.id)
+      await this.tasks.audit('team', route.team.id, requester, 'team.message_queued', {
+        teamThreadId: thread.id,
+        taskId: task.id,
+        runId: run.id,
+        to: assignedBot,
+        roomId: roomId ?? null,
+        memberBotIds: route.participantBotIds,
+        blockedBotIds: route.blockedBotIds,
+        truncatedBotIds: route.truncatedBotIds,
+      }, thread.contextId)
+      const skipped = [...new Set([...route.blockedBotIds, ...route.truncatedBotIds])]
+      const suffix = skipped.length > 0
+        ? ` 未路由成员：${skipped.map(botId => '@' + botId).join('、')}。`
+        : ''
+      await this.sendText(
+        message.target,
+        roomId === undefined
+          ? `已将 Team ${route.team.name} 的任务交给 ${route.participantBotIds.map(botId => '@' + botId).join('、')}。任务 ID：${task.id}。${suffix}`
+          : `已创建 Team ${route.team.name} 协作 Thread/Room，参与：${route.participantBotIds.map(botId => '@' + botId).join('、')}。${suffix} 任务 ID：${task.id}`,
+        'team-ack:' + message.id,
+      )
+      await this.wal.complete(walId)
+      void this.drainCollaboration().catch(error => this.log('warn', 'Team Router dispatch failed: ' + String(error)))
+    } catch (error: unknown) {
+      if (threadId !== undefined) await this.setTeamThreadStatus(threadId, 'cancelled')
+      if (createdTaskId !== undefined) {
+        const task = await this.tasks.task(createdTaskId)
+        if (task && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled') {
+          await this.tasks.cancelTask(createdTaskId, 'team-router')
+        }
+      }
+      await this.handleInboundFailure(
+        message,
+        walId,
+        error,
+        false,
+        'Team 路由失败：' + String(error),
+        'team-error:' + message.id,
+      )
+    }
+  }
+
+  private async setTeamThreadStatus(threadId: string, status: 'completed' | 'cancelled'): Promise<void> {
+    const current = await this.teams.getThread(threadId)
+    if (!current || current.status === 'completed' || current.status === 'cancelled') return
+    try {
+      await this.teams.updateThread(threadId, { status }, 'system:team-router', current.version)
+    } catch (error: unknown) {
+      this.log('warn', 'Team Thread status update failed: ' + String(error))
+    }
+  }
+
+  private async setTeamThreadStatusFromEnvelope(
+    envelope: BotMessageEnvelope,
+    status: 'completed' | 'cancelled',
+  ): Promise<void> {
+    const threadId = typeof envelope.payload.teamThreadId === 'string'
+      ? envelope.payload.teamThreadId
+      : undefined
+    if (threadId !== undefined) await this.setTeamThreadStatus(threadId, status)
   }
 
   private async handleManagerMention(
@@ -3492,6 +3670,7 @@ export class BotGateway {
       await this.failCompiledWorkflowEnvelope(envelope, error)
     }
     if (envelope.roomId !== undefined) await this.rooms.close(envelope.roomId)
+    await this.setTeamThreadStatusFromEnvelope(envelope, 'cancelled')
     const handoffId = typeof envelope.payload.handoffId === 'string' ? envelope.payload.handoffId : undefined
     if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', 'botfleet')
   }
@@ -3826,6 +4005,7 @@ export class BotGateway {
       const handoffId = typeof internal.envelope.payload.handoffId === 'string' ? internal.envelope.payload.handoffId : undefined
       if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', internal.botId)
       if (internal.envelope.roomId !== undefined) await this.rooms.close(internal.envelope.roomId)
+      await this.setTeamThreadStatusFromEnvelope(internal.envelope, 'cancelled')
       if (currentRun?.workflowId !== undefined) {
         void this.queueWorkflowContinuation(currentRun.workflowId)
       } else {
@@ -3927,12 +4107,14 @@ export class BotGateway {
       } else {
         await this.rooms.close(roomId)
         await this.tasks.completeRun(runId, result, true)
+        await this.setTeamThreadStatusFromEnvelope(internal.envelope, 'completed')
       }
     } else if (handoffId !== undefined) {
       const completion = await this.tasks.completeHandoffRun(runId, handoffId, result, internal.botId)
       if (completion === undefined) throw new Error(`handoff completion state is invalid: ${handoffId}`)
     } else {
       await this.tasks.completeRun(runId, result, true)
+      await this.setTeamThreadStatusFromEnvelope(internal.envelope, 'completed')
     }
     await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.completed', {
       taskId: internal.envelope.taskId,
