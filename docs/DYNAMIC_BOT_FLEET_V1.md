@@ -125,7 +125,8 @@ Google Drive is only for large development artifacts such as disposable stress l
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Chat create/edit/clone/confirm/disable/enable/delete | Implemented | Draft-first and owner-confirmed |
-| Automatic Fleet enrollment | Implemented | Owner-scoped runtime projection with status and audit |\n| Fleet health projection and roster filters | Implemented | Membership reason, bounded active Runs, latest failure, and local-console filters |
+| Automatic Fleet enrollment | Implemented | Owner-scoped runtime projection with status and audit |
+| Fleet health projection and roster filters | Implemented | Membership reason, bounded active Runs, latest failure, and local-console filters |
 | Direct dynamic `@bot` invocation | Implemented | Uses the same Task/Run/Mailbox path as static Bots |
 | Dynamic Bot to authorized Bot `@mention` | Implemented behind gate | TTL, hop, visited, ACL, approval, idempotency, and size bounds |
 | User `@manager` planning | Implemented behind gate | Deterministic policy; plan first, then bounded dispatch |
@@ -136,6 +137,8 @@ Google Drive is only for large development artifacts such as disposable stress l
 | Team-wide `@team` routing | Not complete | Explicit Team membership commands now exist; canonical Router integration remains future work |
 | 500 logical Bot roster | Data-path tested | Not 500 simultaneous model sessions |
 | Distributed workers and cross-machine transport | Not implemented | Single-node runtime only |
+
+The `/team manager` command currently persists a governance binding only. It does not replace the configured `@manager` identity or dispatch work until the canonical `@team` Router is implemented.
 
 ## Verification gates
 

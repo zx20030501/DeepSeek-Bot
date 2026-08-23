@@ -91,6 +91,8 @@ Planner 是确定性的，选择理由会保留；它不会调用另一个模型
 
 自动加入的是所有者私有的逻辑 Fleet roster，不是所有 Team。Team 最多六名成员且有独立 manager、revision 和并发约束，仍需显式加入，避免创建 Bot 时偷偷扩大 Team 权限。
 
+当前 `/team manager` 只保存 Team 的治理绑定，供后续 canonical Team/Thread Router 使用；它不会改变现有 `@manager` 的配置身份，也不会单独触发自动委派。`@team` Router 接入前，Team 仍是显式成员和线程的数据层。
+
 相关功能全部默认关闭。`peerMessaging`、`managerAgent` 和 `savedWorkflows` 不仅是配置字段，Gateway 的实际执行入口也会检查开关。本机设置页可以显式开启当前已经接通的能力；未实现的 `externalRuntimes` 不开放。
 
 ## 审批
