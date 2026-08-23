@@ -286,6 +286,9 @@ interface RemoteLedgerEntry {
   readonly deliveryId: string
   readonly state: 'reserved' | 'accepted'
   readonly updatedAt: number
+  /** Optional on old inbox rows; new rows always record their direction. */
+  readonly direction?: 'inbound' | 'outbound'
+  readonly message?: RemoteBotTransportMessage
 }
 
 interface RemoteLedgerEvent {
@@ -298,14 +301,29 @@ export interface RemoteFenceDecision {
   readonly entry: RemoteLedgerEntry
 }
 
-function ledgerKey(message: RemoteBotTransportMessage): string {
-  return message.sourceNodeId + ':' + (message.envelope.idempotencyKey ?? message.envelope.id)
+function ledgerKey(message: RemoteBotTransportMessage, direction: 'inbound' | 'outbound' = 'inbound'): string {
+  return direction + ':' + message.sourceNodeId + ':' + (message.envelope.idempotencyKey ?? message.envelope.id)
+}
+
+function outboundLedgerKey(sourceNodeId: string, idempotencyKey: string): string {
+  return 'outbound:' + sourceNodeId + ':' + idempotencyKey
+}
+
+function cloneLedgerEntry(entry: RemoteLedgerEntry): RemoteLedgerEntry {
+  return {
+    ...entry,
+    ...(entry.message === undefined ? {} : { message: structuredClone(entry.message) }),
+  }
 }
 
 /**
  * Durable remote inbox fence. A higher fencing token supersedes an older
  * attempt for the same source/idempotency key; the accepted marker is only
  * written after the Gateway has durably enqueued the local mailbox item.
+ *
+ * The same journal also stores outbound reservations when a caller supplies an
+ * explicit idempotency key. That closes the send -> journal commit gap without
+ * putting credentials into the Bot payload.
  */
 export class RemoteDeliveryLedger {
   private readonly journal: JsonlJournal<RemoteLedgerEvent>
@@ -320,7 +338,13 @@ export class RemoteDeliveryLedger {
   public async load(): Promise<void> {
     if (this.loaded) return
     for (const event of await this.journal.read()) {
-      if (event.entry) this.entries.set(event.entry.key, event.entry)
+      if (event.entry) {
+        const entry = event.entry
+        this.entries.set(entry.key, {
+          ...entry,
+          ...(entry.direction === undefined ? { direction: 'inbound' as const } : {}),
+        })
+      }
     }
     this.loaded = true
   }
@@ -339,15 +363,15 @@ export class RemoteDeliveryLedger {
   public async admit(message: RemoteBotTransportMessage): Promise<RemoteFenceDecision> {
     return this.serialize(async () => {
       await this.load()
-      const key = ledgerKey(message)
+      const key = ledgerKey(message, 'inbound')
       const current = this.entries.get(key)
       if (current !== undefined) {
-        if (current.fencingToken > message.fencingToken) return { decision: 'stale', entry: { ...current } }
+        if (current.fencingToken > message.fencingToken) return { decision: 'stale', entry: cloneLedgerEntry(current) }
         if (current.fencingToken === message.fencingToken) {
           if (current.leaseId !== message.leaseId) {
-            return { decision: 'stale', entry: { ...current } }
+            return { decision: 'stale', entry: cloneLedgerEntry(current) }
           }
-          if (current.state === 'accepted') return { decision: 'duplicate', entry: { ...current } }
+          if (current.state === 'accepted') return { decision: 'duplicate', entry: cloneLedgerEntry(current) }
         }
       }
       const entry: RemoteLedgerEntry = {
@@ -358,24 +382,80 @@ export class RemoteDeliveryLedger {
         leaseId: message.leaseId,
         deliveryId: message.deliveryId,
         state: 'reserved',
+        direction: 'inbound',
         updatedAt: Date.now(),
       }
       this.entries.set(key, entry)
       await this.journal.append({ kind: 'reserved', entry })
-      return { decision: 'accepted', entry: { ...entry } }
+      return { decision: 'accepted', entry: cloneLedgerEntry(entry) }
     })
   }
 
   public async commit(message: RemoteBotTransportMessage, at = Date.now()): Promise<void> {
     await this.serialize(async () => {
       await this.load()
-      const key = ledgerKey(message)
+      const key = ledgerKey(message, 'inbound')
       const current = this.entries.get(key)
       if (
         current === undefined
         || current.fencingToken !== message.fencingToken
         || current.leaseId !== message.leaseId
       ) return
+      const entry: RemoteLedgerEntry = {
+        ...current,
+        direction: 'inbound',
+        state: 'accepted',
+        updatedAt: at,
+      }
+      this.entries.set(key, entry)
+      await this.journal.append({ kind: 'accepted', entry })
+    })
+  }
+
+  /** Return a reserved/sent outbound message for a caller-provided idempotency key. */
+  public async getOutbound(
+    sourceNodeId: string,
+    idempotencyKey: string,
+  ): Promise<RemoteBotTransportMessage | undefined> {
+    await this.load()
+    const entry = this.entries.get(outboundLedgerKey(sourceNodeId, idempotencyKey))
+    if (entry?.direction !== 'outbound' || entry.message === undefined) return undefined
+    return structuredClone(entry.message)
+  }
+
+  /** Reserve an outbound message before the network call. */
+  public async reserveOutbound(message: RemoteBotTransportMessage): Promise<RemoteBotTransportMessage> {
+    return this.serialize(async () => {
+      await this.load()
+      const key = ledgerKey(message, 'outbound')
+      const current = this.entries.get(key)
+      if (current?.direction === 'outbound' && current.message !== undefined) {
+        return structuredClone(current.message)
+      }
+      const entry: RemoteLedgerEntry = {
+        key,
+        sourceNodeId: message.sourceNodeId,
+        idempotencyKey: message.envelope.idempotencyKey ?? message.envelope.id,
+        fencingToken: message.fencingToken,
+        leaseId: message.leaseId,
+        deliveryId: message.deliveryId,
+        state: 'reserved',
+        direction: 'outbound',
+        message: structuredClone(message),
+        updatedAt: Date.now(),
+      }
+      this.entries.set(key, entry)
+      await this.journal.append({ kind: 'reserved', entry })
+      return structuredClone(message)
+    })
+  }
+
+  public async commitOutbound(message: RemoteBotTransportMessage, at = Date.now()): Promise<void> {
+    await this.serialize(async () => {
+      await this.load()
+      const key = ledgerKey(message, 'outbound')
+      const current = this.entries.get(key)
+      if (current?.direction !== 'outbound' || current.message === undefined) return
       const entry: RemoteLedgerEntry = { ...current, state: 'accepted', updatedAt: at }
       this.entries.set(key, entry)
       await this.journal.append({ kind: 'accepted', entry })
@@ -384,7 +464,10 @@ export class RemoteDeliveryLedger {
 
   public async snapshot(): Promise<readonly RemoteFenceDecision[]> {
     await this.load()
-    return [...this.entries.values()].map(entry => ({ decision: entry.state === 'accepted' ? 'duplicate' : 'accepted', entry: { ...entry } }))
+    return [...this.entries.values()].map(entry => ({
+      decision: entry.state === 'accepted' ? 'duplicate' : 'accepted',
+      entry: cloneLedgerEntry(entry),
+    }))
   }
 }
 
