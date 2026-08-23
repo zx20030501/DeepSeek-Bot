@@ -160,8 +160,12 @@ test('HTTP sender and loopback transport use the same signed receipt contract', 
 })
 
 test('remote transport rejects oversized and credential-like envelopes', () => {
+  const malicious = {
+    ...envelope(),
+    payload: { instruction: 'x'.repeat(70_000), apiKey: 'blocked' },
+  }
   assert.throws(() => createRemoteTransportMessage({
-    envelope: envelope({ payload: { instruction: 'x'.repeat(70_000), apiKey: 'blocked' } }),
+    envelope: malicious,
     sourceNodeId: 'node-a',
     targetNodeId: 'node-b',
   }), RemoteTransportValidationError)
