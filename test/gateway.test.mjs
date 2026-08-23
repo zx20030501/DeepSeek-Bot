@@ -2062,7 +2062,12 @@ test('chat Team commands keep membership explicit and owner-scoped', async () =>
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-team-command-'))
   let gateway
   try {
-    gateway = new BotGateway({}, {
+    const agents = {
+      get() { return undefined },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('Team commands should not create an Agent') },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? agents : undefined }, {
       stateDir: root,
       access: { userIds: ['ou_a', 'ou_b'] },
       telegram: { enabled: false },
