@@ -1262,7 +1262,7 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
       </section>
 
       <section className="dsh-hermes-panel">
-        <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 设置</h3><p className="dsh-hermes-muted"><code>/fleet 任务</code> 会按能力并行分派，再进行验证和汇总；显式 <code>@bot</code> 仍可创建单 Bot 或顺序协作房间。</p></div><span className={`dsh-hermes-badge ${draft.collaboration.enabled ? 'ok' : 'missing'}`}>{draft.collaboration.enabled ? 'Fleet 已启用' : 'Fleet 已停用'}</span></div>
+        <div className="dsh-hermes-diagnostic-head"><div><h3>Bot Fleet 设置</h3><p className="dsh-hermes-muted"><code>/fleet 任务</code> 会按能力并行分派，再进行验证和汇总；显式 <code>@bot</code> 仍可创建单 Bot 或顺序协作房间。</p><p className="dsh-hermes-muted">动态 Bot 默认关闭；对话创建依赖“动态 Bot 注册表”，Peer、Manager 和 Saved Workflow 也必须分别开启。外部 Hermes/Grok Runtime 目前保留关闭。</p></div><span className={`dsh-hermes-badge ${draft.collaboration.enabled ? 'ok' : 'missing'}`}>{draft.collaboration.enabled ? 'Fleet 已启用' : 'Fleet 已停用'}</span></div>
         <div className="dsh-hermes-grid">
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.enabled} onChange={event => { updateCollaboration('enabled', event.target.checked) }} /><span>启用 Bot Fleet</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.autoPlanner} onChange={event => { updateCollaboration('autoPlanner', event.target.checked) }} /><span>启用自动 Planner</span></label>

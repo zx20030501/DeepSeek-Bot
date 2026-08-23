@@ -54,6 +54,8 @@ export function formatHelp(): string {
     '/bot confirm <code> — 用 8 位确认码激活 Bot 草稿',
     '/bot list — 查看自己的动态 Bot、状态和待确认码',
     '/bot status <id> — 查看动态 Bot 的 Fleet 加入、忙碌和最近失败状态',
+    '动态 Bot 流程：设置页同时开启“动态 Bot 注册表”和“允许在对话中创建 Bot”，发送 /new → /bot create → /bot confirm。',
+    'Team 不会自动扩权：用 /teams 和 /team add/remove 显式维护成员。',
     '/bot edit|disable|enable|delete|clone … — 管理自己的动态 Bot',
     '/teams — 查看当前用户可见的 Team',
     '/team create|add|remove|manager|status … — 显式管理 Team 成员和状态',
