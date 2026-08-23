@@ -313,6 +313,17 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       ...(route.enabled === false ? { enabled: false } : {}),
     }
   }
+  const remoteNodes: Record<string, { readonly endpoint: string; readonly enabled?: boolean }> = {}
+  for (const [nodeId, rawNode] of Object.entries(asRecord(remoteTransport.nodes))) {
+    const node = asRecord(rawNode)
+    if (typeof node.endpoint !== 'string') continue
+    const normalizedNodeId = nodeId.trim()
+    if (normalizedNodeId.length === 0 || normalizedNodeId.length > 128) continue
+    remoteNodes[normalizedNodeId] = {
+      endpoint: node.endpoint,
+      ...(node.enabled === false ? { enabled: false } : {}),
+    }
+  }
   const profiles: Record<string, Omit<BotProfile, 'name'>> = {}
   const rawProfiles = asRecord(input.profiles)
   for (const [name, value] of Object.entries(rawProfiles)) profiles[name] = asRecord(value) as Omit<BotProfile, 'name'>
@@ -349,6 +360,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       ...(remoteNodeId === undefined || remoteNodeId.length === 0 ? {} : { nodeId: remoteNodeId }),
       sharedSecretEnv: remoteSharedSecretEnv,
       routes: remoteRoutes,
+      nodes: remoteNodes,
       ...(typeof remoteTransport.defaultLeaseMs === 'number' ? { defaultLeaseMs: remoteTransport.defaultLeaseMs } : {}),
       ...(typeof remoteTransport.timeoutMs === 'number' ? { timeoutMs: remoteTransport.timeoutMs } : {}),
       ...(typeof remoteTransport.maxPayloadBytes === 'number' ? { maxPayloadBytes: remoteTransport.maxPayloadBytes } : {}),
@@ -1716,6 +1728,12 @@ export class BotGateway {
     return route
   }
 
+  private remoteRouteForNode(nodeId: string): RemoteBotRoute | undefined {
+    const node = this.config.remoteTransport?.nodes?.[nodeId]
+    if (!node || node.enabled === false) return undefined
+    return { nodeId, endpoint: node.endpoint }
+  }
+
   private remoteNodeIdOrThrow(): string {
     const nodeId = this.config.remoteTransport?.nodeId?.trim()
     if (!nodeId) throw new Error('Remote Bot Transport requires collaboration.remoteTransport.nodeId or DSH_BOT_NODE_ID')
@@ -1766,10 +1784,10 @@ export class BotGateway {
 
   private async sendRemoteResult(internal: InternalRun, result: string, status: 'completed' | 'failed'): Promise<void> {
     const sourceBotId = internal.envelope.from
-    const route = this.remoteRouteForBot(sourceBotId)
     const sourceNodeId = typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string'
       ? internal.envelope.payload.__dshRemoteSourceNodeId
       : undefined
+    const route = sourceNodeId === undefined ? undefined : this.remoteRouteForNode(sourceNodeId)
     if (!route || sourceNodeId === undefined || route.nodeId !== sourceNodeId) {
       await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_result_route_missing', {
         sourceNodeId: sourceNodeId ?? null,

@@ -69,7 +69,12 @@ When BotGateway is configured with remoteTransport.enabled, nodeId, a secret env
           researcher:
             nodeId: node-b
             endpoint: https://node-b.example/internal/dsh/bot-messages
+        nodes:
+          node-b:
+            endpoint: https://node-b.example/internal/dsh/bot-messages
 
 Remote route messages require an explicit idempotencyKey. The sender persists the exact outbound envelope before the network call, retries the same envelope after a restart, and commits the outbound ledger only after a positive receipt. The receiver sends a report envelope back to the source node after the local Bot finishes. The source node then completes the original Task/Run and emits the reply to the original platform target.
+
+The routes map is used for outbound target Bots. The nodes map is used for report callbacks; for example the receiving node needs a node-a endpoint so it can return a completed report to the sender.
 
 The route endpoint and shared secret are operational configuration. Keep the secret in the environment or DSH credentials service; never put it in the JSON settings body.
