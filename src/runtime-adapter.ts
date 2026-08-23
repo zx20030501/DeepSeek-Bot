@@ -492,9 +492,11 @@ function eventParts(event: HermesRuntimeEvent): {
   readonly payload: unknown
 } {
   const params = isRecord(event.params) ? event.params : {}
+  const type = stringValue(params.type)
+  const sessionId = stringValue(params.session_id) ?? stringValue(params.sessionId)
   return {
-    type: stringValue(params.type),
-    sessionId: stringValue(params.session_id) ?? stringValue(params.sessionId),
+    ...(type === undefined ? {} : { type }),
+    ...(sessionId === undefined ? {} : { sessionId }),
     payload: params.payload ?? params,
   }
 }
@@ -661,13 +663,12 @@ export class HermesRuntimeAdapter implements RuntimeAdapter {
       const directText = hermesText(response)
       if (directText.length > 0) {
         waiter?.stop()
+        const responseId = isRecord(response) ? stringValue(response.id) : undefined
         return {
           requestId: request.requestId,
           status: 'completed',
           text: directText,
-          ...(isRecord(response) && stringValue(response.id) !== undefined
-            ? { responseId: stringValue(response.id) }
-            : {}),
+          ...(responseId === undefined ? {} : { responseId }),
           raw: response,
         }
       }
