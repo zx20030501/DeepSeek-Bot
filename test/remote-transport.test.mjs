@@ -170,3 +170,31 @@ test('remote transport rejects oversized and credential-like envelopes', () => {
     targetNodeId: 'node-b',
   }), RemoteTransportValidationError)
 })
+
+
+test('outbound ledger reserves the exact envelope and survives a restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-remote-outbox-'))
+  try {
+    const message = createRemoteTransportMessage({
+      envelope: envelope({ idempotencyKey: 'remote-outbox-key' }),
+      sourceNodeId: 'node-a',
+      targetNodeId: 'node-b',
+      leaseId: 'lease-outbound',
+      fencingToken: 1,
+      deliveryId: 'delivery-outbound',
+      issuedAt: 2_000,
+      leaseMs: 10_000,
+    })
+    const ledger = new RemoteDeliveryLedger(join(root, 'remote-outbox.jsonl'))
+    const reserved = await ledger.reserveOutbound(message)
+    assert.equal(reserved.deliveryId, message.deliveryId)
+    assert.equal((await ledger.getOutbound('node-a', 'remote-outbox-key'))?.envelope.id, message.envelope.id)
+    await ledger.commitOutbound(message)
+    const reloaded = new RemoteDeliveryLedger(join(root, 'remote-outbox.jsonl'))
+    const entry = (await reloaded.snapshot()).find(item => item.entry.direction === 'outbound')
+    assert.equal(entry?.entry.state, 'accepted')
+    assert.equal(entry?.entry.message?.targetNodeId, 'node-b')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

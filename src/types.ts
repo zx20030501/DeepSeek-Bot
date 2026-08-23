@@ -137,6 +137,11 @@ export interface RemoteBotRoute {
   readonly enabled?: boolean
 }
 
+export interface RemoteNodeRoute {
+  readonly endpoint: string
+  readonly enabled?: boolean
+}
+
 export interface RemoteBotTransportConfig {
   /** Cross-machine Bot-to-Bot transport is disabled unless explicitly enabled. */
   readonly enabled?: boolean
@@ -146,6 +151,8 @@ export interface RemoteBotTransportConfig {
   readonly sharedSecretEnv?: string
   /** Local Bot handle to remote node/endpoint mapping. */
   readonly routes?: Record<string, RemoteBotRoute>
+  /** Return endpoints keyed by remote node ID. */
+  readonly nodes?: Record<string, RemoteNodeRoute>
   readonly defaultLeaseMs?: number
   readonly timeoutMs?: number
   readonly maxPayloadBytes?: number

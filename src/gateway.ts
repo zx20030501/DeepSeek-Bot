@@ -22,7 +22,9 @@ import { generateManagerPlan } from './manager-policy.js'
 import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
 import {
+  HttpRemoteBotTransport,
   RemoteDeliveryLedger,
+  createRemoteTransportMessage,
   validateRemoteTransportMessage,
   type RemoteBotTransportMessage,
   type RemoteTransportReceipt,
@@ -77,6 +79,7 @@ import type {
 import type {
   BotAddress,
   BotMessageEnvelope,
+  RemoteBotRoute,
   BotDefinitionStatus,
   BotDescriptor,
   BotCollaborationConfig,
@@ -289,6 +292,12 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
     ? feishu.appSecret
     : firstEnv('DEEPSEEK_BOT_FEISHU_APP_SECRET', 'DSH_HERMES_BOT_FEISHU_APP_SECRET')
   const configuredStateDir = typeof input.stateDir === 'string' ? input.stateDir : firstEnv('DEEPSEEK_BOT_HOME', 'DSH_HERMES_BOT_HOME')
+  const remoteNodeId = typeof remoteTransport.nodeId === 'string'
+    ? remoteTransport.nodeId.trim()
+    : firstEnv('DSH_BOT_NODE_ID', 'DEEPSEEK_BOT_NODE_ID')
+  const remoteSharedSecretEnv = typeof remoteTransport.sharedSecretEnv === 'string' && remoteTransport.sharedSecretEnv.trim().length > 0
+    ? remoteTransport.sharedSecretEnv.trim()
+    : 'DSH_BOT_TRANSPORT_SECRET'
   const maxGroupRounds = typeof collaboration.maxGroupRounds === 'number'
     ? collaboration.maxGroupRounds
     : typeof collaboration.maxGroupTurns === 'number' ? collaboration.maxGroupTurns : 3
@@ -302,6 +311,17 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       nodeId: route.nodeId,
       endpoint: route.endpoint,
       ...(route.enabled === false ? { enabled: false } : {}),
+    }
+  }
+  const remoteNodes: Record<string, { readonly endpoint: string; readonly enabled?: boolean }> = {}
+  for (const [nodeId, rawNode] of Object.entries(asRecord(remoteTransport.nodes))) {
+    const node = asRecord(rawNode)
+    if (typeof node.endpoint !== 'string') continue
+    const normalizedNodeId = nodeId.trim()
+    if (normalizedNodeId.length === 0 || normalizedNodeId.length > 128) continue
+    remoteNodes[normalizedNodeId] = {
+      endpoint: node.endpoint,
+      ...(node.enabled === false ? { enabled: false } : {}),
     }
   }
   const profiles: Record<string, Omit<BotProfile, 'name'>> = {}
@@ -337,9 +357,10 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
     },
     remoteTransport: {
       enabled: remoteTransport.enabled === true,
-      ...(typeof remoteTransport.nodeId === 'string' ? { nodeId: remoteTransport.nodeId } : {}),
-      ...(typeof remoteTransport.sharedSecretEnv === 'string' ? { sharedSecretEnv: remoteTransport.sharedSecretEnv } : {}),
+      ...(remoteNodeId === undefined || remoteNodeId.length === 0 ? {} : { nodeId: remoteNodeId }),
+      sharedSecretEnv: remoteSharedSecretEnv,
       routes: remoteRoutes,
+      nodes: remoteNodes,
       ...(typeof remoteTransport.defaultLeaseMs === 'number' ? { defaultLeaseMs: remoteTransport.defaultLeaseMs } : {}),
       ...(typeof remoteTransport.timeoutMs === 'number' ? { timeoutMs: remoteTransport.timeoutMs } : {}),
       ...(typeof remoteTransport.maxPayloadBytes === 'number' ? { maxPayloadBytes: remoteTransport.maxPayloadBytes } : {}),
@@ -1438,16 +1459,26 @@ export class BotGateway {
 
   private async sendBotMessageUnlocked(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
-    const bot = this.directory.get(input.to)
-    if (!bot || !this.directory.canInvoke(bot.id, input.replyTarget)) throw new Error('Bot is unavailable or not authorized: ' + input.to)
-    if (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always') {
+    const requestedBotId = input.to.trim().toLowerCase()
+    const bot = this.directory.get(requestedBotId)
+    const remoteRoute = bot === undefined ? this.remoteRouteForBot(requestedBotId) : undefined
+    if (!bot && remoteRoute === undefined) throw new Error('Bot is unavailable or not authorized: ' + input.to)
+    if (bot && !this.directory.canInvoke(bot.id, input.replyTarget)) {
+      throw new Error('Bot is unavailable or not authorized: ' + input.to)
+    }
+    if (bot && (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always')) {
       throw new Error('Bot requires an approved Fleet workflow or handoff: ' + input.to)
     }
-    if (input.idempotencyKey !== undefined) {
-      const existing = await this.mailbox.getByIdempotencyKey(input.idempotencyKey)
-      if (existing) return existing.envelope
+    if (remoteRoute !== undefined && input.idempotencyKey === undefined) {
+      throw new Error('Remote Bot messages require an explicit idempotencyKey for durable retry')
     }
-
+    if (input.idempotencyKey !== undefined && remoteRoute !== undefined) {
+      const existingRemote = await this.remoteDeliveryLedger.getOutbound(this.remoteNodeIdOrThrow(), input.idempotencyKey)
+      if (existingRemote !== undefined) {
+        await this.dispatchRemoteEnvelope(existingRemote.envelope, remoteRoute, existingRemote)
+        return existingRemote.envelope
+      }
+    }
     const fromAddress: BotAddress = input.fromAddress ?? {
       id: input.from,
       type: input.from.startsWith('user:') ? 'user' : 'bot',
@@ -1457,14 +1488,15 @@ export class BotGateway {
     if (fromAddress.type === 'bot' && this.config.collaboration?.features?.peerMessaging !== true) {
       throw new Error('Peer Messaging is disabled; enable collaboration.features.peerMessaging first')
     }
+    const targetBotId = bot?.id ?? requestedBotId
     const toAddress: BotAddress = input.toAddress ?? {
-      id: bot.id,
+      id: targetBotId,
       type: 'bot',
       ...(input.toSessionId === undefined ? {} : { sessionId: input.toSessionId }),
     }
     if (
       typeof toAddress.id !== 'string'
-      || toAddress.id.toLowerCase() !== bot.id
+      || toAddress.id.toLowerCase() !== targetBotId
       || (toAddress.type !== undefined && toAddress.type !== 'bot')
     ) {
       throw new Error('toAddress must identify the selected Bot')
@@ -1484,16 +1516,18 @@ export class BotGateway {
       title: input.title ?? input.instruction,
       instruction: input.instruction,
       createdBy: input.from,
-      assignedTo: bot.id,
+      assignedTo: targetBotId,
       ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
     })
     try {
-      await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+      if (bot !== undefined) {
+        await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+      }
     } catch (error: unknown) {
       await this.tasks.cancelTask(task.id, 'system:admission')
       throw error
     }
-    const run = await this.tasks.createRun(task.id, bot.id, 1)
+    const run = await this.tasks.createRun(task.id, targetBotId, 1)
     const envelope = createPeerEnvelope({
       kind: input.kind ?? 'request',
       from: fromAddress,
@@ -1512,10 +1546,32 @@ export class BotGateway {
       ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
       payload: messagePayload,
     }, this.config.collaboration ?? {})
+    if (remoteRoute !== undefined) {
+      try {
+        await this.dispatchRemoteEnvelope(envelope, remoteRoute)
+      } catch (error: unknown) {
+        // The Task/Run intentionally stays queued. The outbound ledger holds
+        // the exact message so a caller can retry with the same idempotency key
+        // without creating a second local Task/Run.
+        await this.tasks.audit('message', envelope.id, input.from, 'message.remote_send_failed', {
+          targetNodeId: remoteRoute.nodeId,
+          taskId: task.id,
+          runId: run.id,
+          error: String(error).slice(0, 500),
+        }, envelope.correlationId)
+        throw error
+      }
+      await this.tasks.audit('message', envelope.id, input.from, 'message.remote_sent', {
+        targetNodeId: remoteRoute.nodeId,
+        taskId: task.id,
+        runId: run.id,
+      }, envelope.correlationId)
+      return envelope
+    }
     await this.mailbox.enqueue(envelope, peerMessageIdempotencyKey(envelope))
     await this.tasks.audit('message', envelope.id, input.from, 'message.queued', {
       taskId: task.id,
-      to: bot.id,
+      to: bot!.id,
       schemaVersion: envelope.schemaVersion ?? null,
       hop: envelope.hop ?? 0,
     }, envelope.correlationId)
@@ -1533,12 +1589,18 @@ export class BotGateway {
   ): Promise<RemoteTransportReceipt> {
     return this.withDurableMutation(async () => {
       const message = validateRemoteTransportMessage(rawMessage, this.config.remoteTransport ?? {})
-      const configuredNodeId = this.config.remoteTransport?.nodeId
       if (this.config.remoteTransport?.enabled !== true) {
         return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-transport-disabled' }
       }
-      if (configuredNodeId !== undefined && configuredNodeId !== message.targetNodeId) {
+      const configuredNodeId = this.config.remoteTransport.nodeId
+      if (configuredNodeId === undefined || configuredNodeId.length === 0) {
+        return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-node-id-missing' }
+      }
+      if (configuredNodeId !== message.targetNodeId) {
         return { accepted: false, deliveryId: message.deliveryId, errorCode: 'target-node-mismatch' }
+      }
+      if (message.envelope.kind === 'report' && message.envelope.payload.remoteResult !== undefined) {
+        return this.receiveRemoteResult(message)
       }
       if (message.envelope.kind === 'cancel') {
         return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-cancel-not-supported' }
@@ -1587,23 +1649,194 @@ export class BotGateway {
           leaseUntil: message.expiresAt,
         }
       }
-      const item = await this.mailbox.enqueue(message.envelope, idempotencyKey)
+      const localEnvelope: BotMessageEnvelope = {
+        ...message.envelope,
+        payload: {
+          ...message.envelope.payload,
+          __dshRemoteSourceNodeId: message.sourceNodeId,
+          __dshRemoteSourceBotId: message.envelope.from,
+          __dshRemoteDeliveryId: message.deliveryId,
+        },
+      }
+      const item = await this.mailbox.enqueue(localEnvelope, idempotencyKey)
       await this.tasks.audit('message', message.envelope.id, 'remote:' + message.sourceNodeId, 'message.remote_queued', {
         sourceNodeId: message.sourceNodeId,
         targetNodeId: message.targetNodeId,
         taskId: message.envelope.taskId,
         runId: message.envelope.runId,
         fencingToken: message.fencingToken,
-        duplicate: existing !== undefined || reconciled.duplicate || item.id !== message.envelope.id,
+        duplicate: existing !== undefined || reconciled.duplicate || item.id !== localEnvelope.id,
       }, message.envelope.correlationId)
       void this.drainCollaboration().catch(error => this.log('warn', 'remote Bot message dispatch failed: ' + String(error)))
       return {
         accepted: true,
-        ...(existing !== undefined || reconciled.duplicate || item.id !== message.envelope.id ? { duplicate: true } : {}),
+        ...(existing !== undefined || reconciled.duplicate || item.id !== localEnvelope.id ? { duplicate: true } : {}),
         deliveryId: message.deliveryId,
         leaseUntil: message.expiresAt,
       }
     })
+  }
+
+  private async receiveRemoteResult(message: RemoteBotTransportMessage): Promise<RemoteTransportReceipt> {
+    const task = await this.tasks.task(message.envelope.taskId)
+    const run = await this.tasks.run(message.envelope.runId)
+    if (!task || !run || run.taskId !== task.id || run.taskId !== message.envelope.taskId || run.botId !== message.envelope.from) {
+      return { accepted: false, deliveryId: message.deliveryId, errorCode: 'remote-result-task-mismatch' }
+    }
+    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
+      return { accepted: true, duplicate: true, deliveryId: message.deliveryId, leaseUntil: message.expiresAt }
+    }
+    const status = message.envelope.payload.remoteStatus === 'failed' ? 'failed' : 'completed'
+    const resultValue = message.envelope.payload.remoteResult
+    const result = typeof resultValue === 'string' ? resultValue : serializeWorkflowResult(resultValue)
+    if (status === 'failed') {
+      const failed = await this.tasks.failRun(run.id, result, run.workflowId === undefined)
+      if (failed === undefined) {
+        return { accepted: true, duplicate: true, deliveryId: message.deliveryId, leaseUntil: message.expiresAt }
+      }
+      if (run.workflowId !== undefined) void this.queueWorkflowContinuation(run.workflowId)
+    } else {
+      const completed = await this.tasks.completeRun(run.id, result, true)
+      if (completed === undefined) {
+        return { accepted: true, duplicate: true, deliveryId: message.deliveryId, leaseUntil: message.expiresAt }
+      }
+      if (run.workflowId !== undefined) {
+        void this.queueWorkflowContinuation(run.workflowId)
+      } else {
+        const target = this.replyTarget(message.envelope)
+        if (target) {
+          await this.sendText(
+            target,
+            '@' + message.envelope.from + '：\n' + result,
+            'remote-result:' + message.envelope.taskId + ':' + message.envelope.runId,
+          ).catch(error => this.log('warn', 'remote result reply failed: ' + String(error)))
+        }
+      }
+    }
+    await this.tasks.audit('message', message.envelope.id, 'remote:' + message.sourceNodeId, 'message.remote_result_committed', {
+      sourceNodeId: message.sourceNodeId,
+      taskId: message.envelope.taskId,
+      runId: message.envelope.runId,
+      status,
+    }, message.envelope.correlationId)
+    return { accepted: true, deliveryId: message.deliveryId, leaseUntil: message.expiresAt }
+  }
+
+  private remoteRouteForBot(botId: string): RemoteBotRoute | undefined {
+    const route = this.config.remoteTransport?.routes?.[botId.trim().toLowerCase()]
+    if (!route || route.enabled === false) return undefined
+    return route
+  }
+
+  private remoteRouteForNode(nodeId: string): RemoteBotRoute | undefined {
+    const node = this.config.remoteTransport?.nodes?.[nodeId]
+    if (!node || node.enabled === false) return undefined
+    return { nodeId, endpoint: node.endpoint }
+  }
+
+  private remoteNodeIdOrThrow(): string {
+    const nodeId = this.config.remoteTransport?.nodeId?.trim()
+    if (!nodeId) throw new Error('Remote Bot Transport requires collaboration.remoteTransport.nodeId or DSH_BOT_NODE_ID')
+    return nodeId
+  }
+
+  private remoteSecretOrThrow(): string {
+    const envName = this.config.remoteTransport?.sharedSecretEnv ?? 'DSH_BOT_TRANSPORT_SECRET'
+    const secret = process.env[envName]
+    if (!secret) throw new Error('Remote Bot Transport secret is missing from ' + envName)
+    return secret
+  }
+
+  private async dispatchRemoteEnvelope(
+    envelope: BotMessageEnvelope,
+    route: RemoteBotRoute,
+    existing?: RemoteBotTransportMessage,
+  ): Promise<RemoteTransportReceipt> {
+    const sourceNodeId = this.remoteNodeIdOrThrow()
+    let message = existing ?? createRemoteTransportMessage({
+      envelope,
+      sourceNodeId,
+      targetNodeId: route.nodeId,
+      ...(this.config.remoteTransport?.defaultLeaseMs === undefined ? {} : { leaseMs: this.config.remoteTransport.defaultLeaseMs }),
+    }, this.config.remoteTransport ?? {})
+    if (message.sourceNodeId !== sourceNodeId || message.targetNodeId !== route.nodeId) {
+      throw new Error('Remote Bot route changed after the delivery was reserved')
+    }
+    if (message.envelope.idempotencyKey !== undefined) {
+      message = await this.remoteDeliveryLedger.reserveOutbound(message)
+    }
+    const transport = new HttpRemoteBotTransport({
+      endpoint: route.endpoint,
+      nodeId: sourceNodeId,
+      sharedSecret: this.remoteSecretOrThrow(),
+      ...(this.config.remoteTransport?.timeoutMs === undefined ? {} : { timeoutMs: this.config.remoteTransport.timeoutMs }),
+      ...(this.config.remoteTransport?.maxPayloadBytes === undefined ? {} : { maxPayloadBytes: this.config.remoteTransport.maxPayloadBytes }),
+      ...(this.config.remoteTransport?.clockSkewMs === undefined ? {} : { clockSkewMs: this.config.remoteTransport.clockSkewMs }),
+    })
+    try {
+      const receipt = await transport.send(message)
+      if (message.envelope.idempotencyKey !== undefined) await this.remoteDeliveryLedger.commitOutbound(message)
+      return receipt
+    } finally {
+      await transport.close()
+    }
+  }
+
+  private async sendRemoteResult(internal: InternalRun, result: string, status: 'completed' | 'failed'): Promise<void> {
+    const sourceBotId = internal.envelope.from
+    const sourceNodeId = typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string'
+      ? internal.envelope.payload.__dshRemoteSourceNodeId
+      : undefined
+    const route = sourceNodeId === undefined ? undefined : this.remoteRouteForNode(sourceNodeId)
+    if (!route || sourceNodeId === undefined || route.nodeId !== sourceNodeId) {
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_result_route_missing', {
+        sourceNodeId: sourceNodeId ?? null,
+        sourceBotId,
+        status,
+      }, internal.envelope.correlationId)
+      return
+    }
+    const hop = (internal.envelope.hop ?? 0) + 1
+    const maxHops = internal.envelope.maxHops ?? normalizePeerPolicy(this.config.collaboration ?? {}).maxHops
+    if (hop > maxHops) {
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_result_hop_limit', {
+        hop,
+        maxHops,
+      }, internal.envelope.correlationId)
+      return
+    }
+    const targetAddress = internal.envelope.fromAddress ?? { id: sourceBotId, type: 'bot' as const }
+    const replyTarget = this.replyTarget(internal.envelope)
+    const report = createPeerEnvelope({
+      kind: 'report',
+      from: { id: internal.botId, type: 'bot' },
+      to: targetAddress,
+      taskId: internal.envelope.taskId,
+      runId: internal.envelope.runId,
+      attemptId: internal.envelope.attemptId,
+      correlationId: internal.envelope.correlationId,
+      ...(internal.envelope.conversationId === undefined ? {} : { conversationId: internal.envelope.conversationId }),
+      replyTo: internal.envelope.id,
+      traceId: internal.envelope.traceId ?? internal.envelope.correlationId,
+      hop,
+      maxHops,
+      idempotencyKey: 'remote-report:' + internal.envelope.id + ':' + status,
+      payload: {
+        remoteResult: result,
+        remoteStatus: status,
+        requester: typeof internal.envelope.payload.requester === 'string'
+          ? internal.envelope.payload.requester
+          : internal.envelope.from,
+        ...(replyTarget === undefined ? {} : { replyTarget }),
+      },
+    }, this.config.collaboration ?? {})
+    await this.dispatchRemoteEnvelope(report, route)
+    await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_result_sent', {
+      sourceNodeId,
+      sourceBotId,
+      status,
+      reportId: report.id,
+    }, internal.envelope.correlationId)
   }
 
   /** Exposes the durable inbox fence for the host HTTP route. */
@@ -2470,6 +2703,7 @@ export class BotGateway {
       await this.recoverPreviousWorkerLeases()
       await this.recoverInterruptedRunCommits()
       await this.recoverAcceptedHandoffs()
+      await this.recoverRemoteOutbox().catch(error => this.log('warn', `remote outbox recovery failed: ${String(error)}`))
       void this.outbox.flush().catch(error => this.log('warn', `outbox recovery failed: ${String(error)}`))
       await this.recoverCompiledWorkflows().catch(error => this.log('warn', `Compiled Workflow recovery failed: ${String(error)}`))
       void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration recovery failed: ${String(error)}`))
@@ -2609,6 +2843,33 @@ export class BotGateway {
       if (item.envelope.roomId !== undefined) await this.rooms.close(item.envelope.roomId)
       const handoffId = typeof item.envelope.payload.handoffId === 'string' ? item.envelope.payload.handoffId : undefined
       if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', 'botfleet')
+    }
+  }
+
+  private async recoverRemoteOutbox(): Promise<void> {
+    const sourceNodeId = this.config.remoteTransport?.nodeId
+    if (this.config.remoteTransport?.enabled !== true || !sourceNodeId) return
+    const entries = await this.remoteDeliveryLedger.snapshot()
+    for (const decision of entries) {
+      const entry = decision.entry
+      if (entry.direction !== 'outbound' || entry.state !== 'reserved' || entry.message === undefined) continue
+      const route = this.remoteRouteForBot(entry.message.envelope.to)
+      if (!route || route.nodeId !== entry.message.targetNodeId) {
+        await this.tasks.audit('message', entry.message.envelope.id, 'botfleet-recovery', 'message.remote_outbox_route_missing', {
+          targetNodeId: entry.message.targetNodeId,
+          botId: entry.message.envelope.to,
+        }, entry.message.envelope.correlationId)
+        continue
+      }
+      try {
+        await this.dispatchRemoteEnvelope(entry.message.envelope, route, entry.message)
+        await this.tasks.audit('message', entry.message.envelope.id, 'botfleet-recovery', 'message.remote_outbox_retried', {
+          targetNodeId: route.nodeId,
+          botId: entry.message.envelope.to,
+        }, entry.message.envelope.correlationId)
+      } catch (error: unknown) {
+        this.log('warn', 'remote outbox recovery failed: ' + String(error))
+      }
     }
   }
 
@@ -4153,6 +4414,14 @@ export class BotGateway {
         void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow failure drain failed: ${String(nextError)}`))
         return
       }
+      if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
+        await this.sendRemoteResult(internal, String(error), 'failed').catch(reportError => {
+          this.log('warn', 'remote failure report failed: ' + String(reportError))
+        })
+        this.cleanupInternalRun(internal)
+        void this.drainCollaboration().catch(nextError => this.log('warn', `Remote failure continuation failed: ${String(nextError)}`))
+        return
+      }
       const handoffId = typeof internal.envelope.payload.handoffId === 'string' ? internal.envelope.payload.handoffId : undefined
       if (handoffId !== undefined) await this.tasks.updateHandoff(handoffId, 'rejected', internal.botId)
       if (internal.envelope.roomId !== undefined) await this.rooms.close(internal.envelope.roomId)
@@ -4237,6 +4506,19 @@ export class BotGateway {
       this.cleanupInternalRun(internal)
       void this.queueWorkflowContinuation(run.workflowId)
       void this.drainCollaboration().catch(nextError => this.log('warn', `Fleet continuation failed: ${String(nextError)}`))
+      return
+    }
+    if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
+      await this.tasks.completeRun(runId, result, true)
+      await this.sendRemoteResult(internal, result, 'completed').catch(reportError => {
+        this.log('warn', 'remote result report failed: ' + String(reportError))
+      })
+      await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.completed', {
+        taskId: internal.envelope.taskId,
+        remoteSourceNodeId: internal.envelope.payload.__dshRemoteSourceNodeId,
+      }, internal.envelope.correlationId)
+      this.cleanupInternalRun(internal)
+      void this.drainCollaboration().catch(nextError => this.log('warn', `Remote result continuation failed: ${String(nextError)}`))
       return
     }
     const target = this.replyTarget(internal.envelope)

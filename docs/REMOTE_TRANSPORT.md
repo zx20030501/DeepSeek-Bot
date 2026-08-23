@@ -54,3 +54,27 @@ This first slice intentionally keeps HTTP server registration host-owned. It all
 - Fencing tokens start at 1 and must increase for a new delivery attempt using the same idempotency key.
 
 Cross-machine Workflow scheduling remains Gateway-owned: the remote transport is only the durable message hop. A Workflow node must still be admitted through the local Task/Run/Mailbox state machine.
+
+
+## Automatic Bot route dispatch
+
+When BotGateway is configured with remoteTransport.enabled, nodeId, a secret environment name, and a routes map, sendBotMessage() can target a Bot that is not in the local roster:
+
+    collaboration:
+      remoteTransport:
+        enabled: true
+        nodeId: node-a
+        sharedSecretEnv: DSH_BOT_TRANSPORT_SECRET
+        routes:
+          researcher:
+            nodeId: node-b
+            endpoint: https://node-b.example/internal/dsh/bot-messages
+        nodes:
+          node-b:
+            endpoint: https://node-b.example/internal/dsh/bot-messages
+
+Remote route messages require an explicit idempotencyKey. The sender persists the exact outbound envelope before the network call, retries the same envelope after a restart, and commits the outbound ledger only after a positive receipt. The receiver sends a report envelope back to the source node after the local Bot finishes. The source node then completes the original Task/Run and emits the reply to the original platform target.
+
+The routes map is used for outbound target Bots. The nodes map is used for report callbacks; for example the receiving node needs a node-a endpoint so it can return a completed report to the sender.
+
+The route endpoint and shared secret are operational configuration. Keep the secret in the environment or DSH credentials service; never put it in the JSON settings body.
