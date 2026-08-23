@@ -35,5 +35,7 @@ test('extracts only text content blocks and keeps help actionable', () => {
   ]), 'hello world')
   const help = formatHelp()
   assert.match(help, /\/new/u)
+  assert.match(help, /动态 Bot 流程/u)
+  assert.match(help, /Team 不会自动扩权/u)
   assert.match(help, /未知 \/ 命令/u)
 })
