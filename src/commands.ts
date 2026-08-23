@@ -58,7 +58,7 @@ export function formatHelp(): string {
     'Team 不会自动扩权：用 /teams 和 /team add/remove 显式维护成员。',
     '/bot edit|disable|enable|delete|clone … — 管理自己的动态 Bot',
     '/teams — 查看当前用户可见的 Team',
-    '/team create|add|remove|manager|status … — 显式管理 Team 成员和状态',
+    '/team create|add|remove|manager|status … — 显式管理 Team 成员和状态；Manager 目前只保存治理配置，@team Router 尚未接入',
     '/mesh — 查看你自己的 BotMesh mailbox、task、run 和 handoff 状态',
     '/fleet <任务> — 自动规划并行 Bot 工作流（执行→验证→汇总）',
     '/tasks — 查看自己最近的 Fleet 任务',

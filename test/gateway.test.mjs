@@ -2109,12 +2109,60 @@ test('chat Team commands keep membership explicit and owner-scoped', async () =>
     const status = await send('team-status', 'ou_a', `/team status ${teamId}`)
     assert.match(status, /@researcher/u)
     assert.match(status, /@reviewer/u)
-    assert.match(await send('team-manager', 'ou_a', `/team manager ${teamId} reviewer`), /Team Manager 已更新/u)
+    const managerResult = await send('team-manager', 'ou_a', `/team manager ${teamId} reviewer`)
+    assert.match(managerResult, /Team Manager 已更新/u)
+    assert.match(managerResult, /@team Router 和自动委派尚未接入/u)
+    assert.match(await send('team-status-after-manager', 'ou_a', `/team status ${teamId}`), /@team Router 和自动委派尚未接入/u)
     assert.match(await send('team-remove', 'ou_a', `/team remove ${teamId} researcher`), /显式移出 Team/u)
     assert.doesNotMatch(await send('team-owner-privacy', 'ou_b', '/teams'), new RegExp(teamId, 'u'))
     assert.doesNotMatch(await send('team-owner-privacy-name', 'ou_b', '/teams'), /Research/u)
   } finally {
     if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+
+test('Team diagnostics restore persisted teams even when Fleet feature gates are off', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-team-diagnostics-recovery-'))
+  let gateway
+  let recovered
+  const config = {
+    stateDir: root,
+    telegram: { enabled: false },
+    feishu: { enabled: false },
+    profiles: { researcher: { capabilities: ['research'] } },
+    collaboration: {
+      enabled: true,
+      features: {
+        dynamicRegistry: false,
+        chatBotCreation: false,
+        peerMessaging: false,
+        managerAgent: false,
+        savedWorkflows: false,
+        externalRuntimes: false,
+      },
+    },
+  }
+  try {
+    gateway = new BotGateway({}, config)
+    await gateway.start()
+    const team = await gateway.teams.createTeam({
+      name: 'Recovery Team',
+      scope: 'user',
+      ownerId: 'user:feishu:ou_recovery',
+      memberBotIds: ['researcher'],
+    }, 'local-dashboard')
+    assert.equal(team.memberBotIds.length, 1)
+    await gateway.stop()
+
+    recovered = new BotGateway({}, config)
+    await recovered.start()
+    assert.equal(recovered.status().collaboration.teams.teams, 1)
+    assert.equal(recovered.status().collaboration.teams.activeTeams, 1)
+  } finally {
+    if (gateway) await gateway.stop()
+    if (recovered) await recovered.stop()
     await rm(root, { recursive: true, force: true })
   }
 })

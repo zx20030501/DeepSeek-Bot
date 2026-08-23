@@ -37,5 +37,6 @@ test('extracts only text content blocks and keeps help actionable', () => {
   assert.match(help, /\/new/u)
   assert.match(help, /动态 Bot 流程/u)
   assert.match(help, /Team 不会自动扩权/u)
+  assert.match(help, /Manager 目前只保存治理配置/u)
   assert.match(help, /未知 \/ 命令/u)
 })

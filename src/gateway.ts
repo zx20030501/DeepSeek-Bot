@@ -2234,7 +2234,11 @@ export class BotGateway {
     const features = this.config.collaboration?.features
     await this.registry.load()
     await this.assertStaticProfileNamespace(this.config)
-    if (features && Object.values(features).some(Boolean)) await this.teams.load()
+    // Team state is shown by the local Fleet diagnostics and is also lazily
+    // available to chat commands. Load it unconditionally so a restart with
+    // every Fleet feature gate disabled does not report a false zero-count
+    // Team snapshot before the first /teams command is issued.
+    await this.teams.load()
     await this.refreshBotDirectory()
     if (features?.dynamicRegistry === true) {
       await this.reconcileBotActivationApprovals()
@@ -4905,7 +4909,7 @@ export class BotGateway {
       '/team create <名称> <bot-id>[,bot-id...] — 创建私有 Team',
       '/team add <team-id> <bot-id> — 显式加入一个 Bot',
       '/team remove <team-id> <bot-id> — 显式移除一个 Bot',
-      '/team manager <team-id> <bot-id|none> — 设置或清除 Manager',
+      '/team manager <team-id> <bot-id|none> — 保存或清除治理 Manager（当前不驱动 @team Router）',
       '/team status <team-id> — 查看 Team 成员、版本和 Thread 状态',
     ].join('\n')
     if (action === 'help') return usage
@@ -4943,7 +4947,7 @@ export class BotGateway {
     if (action === 'status') {
       const threads = await this.teams.listThreads(team.id)
       const openThreads = threads.filter(thread => thread.status === 'open' || thread.status === 'waiting').length
-      return `${formatTeam(team)}\nThreads：${threads.length}（开放 ${openThreads}）`
+      return `${formatTeam(team)}\nThreads：${threads.length}（开放 ${openThreads}）\n提示：当前仅保存 Team 治理配置；@team Router 和自动委派尚未接入。`
     }
     if (action === 'add' || action === 'remove') {
       const botId = (parts[2] ?? '').trim().toLowerCase()
@@ -4978,7 +4982,7 @@ export class BotGateway {
       const updated = await this.teams.updateTeam(team.id, {
         managerBotId: manager === 'none' ? null : manager,
       }, actor, team.version)
-      return `Team Manager 已更新。\n${formatTeam(updated)}`
+      return `Team Manager 已更新（当前保存为治理配置；@team Router 和自动委派尚未接入）。\n${formatTeam(updated)}`
     }
     throw new Error(`不支持的 Team 操作：${action}。\n${usage}`)
   }
