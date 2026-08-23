@@ -51,7 +51,11 @@ function parseField(
     const slash = trimmed.split('/')
     if (slash.length > 2) throw new CronExpressionError('Invalid cron step in ' + label + ': ' + trimmed)
     const base = slash[0]
-    const step = slash.length === 2 ? parseInteger(slash[1], label + ' step') : 1
+    if (base === undefined) throw new CronExpressionError('Empty cron ' + label + ' item')
+    const stepRaw = slash[1]
+    const step = slash.length === 2
+      ? (stepRaw === undefined ? (() => { throw new CronExpressionError('Missing cron step in ' + label) })() : parseInteger(stepRaw, label + ' step'))
+      : 1
     if (step <= 0) throw new CronExpressionError('Cron step must be positive in ' + label)
     if (base === '*') wildcard = true
     let start: number
@@ -61,7 +65,9 @@ function parseField(
       end = maximum
     } else if (base.includes('-')) {
       const range = base.split('-')
-      if (range.length !== 2) throw new CronExpressionError('Invalid cron range in ' + label + ': ' + base)
+      if (range.length !== 2 || range[0] === undefined || range[1] === undefined) {
+        throw new CronExpressionError('Invalid cron range in ' + label + ': ' + base)
+      }
       start = parseInteger(range[0], label)
       end = parseInteger(range[1], label)
       if (start > end) throw new CronExpressionError('Cron range is reversed in ' + label + ': ' + base)
@@ -85,7 +91,18 @@ export function parseCronExpression(expression: string): ParsedCronExpression {
   if (typeof expression !== 'string') throw new CronExpressionError('Cron expression must be a string')
   const fields = expression.trim().split(/\s+/u)
   if (fields.length !== 5) throw new CronExpressionError('Cron expression must contain exactly five fields')
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields
+  const minute = fields[0]
+  const hour = fields[1]
+  const dayOfMonth = fields[2]
+  const month = fields[3]
+  const dayOfWeek = fields[4]
+  if (
+    minute === undefined
+    || hour === undefined
+    || dayOfMonth === undefined
+    || month === undefined
+    || dayOfWeek === undefined
+  ) throw new CronExpressionError('Cron expression must contain exactly five fields')
   return {
     expression: fields.join(' '),
     minute: parseField(minute, 'minute', 0, 59),
@@ -141,7 +158,9 @@ function calendarParts(date: Date, timezone: string): CalendarParts {
   }
   const values: Record<string, string> = {}
   for (const part of formatter.formatToParts(date)) values[part.type] = part.value
-  const weekday = weekdayNumbers[values.weekday]
+  const weekdayName = values.weekday
+  if (weekdayName === undefined) throw new CronExpressionError('Could not resolve weekday for timezone: ' + timezone)
+  const weekday = weekdayNumbers[weekdayName]
   if (weekday === undefined) throw new CronExpressionError('Could not resolve weekday for timezone: ' + timezone)
   return {
     minute: Number(values.minute),
@@ -602,7 +621,7 @@ export class RoutineScheduler {
   private readonly pollMs: number
   private readonly maxDuePerTick: number
   private readonly now: () => number
-  private readonly onError?: (error: unknown) => void
+  private readonly onError: ((error: unknown) => void) | undefined
   private readonly active = new Set<Promise<void>>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private running = false
