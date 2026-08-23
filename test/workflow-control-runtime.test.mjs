@@ -430,3 +430,43 @@ test('saved Workflows support update, cancelWorkflowRuns and delete management',
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('a workflow with a launch deadline fails when the whole run exceeds it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-wf-deadline-'))
+  let gateway
+  try {
+    const setup = await makeGateway(root, {
+      starter: (attempt, respond) => respond('ok', '["go"]'),
+      // worker has no behaviour: the run hangs until the deadline wake fires.
+    })
+    gateway = setup.gateway
+    const definition = await gateway.createWorkflowDefinition({
+      name: 'Deadline flow',
+      description: 'must finish in time',
+      ownerId: 'user:feishu:ou_user',
+      scope: 'user',
+      entryNodeId: 'start',
+      inputs: [],
+      outputs: [],
+      nodes: [
+        node('start', 'task', { capability: 'start' }),
+        node('hung', 'task', { capability: 'work' }),
+      ],
+      edges: [{ from: 'start', to: 'hung' }],
+      policy: policy(['start', 'work']),
+    }, 'user:feishu:ou_user')
+    const launch = await gateway.launchWorkflowDefinition(definition.id, 'user:feishu:ou_user', target, 'user:feishu:ou_user', {
+      launchId: 'deadline-run',
+      deadlineMs: 800,
+    })
+    await waitUntil(async () => {
+      const detail = await gateway.fleetTaskDetail(launch.rootTaskId, 'local-dashboard')
+      return detail.task.status === 'failed'
+    }, 5_000)
+    const detail = await gateway.fleetTaskDetail(launch.rootTaskId, 'local-dashboard')
+    assert.match(detail.task.error, /deadline exceeded/u)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})

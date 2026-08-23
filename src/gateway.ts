@@ -265,6 +265,8 @@ export interface WorkflowLaunchOptions {
   readonly launchId?: string
   /** JSON-safe values used by input references in the Workflow graph. */
   readonly inputs?: Readonly<Record<string, unknown>>
+  /** Whole-workflow deadline from launch; the run fails if it is not done in time. */
+  readonly deadlineMs?: number
 }
 
 export interface WorkflowLaunchResult {
@@ -1825,7 +1827,13 @@ export class BotGateway {
     if (launchId.length > 200) throw new Error('Workflow launchId is too long')
     const workflowRunId = 'workflow-run:' + definition.id + ':' + definition.revision + ':' + launchId
     const correlationId = 'workflow:' + definition.id + ':' + definition.revision + ':' + launchId
-    const workflowInputs = options.inputs === undefined ? {} : structuredClone(options.inputs)
+    const deadlineMs = options.deadlineMs === undefined
+      ? undefined
+      : Math.max(1_000, Math.floor(options.deadlineMs))
+    const workflowInputs = {
+      ...(options.inputs === undefined ? {} : structuredClone(options.inputs)),
+      ...(deadlineMs === undefined ? {} : { __dshWorkflowDeadline: Date.now() + deadlineMs }),
+    }
     validateWorkflowLaunchInputs(definition, workflowInputs)
     validatePeerPayload({ workflowInputs }, normalizePeerPolicy(this.config.collaboration ?? {}).maxPayloadBytes)
     const snapshot = await this.tasks.snapshot()
@@ -1863,6 +1871,16 @@ export class BotGateway {
     )
     if (dispatched.length > 0) {
       void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
+    }
+    if (deadlineMs !== undefined) {
+      this.scheduleWorkflowWake({
+        definition,
+        workflowRunId,
+        rootTaskId: rootTask.id,
+        requester,
+        replyTarget,
+        correlationId,
+      }, rootTask, deadlineMs)
     }
     return {
       workflowId: definition.id,
@@ -5870,6 +5888,11 @@ export class BotGateway {
       const compensationState = asRecord(root.workflowInputs?.__dshWorkflowCompensation)
       if (compensationState.active === true) {
         await this.advanceCompiledWorkflowCompensationLocked(input, root, compensationState)
+        return
+      }
+      const workflowDeadline = root.workflowInputs?.__dshWorkflowDeadline
+      if (typeof workflowDeadline === 'number' && Date.now() > workflowDeadline) {
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow deadline exceeded after ' + (Date.now() - workflowDeadline) + 'ms')
         return
       }
       const plan = compileWorkflowLaunch(input.definition)
