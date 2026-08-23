@@ -290,3 +290,23 @@ export type {
   RuntimeUsage,
   XaiGrokRuntimeAdapterOptions,
 } from './runtime-adapter.js'
+export {
+  CronExpressionError,
+  RoutineScheduler,
+  RoutineStore,
+  cronMatches,
+  nextCronOccurrence,
+  parseCronExpression,
+} from './routine.js'
+export type {
+  CreateRoutineInput,
+  ParsedCronExpression,
+  RoutineLastRunStatus,
+  RoutineLaunch,
+  RoutineLaunchHandler,
+  RoutineLaunchResult,
+  RoutineRecord,
+  RoutineSchedulerOptions,
+  RoutineStatus,
+  UpdateRoutineInput,
+} from './routine.js'
