@@ -51,6 +51,21 @@ import { botActivationFingerprint, BotRegistry, runtimeProfileFor } from './bot-
 import { TeamStore } from './team-store.js'
 import { TeamRouter, teamMentionHandle } from './team-router.js'
 import {
+  RoutineScheduler,
+  RoutineStore,
+  type CreateRoutineInput,
+  type RoutineLaunch,
+  type RoutineLaunchResult,
+  type RoutineRecord,
+  type UpdateRoutineInput,
+} from './routine.js'
+import {
+  RuntimeAdapterRegistry,
+  XaiGrokRuntimeAdapter,
+  type RuntimeAdapter,
+  type RuntimeAdapterKind,
+} from './runtime-adapter.js'
+import {
   compensationNodeIds,
   evaluateWorkflowCondition,
   mapWorkflowValues,
@@ -135,6 +150,7 @@ interface InternalRun {
   eventSeqFloor?: number
   leaseHeartbeat?: ReturnType<typeof setTimeout>
   pendingModelHandoffId?: string
+  runtimeKind?: Exclude<RuntimeAdapterKind, 'dsh'>
 }
 
 interface CompiledWorkflowNodeRequest {
@@ -403,6 +419,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
         managerAgent: fleetFeatures.managerAgent === true,
         savedWorkflows: fleetFeatures.savedWorkflows === true,
         externalRuntimes: fleetFeatures.externalRuntimes === true,
+        routines: fleetFeatures.routines === true,
       },
     },
   }
@@ -429,7 +446,10 @@ export class BotGateway {
   private readonly rooms: GroupRoomStore
   private readonly approvals: FleetApprovalStore
   private readonly workflows: WorkflowStore
+  private readonly routines: RoutineStore
   private readonly registry: BotRegistry
+  private readonly routineScheduler: RoutineScheduler
+  private readonly runtimeAdapters = new RuntimeAdapterRegistry()
   private readonly teams: TeamStore
   private readonly teamRouter: TeamRouter
   private readonly planner = new FleetPlanner()
@@ -498,6 +518,12 @@ export class BotGateway {
     this.remoteDeliveryLedger = new RemoteDeliveryLedger(join(stateDir, 'remote-inbox.jsonl'))
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
     this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
+    this.routines = new RoutineStore(join(stateDir, 'routines.jsonl'))
+    this.routineScheduler = new RoutineScheduler({
+      store: this.routines,
+      launch: launch => this.launchRoutine(launch),
+      onError: error => this.log('warn', `Routine scheduler failed: ${String(error)}`),
+    })
     this.rooms = new GroupRoomStore(join(stateDir, 'rooms.json'), this.config.collaboration)
     this.approvals = new FleetApprovalStore(join(stateDir, 'approvals.json'), this.config.collaboration?.approvalTtlMs)
     this.registry = new BotRegistry(join(stateDir, 'bot-registry.jsonl'))
@@ -517,6 +543,7 @@ export class BotGateway {
       this.config.retryBaseMs ?? 1_000,
       this.config.retryMaxMs ?? 60_000,
     )
+    this.syncConfiguredRuntimeAdapters()
   }
 
   public async start(): Promise<void> {
@@ -554,6 +581,7 @@ export class BotGateway {
   }
 
   private async finishStop(): Promise<void> {
+    await this.routineScheduler.stop()
     this.discovery = undefined
     for (const timer of this.inboundRetryTimers) clearTimeout(timer)
     this.inboundRetryTimers.clear()
@@ -598,6 +626,10 @@ export class BotGateway {
     const stoppingAgents: Promise<void>[] = []
     for (const internal of stoppingRuns) {
       if (internal.leaseHeartbeat !== undefined) clearTimeout(internal.leaseHeartbeat)
+      if (internal.runtimeKind !== undefined) {
+        const adapter = this.runtimeAdapters.get(internal.runtimeKind)
+        if (adapter?.cancel !== undefined) stoppingAgents.push(adapter.cancel(internal.runId))
+      }
       const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
       if (agent && this.bridge) {
         this.bridge.stop(agent)
@@ -674,13 +706,17 @@ export class BotGateway {
     }
     try {
       mutationStarted = true
-      if (wasRunning) await this.stopTransports()
+      if (wasRunning) {
+        await this.routineScheduler.stop()
+        await this.stopTransports()
+      }
       this.applyConfig(next)
       this.installTransports(next)
       if (wasRunning) {
         await this.loadDurableState()
         await this.loadFleetV2State()
         await this.activateTransports(true)
+        this.syncRoutineScheduler()
       } else {
         await this.loadFleetV2State()
       }
@@ -701,6 +737,7 @@ export class BotGateway {
           await this.loadDurableState()
           await this.loadFleetV2State()
           await this.activateTransports(true)
+          this.syncRoutineScheduler()
         } else {
           await this.loadFleetV2State()
         }
@@ -726,6 +763,7 @@ export class BotGateway {
     this.mailbox.configure(next.collaboration)
     this.rooms.configure(next.collaboration)
     this.approvals.configure(next.collaboration?.approvalTtlMs)
+    this.syncConfiguredRuntimeAdapters()
   }
 
   public onSessionEvent(session: SessionLike, event: unknown): void {
@@ -744,6 +782,74 @@ export class BotGateway {
       })
     this.sessionEventLanes.set(id, task)
     this.sessionEventTasks.add(task)
+  }
+
+  public registerRuntimeAdapter(adapter: RuntimeAdapter, replace = false): void {
+    if (this.config.collaboration?.features?.externalRuntimes !== true) {
+      throw new Error('External runtime adapters are disabled; enable collaboration.features.externalRuntimes first')
+    }
+    this.runtimeAdapters.register(adapter, replace)
+  }
+
+  private syncConfiguredRuntimeAdapters(): void {
+    if (this.config.collaboration?.features?.externalRuntimes !== true) return
+    const needsGrok = [...this.profiles.values()].some(profile => profile.runtimeAdapter === 'grok')
+    if (needsGrok && this.runtimeAdapters.get('grok') === undefined) {
+      // The adapter reads XAI_API_KEY at construction time. The key is never
+      // copied into Gateway config, durable state, logs, or routine inputs.
+      this.runtimeAdapters.register(new XaiGrokRuntimeAdapter())
+    }
+  }
+
+  private externalRuntimesEnabled(): boolean {
+    return this.config.collaboration?.enabled !== false
+      && this.config.collaboration?.features?.externalRuntimes === true
+  }
+
+  private hasExternalRuntimeProfiles(): boolean {
+    return this.externalRuntimesEnabled()
+      && [...this.profiles.values()].some(profile => (
+        profile.enabled !== false
+        && profile.runtimeAdapter !== undefined
+        && profile.runtimeAdapter !== 'dsh'
+      ))
+  }
+
+  private runnableBotIds(): readonly string[] {
+    if (this.bridge !== undefined) return this.directory.ids()
+    if (!this.hasExternalRuntimeProfiles()) return []
+    return this.directory.list()
+      .filter(bot => bot.enabled && bot.profile !== undefined)
+      .filter(bot => {
+        const profile = this.profiles.get(bot.profile)
+        return profile?.runtimeAdapter !== undefined && profile.runtimeAdapter !== 'dsh'
+      })
+      .map(bot => bot.id)
+  }
+
+  private routinesEnabled(): boolean {
+    const features = this.config.collaboration?.features
+    return this.config.collaboration?.enabled !== false
+      && features?.savedWorkflows === true
+      && features?.routines === true
+  }
+
+  private assertRoutinesEnabled(): void {
+    if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
+    if (this.config.collaboration?.features?.savedWorkflows !== true) {
+      throw new Error('Saved Workflows are disabled; enable collaboration.features.savedWorkflows first')
+    }
+    if (this.config.collaboration?.features?.routines !== true) {
+      throw new Error('Workflow routines are disabled; enable collaboration.features.routines first')
+    }
+  }
+
+  private syncRoutineScheduler(): void {
+    if (this.running && !this.stopped && this.routinesEnabled()) {
+      this.routineScheduler.start()
+      return
+    }
+    void this.routineScheduler.stop().catch(error => this.log('warn', 'Routine scheduler stop failed: ' + String(error)))
   }
 
   public status(): Record<string, unknown> {
@@ -769,6 +875,15 @@ export class BotGateway {
       collaboration: {
         enabled: this.config.collaboration?.enabled !== false,
         activeRuns: this.activeBotRuns.size,
+        routines: {
+          enabled: this.routinesEnabled(),
+        },
+        runtimeProfiles: this.directory.list()
+          .filter(bot => this.profiles.get(bot.profile)?.runtimeAdapter !== undefined)
+          .map(bot => ({
+            id: bot.id,
+            adapter: this.profiles.get(bot.profile)?.runtimeAdapter ?? 'dsh',
+          })),
         workerId: this.collaborationWorkerId,
         features: { ...this.config.collaboration?.features },
         registry: this.registry.stats(),
@@ -1078,6 +1193,67 @@ export class BotGateway {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
     if (this.config.collaboration?.features?.savedWorkflows !== true) {
       throw new Error('Saved Workflows are disabled; enable collaboration.features.savedWorkflows first')
+    }
+  }
+
+  public async createRoutine(input: CreateRoutineInput): Promise<RoutineRecord> {
+    return this.withDurableMutation(async () => {
+      this.assertRoutinesEnabled()
+      return this.routines.create(input)
+    })
+  }
+
+  public async listRoutines(ownerId?: string): Promise<RoutineRecord[]> {
+    this.assertRoutinesEnabled()
+    const routines = await this.routines.list()
+    return ownerId === undefined ? routines : routines.filter(routine => routine.ownerId === ownerId)
+  }
+
+  public async updateRoutine(
+    routineId: string,
+    patch: UpdateRoutineInput,
+    ownerId = 'local-dashboard',
+  ): Promise<RoutineRecord> {
+    return this.withDurableMutation(async () => {
+      this.assertRoutinesEnabled()
+      const current = await this.routines.get(routineId)
+      if (current === undefined) throw new Error('Routine is not found: ' + routineId)
+      if (ownerId !== 'local-dashboard' && current.ownerId !== ownerId) {
+        throw new Error('Routine does not belong to the current user')
+      }
+      return this.routines.update(routineId, patch)
+    })
+  }
+
+  public async deleteRoutine(routineId: string, ownerId = 'local-dashboard'): Promise<boolean> {
+    return this.withDurableMutation(async () => {
+      this.assertRoutinesEnabled()
+      const current = await this.routines.get(routineId)
+      if (current === undefined) return false
+      if (ownerId !== 'local-dashboard' && current.ownerId !== ownerId) {
+        throw new Error('Routine does not belong to the current user')
+      }
+      await this.routines.delete(routineId)
+      return true
+    })
+  }
+
+  private async launchRoutine(launch: RoutineLaunch): Promise<RoutineLaunchResult> {
+    try {
+      const replyTarget = launch.replyTarget ?? { platform: 'internal', chatId: launch.ownerId }
+      const result = await this.launchWorkflowDefinition(
+        launch.workflowId,
+        launch.ownerId,
+        replyTarget,
+        launch.ownerId,
+        {
+          launchId: launch.id,
+          inputs: launch.inputs,
+        },
+      )
+      return { status: 'started', runId: result.workflowRunId }
+    } catch (error: unknown) {
+      return { status: 'failed', error: String(error), retryable: true }
     }
   }
 
@@ -1986,6 +2162,7 @@ export class BotGateway {
           title: input.title,
           ...(input.description === undefined ? {} : { description: input.description }),
           ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.runtimeAdapter === undefined ? {} : { runtimeAdapter: input.runtimeAdapter }),
           capabilities: input.capabilities ?? [],
           skills: input.skills ?? [],
           ...(input.soul === undefined ? {} : { soul: input.soul }),
@@ -2201,6 +2378,7 @@ export class BotGateway {
       ...(input.skills === undefined ? {} : { skills: input.skills }),
       ...(input.role === undefined ? {} : { fleetRole: input.role }),
       ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.runtimeAdapter === undefined ? {} : { runtimeAdapter: input.runtimeAdapter }),
       ...(input.soul === undefined ? {} : { soul: input.soul }),
       changeSummary: 'Updated through the scoped draft tool',
     }
@@ -2598,6 +2776,7 @@ export class BotGateway {
   private async boot(): Promise<void> {
     if (this.config.enabled === false) return
     await this.loadDurableState()
+    this.syncRoutineScheduler()
     await this.activateTransports(true)
   }
 
@@ -2612,6 +2791,7 @@ export class BotGateway {
     await this.remoteDeliveryLedger.load()
     await this.tasks.load()
     await this.workflows.load()
+    await this.routines.load()
     await this.approvals.snapshot()
     await this.loadFleetV2State()
     this.durableLoaded = true
@@ -2691,11 +2871,11 @@ export class BotGateway {
   private async activateTransports(recover: boolean): Promise<void> {
     if (this.config.enabled === false || this.stopped || !this.running) return
     const bridgeReady = this.ensureHarnessBridge()
+    const externalRuntimeReady = this.hasExternalRuntimeProfiles()
     if (this.transports.length === 0) {
       this.log('warn', 'no enabled Telegram or Feishu transport configured; Bot Gateway is installed but idle')
-      return
     }
-    if (!bridgeReady) return
+    if (!bridgeReady && !externalRuntimeReady) return
     if (recover) {
       for (const item of await this.wal.pending()) {
         void this.queueInbound(item.message, item.id)
@@ -2710,14 +2890,18 @@ export class BotGateway {
       void this.withDurableMutation(() => this.recoverFleetWorkflows())
         .catch(error => this.log('warn', `Fleet workflow recovery failed: ${String(error)}`))
     }
-    for (const transport of this.transports) {
-      void transport.start(message => this.withDurableMutation(() => this.acceptInbound(message))).catch(error => {
-        if (!this.stopped && this.transportByPlatform.get(transport.platform) === transport) {
-          this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
-        }
-      })
+    if (bridgeReady) {
+      for (const transport of this.transports) {
+        void transport.start(message => this.withDurableMutation(() => this.acceptInbound(message))).catch(error => {
+          if (!this.stopped && this.transportByPlatform.get(transport.platform) === transport) {
+            this.log('error', `${transport.platform} transport stopped: ${String(error)}`)
+          }
+        })
+      }
+      this.log('info', `Bot Gateway started: ${this.transports.map(transport => transport.platform).join(', ')}`)
+    } else {
+      this.log('warn', 'DeepSeek Harness Agent service unavailable; external runtime workflows may continue but chat transports remain idle')
     }
-    this.log('info', `Bot Gateway started: ${this.transports.map(transport => transport.platform).join(', ')}`)
   }
 
   private async recoverFleetWorkflows(): Promise<void> {
@@ -3956,7 +4140,7 @@ export class BotGateway {
   }
 
   private async runCollaborationLoop(): Promise<void> {
-    if (!this.bridge) return
+    if (!this.bridge && !this.hasExternalRuntimeProfiles()) return
     while (!this.stopped && this.running) {
       const recovered = await this.mailbox.recoverExpired()
       for (const item of recovered) {
@@ -3982,7 +4166,7 @@ export class BotGateway {
       const parallelLimit = Math.max(1, Math.min(6, Math.floor(this.config.collaboration?.maxParallelRuns ?? 6)))
       if (this.activeBotRuns.size >= parallelLimit) return
       const lease = await this.mailbox.claim(
-        this.directory.ids(),
+        this.runnableBotIds(),
         this.collaborationWorkerId,
         new Set(this.activeBotRuns.keys()),
       )
@@ -4054,6 +4238,27 @@ export class BotGateway {
       this.internalRuns.set(run.id, internal)
       this.activeBotRuns.set(bot.id, run.id)
       this.scheduleLeaseHeartbeat(internal)
+      const runtimeKind = profile.runtimeAdapter
+      if (runtimeKind !== undefined && runtimeKind !== 'dsh') {
+        if (!this.externalRuntimesEnabled()) {
+          await this.finishInternalRun(run.id, undefined, 'External runtime adapters are disabled')
+          continue
+        }
+        const adapter = this.runtimeAdapters.get(runtimeKind)
+        if (adapter === undefined) {
+          await this.finishInternalRun(run.id, undefined, 'No runtime adapter is registered for ' + runtimeKind)
+          continue
+        }
+        internal.runtimeKind = runtimeKind
+        void this.runExternalRuntime(internal, bot, profile, task).catch(error => {
+          this.log('warn', 'External runtime completion failed: ' + String(error))
+        })
+        continue
+      }
+      if (!this.bridge) {
+        await this.finishInternalRun(run.id, undefined, 'DeepSeek Harness Agent service unavailable')
+        continue
+      }
       try {
         const agent = await this.bridge.resumeOrCreate(
           scopedSessionId as SessionId,
@@ -4070,6 +4275,55 @@ export class BotGateway {
         await this.bridge.followup(agent, this.buildInternalPrompt(bot, task, internal.envelope))
       } catch (error: unknown) {
         await this.finishInternalRun(run.id, undefined, error)
+      }
+    }
+  }
+
+  private async runExternalRuntime(
+    internal: InternalRun,
+    bot: BotDescriptor,
+    profile: BotProfile,
+    task: TaskRecord,
+  ): Promise<void> {
+    const runtimeKind = internal.runtimeKind
+    if (runtimeKind === undefined) return
+    const adapter = this.runtimeAdapters.get(runtimeKind)
+    if (adapter === undefined) {
+      try {
+        await this.withDurableMutation(() => this.finishInternalRun(internal.runId, undefined, 'No runtime adapter is registered for ' + runtimeKind))
+      } catch (error: unknown) {
+        if (!this.stopped) throw error
+      }
+      return
+    }
+    try {
+      const result = await adapter.run({
+        requestId: internal.runId,
+        botId: bot.id,
+        sessionId: internal.sessionId,
+        instruction: this.buildInternalPrompt(bot, task, internal.envelope),
+        ...(profile.soul === undefined ? {} : { systemPrompt: profile.soul }),
+        ...(profile.model === undefined ? {} : { model: profile.model }),
+      })
+      if (result.status === 'completed') {
+        try {
+          await this.withDurableMutation(() => this.finishInternalRun(internal.runId, result.text))
+        } catch (error: unknown) {
+          if (!this.stopped) throw error
+        }
+        return
+      }
+      const error = result.status === 'cancelled' ? 'External runtime request cancelled' : 'External runtime request failed'
+      try {
+        await this.withDurableMutation(() => this.finishInternalRun(internal.runId, undefined, error))
+      } catch (finishError: unknown) {
+        if (!this.stopped) throw finishError
+      }
+    } catch (error: unknown) {
+      try {
+        await this.withDurableMutation(() => this.finishInternalRun(internal.runId, undefined, error))
+      } catch (finishError: unknown) {
+        if (!this.stopped) throw finishError
       }
     }
   }
@@ -5707,7 +5961,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -5797,6 +6051,89 @@ export class BotGateway {
       const pending = (await this.approvals.pending()).filter(item => item.requestedBy === actor)
       const rows = pending.slice(0, 20).map(item => `${item.code} · ${item.kind} · ${item.summary}`)
       await this.completeWithText(message, walId, binding, rows.length ? `待审批：\n${rows.join('\n')}` : '当前没有待审批的 Fleet 操作。')
+      return true
+    }
+    if (name === 'routine' || name === 'routines') {
+      const actor = actorForTarget(message.target)
+      const parts = args.trim().split(/\s+/u).filter(Boolean)
+      const action = (parts[0] ?? 'list').toLowerCase()
+      try {
+        if (action === 'list') {
+          const routines = await this.listRoutines(actor)
+          const rows = routines.slice(0, 20).map(routine => (
+            routine.id + ' · ' + routine.status + ' · ' + routine.cron + ' ' + routine.timezone
+              + ' · ' + routine.workflowId + ' · ' + routine.name
+          ))
+          await this.completeWithText(message, walId, binding, rows.length
+            ? '当前用户的定时 Workflow：\n' + rows.join('\n')
+            : '当前没有定时 Workflow。')
+          return true
+        }
+        if (action === 'create') {
+          const spec = args.slice('create'.length).trim().split('|').map(value => value.trim())
+          if (spec.length < 3 || !spec[0] || !spec[1] || !spec[2]) {
+            await this.completeWithText(
+              message,
+              walId,
+              binding,
+              '用法：/routine create <workflowId> | <cron> | <名称> | <timezone> | <JSON输入>',
+            )
+            return true
+          }
+          const workflowId = spec[0]!
+          const workflow = await this.getWorkflowDefinition(workflowId, actor)
+          if (workflow === undefined) throw new Error('Workflow 不存在，或当前用户不可见：' + workflowId)
+          const timezone = spec[3] || 'UTC'
+          let inputs: Record<string, unknown> = {}
+          if (spec[4]) {
+            const parsed: unknown = JSON.parse(spec[4])
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error('JSON输入必须是对象')
+            }
+            inputs = parsed as Record<string, unknown>
+          }
+          const routine = await this.createRoutine({
+            name: spec[2]!,
+            ownerId: actor,
+            workflowId: workflow.id,
+            cron: spec[1]!,
+            timezone,
+            inputs,
+            replyTarget: message.target,
+          })
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            '已创建定时 Workflow：' + routine.id + '\n下次运行：' + new Date(routine.nextRunAt).toISOString(),
+          )
+          return true
+        }
+        const routineId = parts[1] ?? ''
+        if (!routineId || !['enable', 'disable', 'delete'].includes(action)) {
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            '用法：/routine list | /routine create <workflowId> | <cron> | <名称> | <timezone> | <JSON输入> | /routine enable|disable|delete <routineId>',
+          )
+          return true
+        }
+        if (action === 'delete') {
+          const deleted = await this.deleteRoutine(routineId, actor)
+          await this.completeWithText(message, walId, binding, deleted ? '已删除定时 Workflow：' + routineId : '没有找到这个定时 Workflow。')
+          return true
+        }
+        const updated = await this.updateRoutine(routineId, { enabled: action === 'enable' }, actor)
+        await this.completeWithText(
+          message,
+          walId,
+          binding,
+          (action === 'enable' ? '已启用：' : '已停用：') + updated.id,
+        )
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, 'Routine 操作失败：' + (error instanceof Error ? error.message : String(error)))
+      }
       return true
     }
     if (name === 'tasks') {

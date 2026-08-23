@@ -62,6 +62,7 @@ export function botActivationFingerprint(entry: BotRegistryEntry): string {
       provider: revision.provider ?? null,
       model: revision.model ?? null,
       maxTokens: revision.maxTokens ?? null,
+      runtimeAdapter: revision.runtimeAdapter ?? 'dsh',
       capabilities: [...revision.capabilities],
       skills: [...revision.skills],
       soul: revision.soul ?? null,
@@ -95,6 +96,7 @@ export function runtimeProfileFor(entry: BotRegistryEntry): BotProfile | undefin
     ...(revision.provider === undefined ? {} : { provider: revision.provider }),
     ...(revision.model === undefined ? {} : { model: revision.model }),
     ...(revision.maxTokens === undefined ? {} : { maxTokens: revision.maxTokens }),
+    ...(revision.runtimeAdapter === undefined ? {} : { runtimeAdapter: revision.runtimeAdapter }),
     capabilities: [...revision.capabilities],
     skills: [...revision.skills],
     ...(revision.soul === undefined ? {} : { soul: revision.soul }),
@@ -229,6 +231,10 @@ function normalizeRevision(
   if (maxTokens !== undefined && (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 2_000_000)) {
     throw new Error('maxTokens must be an integer between 1 and 2000000')
   }
+  const runtimeAdapter = draft.runtimeAdapter ?? 'dsh'
+  if (runtimeAdapter !== 'dsh' && runtimeAdapter !== 'hermes' && runtimeAdapter !== 'grok') {
+    throw new Error('Unsupported Bot runtime adapter')
+  }
   return {
     id: randomUUID(),
     botId,
@@ -238,6 +244,7 @@ function normalizeRevision(
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
     ...(maxTokens === undefined ? {} : { maxTokens }),
+    runtimeAdapter,
     capabilities: uniqueStrings(draft.capabilities),
     skills: uniqueStrings(draft.skills),
     ...(soul === undefined ? {} : { soul }),
@@ -269,6 +276,7 @@ function revisedDraft(current: BotRevision, patch: Partial<BotRevisionDraft>): B
     ...(Object.hasOwn(patch, 'maxTokens')
       ? patch.maxTokens === undefined ? {} : { maxTokens: patch.maxTokens }
       : current.maxTokens === undefined ? {} : { maxTokens: current.maxTokens }),
+    runtimeAdapter: patch.runtimeAdapter ?? current.runtimeAdapter ?? 'dsh',
     capabilities: patch.capabilities ?? current.capabilities,
     skills: patch.skills ?? current.skills,
     ...(soul === undefined ? {} : { soul }),
@@ -334,6 +342,7 @@ function sameRevisionContent(left: BotRevision, right: BotRevision): boolean {
     provider: revision.provider ?? null,
     model: revision.model ?? null,
     maxTokens: revision.maxTokens ?? null,
+    runtimeAdapter: revision.runtimeAdapter ?? 'dsh',
     capabilities: revision.capabilities,
     skills: revision.skills,
     soul: revision.soul ?? null,
@@ -455,6 +464,7 @@ export class BotRegistry {
           ...(profile.provider === undefined ? {} : { provider: profile.provider }),
           ...(profile.model === undefined ? {} : { model: profile.model }),
           ...(profile.maxTokens === undefined ? {} : { maxTokens: profile.maxTokens }),
+          ...(profile.runtimeAdapter === undefined ? {} : { runtimeAdapter: profile.runtimeAdapter }),
           capabilities: profile.capabilities ?? [],
           skills: profile.skills ?? [],
           ...(profile.soul === undefined ? {} : { soul: profile.soul }),

@@ -40,6 +40,7 @@ export interface HermesBotSettings {
       managerAgent: boolean
       savedWorkflows: boolean
       externalRuntimes: boolean
+      routines: boolean
     }
   }
   profiles: HermesBotProfileSettings[]
@@ -51,6 +52,7 @@ export interface HermesBotProfileSettings {
   description: string
   provider: string
   model: string
+  runtimeAdapter: 'dsh' | 'hermes' | 'grok'
   capabilities: string[]
   skills: string[]
   soul: string
@@ -68,6 +70,7 @@ const ProfileSettingsSchema: z<HermesBotProfileSettings> = z.object({
   description: z.string().default(''),
   provider: z.string().default(''),
   model: z.string().default(''),
+  runtimeAdapter: z.union(['dsh', 'hermes', 'grok'] as const).default('dsh'),
   capabilities: z.array(z.string()).default([]),
   skills: z.array(z.string()).default([]),
   soul: z.string().default(''),
@@ -110,6 +113,7 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
       managerAgent: z.boolean().default(false),
       savedWorkflows: z.boolean().default(false),
       externalRuntimes: z.boolean().default(false),
+      routines: z.boolean().default(false),
     }).default({
       dynamicRegistry: false,
       chatBotCreation: false,
@@ -117,6 +121,7 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
       managerAgent: false,
       savedWorkflows: false,
       externalRuntimes: false,
+      routines: false,
     }),
   }),
   profiles: z.array(ProfileSettingsSchema).default([]),
@@ -137,6 +142,7 @@ function profileSettings(id: string, profile: Omit<BotProfile, 'name'>): HermesB
     description: textOf(profile.description),
     provider: textOf(profile.provider),
     model: textOf(profile.model),
+    runtimeAdapter: profile.runtimeAdapter ?? 'dsh',
     capabilities: listOf(profile.capabilities),
     skills: listOf(profile.skills),
     soul: textOf(profile.soul),
@@ -182,6 +188,7 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
         managerAgent: config.collaboration?.features?.managerAgent === true,
         savedWorkflows: config.collaboration?.features?.savedWorkflows === true,
         externalRuntimes: config.collaboration?.features?.externalRuntimes === true,
+        routines: config.collaboration?.features?.routines === true,
       },
     },
     profiles: Object.entries(config.profiles ?? {}).map(([id, profile]) => profileSettings(id, profile)),
@@ -210,6 +217,7 @@ export function gatewayConfigFromSettings(
       ...(profile.description.trim() === '' ? {} : { description: profile.description.trim() }),
       ...(profile.provider.trim() === '' ? {} : { provider: profile.provider.trim() }),
       ...(profile.model.trim() === '' ? {} : { model: profile.model.trim() }),
+      runtimeAdapter: profile.runtimeAdapter,
       capabilities: listOf(profile.capabilities),
       skills: listOf(profile.skills),
       ...(profile.soul.trim() === '' ? {} : { soul: profile.soul.trim() }),
@@ -259,6 +267,7 @@ export function gatewayConfigFromSettings(
         managerAgent: collaborationFeatures.managerAgent,
         savedWorkflows: collaborationFeatures.savedWorkflows,
         externalRuntimes: collaborationFeatures.externalRuntimes,
+        routines: collaborationFeatures.routines,
       },
     },
   }
