@@ -389,7 +389,7 @@ export interface HttpRemoteTransportOptions extends RemoteTransportPolicyInput {
   readonly fetch?: typeof fetch
 }
 
-function responseJson(status: number, body: Record<string, unknown>): Response {
+function responseJson(status: number, body: object): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
