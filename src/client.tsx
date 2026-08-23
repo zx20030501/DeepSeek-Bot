@@ -1052,6 +1052,7 @@ function FleetStatusPanel({
   const fleet = diagnostics.fleet
   const approvals = (fleet?.approvals ?? []).filter(approval => approval.status === 'pending')
   const fleetWorkflows = fleet?.workflows ?? []
+  const askCounts = fleet?.askCounts ?? { pending: 0, answered: 0, 'timed-out': 0, cancelled: 0 }
   const tasks = fleet?.tasks ?? []
   const deadLetters = fleet?.deadLetters ?? []
   const registryBots = fleet?.registryBots ?? []
@@ -1093,6 +1094,7 @@ function FleetStatusPanel({
       </div>
       <div className="dsh-hermes-fleet-columns">
         <div><strong>待审批</strong>{approvals.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : approvals.map(approval => <div className="dsh-hermes-fleet-row" key={approval.id}><div><code>{approval.code}</code><span>{approval.summary ?? approval.kind}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'approved') }}>批准</button><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'rejected') }}>拒绝</button></div></div>)}</div>
+        <div><strong>Ask 汇总</strong><span className="dsh-hermes-muted">{askCounts.pending} 待答 · {askCounts.answered} 已答{askCounts['timed-out'] > 0 ? ` · ${askCounts['timed-out']} 超时` : ''}</span></div>
         <div><strong>最近工作流</strong>{fleetWorkflows.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : fleetWorkflows.slice(0, 6).map(workflow => <div className="dsh-hermes-fleet-row" key={workflow.id}><div><code>{workflow.id}</code><span>{workflow.status} · {(workflow.workerBotIds ?? []).map(id => '@' + id).join('、')}</span></div></div>)}</div>
         <div><strong>最近任务</strong>{tasks.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : tasks.slice(0, 10).map(task => {
           const taskId = task.id ?? ''
