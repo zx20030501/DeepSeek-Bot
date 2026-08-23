@@ -185,6 +185,25 @@ export type {
   BotAskStatus,
   BotAskWaitOptions,
 } from './bot-ask.js'
+export { ManagerActionLog, ManagerPauseRegistry } from './manager-control.js'
+export type {
+  ManagerActionInput,
+  ManagerActionKind,
+  ManagerActionQuery,
+  ManagerActionRecord,
+  ManagerBotObservation,
+  ManagerObservation,
+  ManagerObserveOptions,
+  ManagerPauseActionResult,
+  ManagerPauseInput,
+  ManagerPauseRecord,
+  ManagerReplanInput,
+  ManagerReplanObservationInput,
+  ManagerReplanResult,
+  ManagerStopResult,
+  ManagerWaitOptions,
+  ManagerWaitResult,
+} from './manager-control.js'
 export {
   REMOTE_TRANSPORT_SCHEMA_VERSION,
   HttpRemoteBotTransport,

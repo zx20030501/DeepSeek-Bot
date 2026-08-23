@@ -18,7 +18,24 @@ import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool.js'
-import { generateManagerPlan } from './manager-policy.js'
+import { generateManagerPlan, generateReplanSuggestion } from './manager-policy.js'
+import {
+  ManagerActionLog,
+  ManagerPauseRegistry,
+  boundedPollInterval,
+  boundedWaitTimeout,
+  normalizeManagerReplanObservations,
+  type ManagerActionQuery,
+  type ManagerActionRecord,
+  type ManagerObservation,
+  type ManagerObserveOptions,
+  type ManagerPauseActionResult,
+  type ManagerReplanInput,
+  type ManagerReplanResult,
+  type ManagerStopResult,
+  type ManagerWaitOptions,
+  type ManagerWaitResult,
+} from './manager-control.js'
 import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
 import { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
@@ -449,6 +466,8 @@ export class BotGateway {
   private readonly approvals: FleetApprovalStore
   private readonly workflows: WorkflowStore
   private readonly askRegistry: BotAskRegistry
+  private readonly managerActions: ManagerActionLog
+  private readonly managerPauses: ManagerPauseRegistry
   private readonly routines: RoutineStore
   private readonly registry: BotRegistry
   private readonly routineScheduler: RoutineScheduler
@@ -522,6 +541,8 @@ export class BotGateway {
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
     this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
     this.askRegistry = new BotAskRegistry(join(stateDir, 'bot-asks.jsonl'))
+    this.managerActions = new ManagerActionLog(join(stateDir, 'manager-actions.jsonl'))
+    this.managerPauses = new ManagerPauseRegistry(join(stateDir, 'manager-pauses.jsonl'))
     this.routines = new RoutineStore(join(stateDir, 'routines.jsonl'))
     this.routineScheduler = new RoutineScheduler({
       store: this.routines,
@@ -1093,6 +1114,10 @@ export class BotGateway {
       },
       this.activeBotRuns,
     )
+    const pausedBots = new Set((await this.managerPauses.paused()).map(pause => pause.botId))
+    const effectiveDescriptors = descriptors.map(descriptor => (
+      pausedBots.has(descriptor.id) ? { ...descriptor, status: 'unavailable' as const } : descriptor
+    ))
     const plan = generateManagerPlan({
       taskId: task.id,
       traceId,
@@ -1104,12 +1129,23 @@ export class BotGateway {
       ...(input.requiresExternalEffect === undefined ? {} : { requiresExternalEffect: input.requiresExternalEffect }),
       ...(input.budget === undefined ? {} : { budget: input.budget }),
       ...(input.maxAssignments === undefined ? {} : { maxAssignments: input.maxAssignments }),
-    }, managerBotId, descriptors)
+    }, managerBotId, effectiveDescriptors)
     await this.tasks.audit('task', task.id, requester, 'manager.plan_created', {
       plan,
       requester,
       replyTarget: input.replyTarget,
     }, traceId)
+    await this.managerActions.record({
+      kind: 'plan',
+      actor: requester,
+      taskId: task.id,
+      traceId,
+      detail: {
+        plan: structuredClone(plan),
+        replyTarget: input.replyTarget,
+        ...(input.maxAssignments === undefined ? {} : { maxAssignments: input.maxAssignments }),
+      },
+    })
     if (plan.policyDecision === 'deny') {
       await this.tasks.failTask(task.id, plan.reasons.join('; '), 'botfleet')
       return { taskId: task.id, traceId, plan, dispatched: [] }
@@ -1157,6 +1193,9 @@ export class BotGateway {
       }
       if (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always') {
         throw new Error('Manager delegation requires a separate approved Bot invocation: ' + bot.id)
+      }
+      if (await this.managerPauses.isPaused(bot.id)) {
+        throw new Error('Manager delegation target is paused: ' + bot.id)
       }
       const existing = await this.mailbox.getByIdempotencyKey(spec.idempotencyKey)
       if (existing !== undefined) {
@@ -1207,9 +1246,351 @@ export class BotGateway {
       }
     }
     if (dispatched.length > 0) {
+      await this.managerActions.record({
+        kind: 'dispatch',
+        actor: requester,
+        taskId: task.id,
+        traceId: plan.traceId,
+        detail: {
+          planId: plan.planId,
+          planRevision: plan.planRevision,
+          dispatched: dispatched.length,
+          targets: dispatched.map(envelope => envelope.to),
+        },
+      })
       void this.drainCollaboration().catch(error => this.log('warn', 'Manager delegation drain failed: ' + String(error)))
     }
     return dispatched
+  }
+
+  /**
+   * Manager observation: a bounded, Manager-ready view of the Fleet. Bot
+   * status is derived from real run state (busy = active run, timeout/failed =
+   * last failed run, unavailable = disabled or paused).
+   */
+  public async managerObserve(options: ManagerObserveOptions = {}): Promise<ManagerObservation> {
+    return this.withDurableMutation(async () => {
+      const maxBots = Math.max(1, Math.min(500, options.maxBots ?? 100))
+      const maxTasks = Math.max(1, Math.min(500, options.maxTasks ?? 100))
+      const [snapshot, asks, pauses] = await Promise.all([
+        this.tasks.snapshot(),
+        this.askRegistry.snapshot(),
+        this.managerPauses.paused(),
+      ])
+      const pauseByBot = new Map(pauses.map(pause => [pause.botId, pause]))
+      const failuresByBot = new Map<string, { runId: string; error: string; at: number }>()
+      const inFlightByBot = new Map<string, number>()
+      for (const run of snapshot.runs) {
+        if (run.status === 'queued' || run.status === 'running') {
+          inFlightByBot.set(run.botId, (inFlightByBot.get(run.botId) ?? 0) + 1)
+        }
+        if (run.status === 'failed') {
+          const candidate = { runId: run.id, error: run.error ?? 'Run failed', at: run.updatedAt }
+          const previous = failuresByBot.get(run.botId)
+          if (previous === undefined || candidate.at >= previous.at) failuresByBot.set(run.botId, candidate)
+        }
+      }
+      const bots: ManagerObservation['bots'] = this.directory.list().slice(0, maxBots).map(bot => {
+        const paused = pauseByBot.get(bot.id)
+        const lastFailure = failuresByBot.get(bot.id)
+        const inFlight = inFlightByBot.get(bot.id) ?? 0
+        let status: 'available' | 'busy' | 'unavailable' | 'timeout' | 'failed'
+        if (!bot.enabled || paused !== undefined) status = 'unavailable'
+        else if (inFlight > 0) status = 'busy'
+        else if (lastFailure !== undefined && /expired|timed out|timeout/u.test(lastFailure.error)) status = 'timeout'
+        else if (lastFailure !== undefined) status = 'failed'
+        else status = 'available'
+        return {
+          id: bot.id,
+          ...(bot.title === undefined ? {} : { title: bot.title }),
+          status,
+          inFlight,
+          capabilities: [...bot.capabilities],
+          skills: [...bot.skills],
+          ...(bot.fleetRole === undefined ? {} : { role: bot.fleetRole }),
+          ...(paused === undefined ? {} : { paused: { reason: paused.reason, until: paused.until } }),
+          ...(lastFailure === undefined ? {} : { lastFailure }),
+        }
+      })
+      const workflows = snapshot.workflows
+      const activeWorkflowStatuses = new Set(['pending-approval', 'running', 'verifying', 'synthesizing'])
+      const observation: ManagerObservation = {
+        now: Date.now(),
+        bots,
+        tasks: snapshot.tasks.slice(-maxTasks).map(task => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          assignedTo: task.assignedTo,
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          ...(task.result === undefined ? {} : { result: String(task.result).slice(0, 500) }),
+          ...(task.error === undefined ? {} : { error: String(task.error).slice(0, 500) }),
+        })),
+        runs: snapshot.runs.slice(-(maxTasks * 2)).map(run => ({
+          id: run.id,
+          taskId: run.taskId,
+          botId: run.botId,
+          status: run.status,
+          attemptId: run.attemptId,
+          ...(run.error === undefined ? {} : { error: String(run.error).slice(0, 500) }),
+          updatedAt: run.updatedAt,
+        })),
+        asks: {
+          pending: asks.filter(ask => ask.status === 'pending').length,
+          answered: asks.filter(ask => ask.status === 'answered').length,
+          'timed-out': asks.filter(ask => ask.status === 'timed-out').length,
+          cancelled: asks.filter(ask => ask.status === 'cancelled').length,
+        },
+        workflows: {
+          active: workflows.filter(workflow => activeWorkflowStatuses.has(workflow.status)).length,
+          completed: workflows.filter(workflow => workflow.status === 'completed').length,
+          failed: workflows.filter(workflow => workflow.status === 'failed').length,
+          cancelled: workflows.filter(workflow => workflow.status === 'cancelled').length,
+        },
+        pauses: pauses.map(pause => ({ ...pause })),
+      }
+      if (options.record === true) {
+        await this.managerActions.record({
+          kind: 'observe',
+          actor: 'manager',
+          detail: { botCount: bots.length, ...observation.asks },
+        })
+      }
+      return observation
+    })
+  }
+
+  /** Wait until a Manager task reaches a terminal state or the caller's budget elapses. */
+  public async managerWait(taskId: string, options: ManagerWaitOptions = {}): Promise<ManagerWaitResult> {
+    return this.withDurableMutation(async () => {
+      const timeoutMs = boundedWaitTimeout(options.timeoutMs)
+      const pollMs = boundedPollInterval(options.pollMs)
+      const started = Date.now()
+      let current = await this.tasks.task(taskId)
+      if (current === undefined) throw new Error('Manager task not found: ' + taskId)
+      for (;;) {
+        if (current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled') {
+          const waitedMs = Date.now() - started
+          await this.managerActions.record({
+            kind: 'wait',
+            actor: 'manager',
+            taskId,
+            detail: { status: current.status, waitedMs },
+          })
+          return {
+            taskId,
+            status: current.status,
+            ...(current.result === undefined ? {} : { result: current.result }),
+            ...(current.error === undefined ? {} : { error: String(current.error) }),
+            timedOut: false,
+            waitedMs,
+          }
+        }
+        if (Date.now() - started >= timeoutMs) break
+        await new Promise(resolve => setTimeout(resolve, pollMs))
+        current = await this.tasks.task(taskId)
+        if (current === undefined) throw new Error('Manager task not found: ' + taskId)
+      }
+      const waitedMs = Date.now() - started
+      await this.managerActions.record({
+        kind: 'wait',
+        actor: 'manager',
+        taskId,
+        detail: { status: current.status, timedOut: true, waitedMs },
+      })
+      return { taskId, status: current.status, timedOut: true, waitedMs }
+    })
+  }
+
+  /** Durably pause a Bot so the Manager stops delegating new work to it. */
+  public async managerPause(
+    botId: string,
+    input: { reason?: string; durationMs?: number; actor?: string } = {},
+  ): Promise<ManagerPauseActionResult> {
+    return this.withDurableMutation(async () => {
+      const normalized = botId.trim().toLowerCase()
+      const bot = this.directory.get(normalized)
+      if (!bot) throw new Error('unknown Bot: ' + normalized)
+      const actor = input.actor ?? 'manager'
+      const record = await this.managerPauses.pause({
+        botId: normalized,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
+        ...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
+        actor,
+      })
+      await this.managerActions.record({
+        kind: 'pause',
+        actor,
+        botId: normalized,
+        detail: { reason: record.reason, until: record.until },
+      })
+      return { botId: normalized, reason: record.reason, until: record.until }
+    })
+  }
+
+  /** Resume a paused Bot. Returns false when the Bot was not paused. */
+  public async managerResume(botId: string, actor = 'manager'): Promise<boolean> {
+    return this.withDurableMutation(async () => {
+      const normalized = botId.trim().toLowerCase()
+      const resumed = await this.managerPauses.resume(normalized, actor)
+      if (resumed) {
+        await this.managerActions.record({ kind: 'resume', actor, botId: normalized })
+      }
+      return resumed !== undefined
+    })
+  }
+
+  /** Stop a Manager task and every delegation attached to it, durably. */
+  public async managerStop(
+    taskId: string,
+    input: { reason?: string; actor?: string } = {},
+  ): Promise<ManagerStopResult> {
+    return this.withDurableMutation(async () => {
+      const actor = input.actor ?? 'manager'
+      const task = await this.tasks.task(taskId)
+      const cancellable = task !== undefined && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+      const cancelledTask = cancellable ? await this.cancelFleetTaskUnlocked(taskId, actor) : undefined
+      await this.managerActions.record({
+        kind: 'stop',
+        actor,
+        taskId,
+        ...(task === undefined ? {} : { traceId: task.id }),
+        detail: { reason: input.reason ?? 'stopped by Manager', cancelled: cancelledTask !== undefined },
+      })
+      const status = cancelledTask?.status ?? task?.status
+      return {
+        taskId,
+        cancelled: cancelledTask !== undefined,
+        ...(status === undefined ? {} : { status }),
+      }
+    })
+  }
+
+  /**
+   * Replan after a worker fails or times out. The suggestion is always
+   * recorded durably; when `auto` is set and policy permits, replacement
+   * delegations are dispatched on a fresh task sharing the same trace.
+   */
+  public async managerReplan(input: ManagerReplanInput): Promise<ManagerReplanResult> {
+    return this.withDurableMutation(async () => {
+      const task = await this.tasks.task(input.taskId)
+      if (!task) throw new Error('Manager task not found: ' + input.taskId)
+      const storedPlan = await this.managerActions.last(input.taskId, 'plan')
+      if (!storedPlan?.detail?.plan) throw new Error('no stored Manager plan for task: ' + input.taskId)
+      const currentPlan = storedPlan.detail.plan as ManagerPlan
+      const replyTarget = storedPlan.detail.replyTarget as BotTarget | undefined
+      if (replyTarget === undefined) throw new Error('stored Manager plan has no reply target')
+      const traceId = currentPlan.traceId
+      const actor = input.actor ?? 'manager'
+      const observations = normalizeManagerReplanObservations(input.observations)
+      if (observations.length === 0) throw new Error('replan requires at least one observation')
+      const pausedBots = new Set((await this.managerPauses.paused()).map(pause => pause.botId))
+      const descriptors = managerDescriptorsFromRoster(
+        this.directory.list(),
+        replyTarget,
+        (botId, target) => {
+          const bot = this.directory.get(botId)
+          return bot !== undefined
+            && !bot.approvalRequired
+            && this.config.collaboration?.approvalMode !== 'always'
+            && this.directory.canInvoke(botId, target)
+        },
+        this.activeBotRuns,
+      ).map(descriptor => pausedBots.has(descriptor.id) ? { ...descriptor, status: 'unavailable' as const } : descriptor)
+      const managerBotId = currentPlan.delegations[0]?.fromManager ?? (this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+      const storedMaxAssignments = typeof storedPlan.detail.maxAssignments === 'number'
+        ? storedPlan.detail.maxAssignments
+        : currentPlan.delegations.length
+      const suggestion = generateReplanSuggestion({
+        task: {
+          taskId: task.id,
+          traceId,
+          requester: task.createdBy,
+          instruction: task.instruction,
+          ...(task.acceptanceCriteria.length === 0 ? {} : { acceptanceCriteria: task.acceptanceCriteria }),
+          maxAssignments: Math.max(1, storedMaxAssignments),
+        },
+        currentPlan,
+        observations,
+        availableBots: descriptors,
+        managerBotId,
+      })
+      await this.managerActions.record({
+        kind: 'replan',
+        actor,
+        taskId: input.taskId,
+        traceId,
+        detail: { suggestion: structuredClone(suggestion), auto: input.auto === true },
+      })
+      if (input.auto !== true) {
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false }
+      }
+      const approvalRequired = suggestion.approval.required
+        || suggestion.policyDecision === 'approval-required'
+        || this.config.collaboration?.approvalMode === 'always'
+      if (approvalRequired) {
+        const approval = await this.approvals.create({
+          kind: 'bot-invocation',
+          requestedBy: task.createdBy,
+          summary: 'Manager 重规划：' + task.instruction,
+          entityId: input.taskId,
+          ...(this.config.collaboration?.approvalTtlMs === undefined ? {} : { ttlMs: this.config.collaboration.approvalTtlMs }),
+        })
+        await this.tasks.audit('approval', approval.id, actor, 'manager.replan_approval_requested', {
+          taskId: input.taskId,
+          planId: suggestion.planId,
+          planRevision: suggestion.planRevision,
+        }, traceId)
+        this.scheduleApprovalExpiry(approval.expiresAt)
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false, approvalCode: approval.code }
+      }
+      if (suggestion.replacementDelegations.length === 0) {
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false }
+      }
+      const newTask = await this.tasks.createTask({
+        title: 'Manager replan: ' + task.title.replace(/^Manager:\s*/u, ''),
+        instruction: task.instruction,
+        createdBy: task.createdBy,
+        assignedTo: managerBotId,
+        acceptanceCriteria: task.acceptanceCriteria,
+      })
+      const plan: ManagerPlan = {
+        schemaVersion: 1,
+        planId: suggestion.planId,
+        planRevision: suggestion.planRevision,
+        taskId: newTask.id,
+        traceId,
+        policyDecision: 'allow',
+        reasons: [...suggestion.reasons],
+        budget: currentPlan.budget,
+        delegations: suggestion.replacementDelegations,
+        approval: { required: false, risk: suggestion.approval.risk, reason: suggestion.approval.reason, scope: suggestion.approval.scope },
+        generatedAt: Date.now(),
+      }
+      const dispatched = await this.dispatchManagerPlan(plan, task.createdBy, replyTarget, false)
+      await this.managerActions.record({
+        kind: 'plan',
+        actor,
+        taskId: newTask.id,
+        traceId,
+        detail: { plan: structuredClone(plan), replyTarget, replanOf: input.taskId },
+      })
+      return {
+        taskId: input.taskId,
+        traceId,
+        suggestion,
+        autoDispatched: true,
+        dispatchedTaskId: newTask.id,
+        dispatchedEnvelopes: dispatched.map(envelope => ({ ...envelope })),
+        plan,
+      }
+    })
+  }
+
+  /** Replayable Manager history: every durable action, queryable. */
+  public async managerHistory(query: ManagerActionQuery = {}): Promise<ManagerActionRecord[]> {
+    return this.managerActions.query(query)
   }
 
   private assertSavedWorkflowsEnabled(): void {
@@ -2850,7 +3231,11 @@ export class BotGateway {
   }
 
   private canManageTask(task: TaskRecord, actor: string): boolean {
-    return actor === 'local-dashboard' || actor === 'local-admin' || task.createdBy === actor
+    const managerBotId = (this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+    return actor === 'local-dashboard'
+      || actor === 'local-admin'
+      || actor === managerBotId
+      || task.createdBy === actor
   }
 
   /** Start a short-lived, local-UI-driven identity discovery flow. */
