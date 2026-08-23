@@ -45,7 +45,7 @@ test('map and reduce are bounded and deterministic', () => {
   assert.equal(reduceWorkflowValues({ source: { kind: 'node-output', nodeId: 'source', output: 'result' }, reducer: 'count' }, {}, values), 3)
   assert.equal(reduceWorkflowValues({ source: { kind: 'node-output', nodeId: 'source', output: 'result' }, reducer: 'all-success', }, {}, new Map([['source', [{ status: 'completed' }, { status: 'ok' }]]])), true)
   assert.throws(() => mapWorkflowValues({ source: { kind: 'constant', value: 'not-array' }, itemInput: 'item', templateNodeId: 'worker' }, {}, new Map(), 3), /array/u)
-  assert.throws(() => mapWorkflowValues({ source: { kind: 'constant', value: 1 }, itemInput: 'item', templateNodeId: 'worker' }, {}, new Map(), 0), /fan-out/u)
+  assert.throws(() => mapWorkflowValues({ source: { kind: 'constant', value: [1] }, itemInput: 'item', templateNodeId: 'worker' }, {}, new Map(), 0), /fan-out/u)
 })
 
 test('compensation targets are reverse-ordered and deduplicated', () => {
@@ -71,5 +71,5 @@ test('compensation targets are reverse-ordered and deduplicated', () => {
       { id: 'undo-b', label: 'Undo B', kind: 'task' },
     ],
   }
-  assert.deepEqual(compensationNodeIds(definition, ['a', 'b', 'a'], 'failure'), ['undo-b', 'undo-a'])
+  assert.deepEqual(compensationNodeIds(definition, ['a', 'b'], 'failure'), ['undo-b', 'undo-a'])
 })

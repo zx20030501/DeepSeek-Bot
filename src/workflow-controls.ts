@@ -59,8 +59,8 @@ export function parseWorkflowResult(result: string | undefined): unknown {
  * The result output is the whole value; named outputs read object keys.
  */
 export function selectWorkflowOutput(value: unknown, output: string): unknown {
-  if (output === 'result') return clone(value)
   if (isRecord(value) && Object.hasOwn(value, output)) return clone(value[output])
+  if (output === 'result') return clone(value)
   return undefined
 }
 
