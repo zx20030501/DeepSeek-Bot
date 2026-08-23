@@ -41,7 +41,7 @@ import {
 } from './bot-registry-tool.js'
 import { botActivationFingerprint, BotRegistry, runtimeProfileFor } from './bot-registry.js'
 import { TeamStore } from './team-store.js'
-import { TeamRouter } from './team-router.js'
+import { TeamRouter, teamMentionHandle } from './team-router.js'
 import {
   BotDirectory,
   BotMailbox,
