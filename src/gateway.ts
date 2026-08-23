@@ -420,6 +420,9 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       mailboxRetryMaxMs: typeof collaboration.mailboxRetryMaxMs === 'number' ? collaboration.mailboxRetryMaxMs : 60_000,
       botRunMaxAttempts: typeof collaboration.botRunMaxAttempts === 'number' ? collaboration.botRunMaxAttempts : 3,
       maxParallelRuns: typeof collaboration.maxParallelRuns === 'number' ? collaboration.maxParallelRuns : 6,
+      perUserMaxRuns: typeof collaboration.perUserMaxRuns === 'number' ? Math.max(0, Math.floor(collaboration.perUserMaxRuns)) : 0,
+      sessionIdleTimeoutMs: typeof collaboration.sessionIdleTimeoutMs === 'number' ? Math.max(1_000, Math.floor(collaboration.sessionIdleTimeoutMs)) : 0,
+      sessionIdleCheckMs: typeof collaboration.sessionIdleCheckMs === 'number' ? Math.max(100, Math.floor(collaboration.sessionIdleCheckMs)) : 30_000,
       defaultSessionScope: collaboration.defaultSessionScope === 'shared' || collaboration.defaultSessionScope === 'chat' || collaboration.defaultSessionScope === 'task'
         ? collaboration.defaultSessionScope
         : 'requester',
@@ -522,6 +525,10 @@ export class BotGateway {
   private collaborationDrainDueAt: number | undefined
   private approvalExpiryTimer: ReturnType<typeof setTimeout> | undefined
   private approvalExpiryDueAt: number | undefined
+  /** Last-observed activity per direct-chat session, keyed like sessionTargets. */
+  private readonly sessionActivity = new Map<string, number>()
+  private readonly reapedSessions = new Set<string>()
+  private idleReapTimer: ReturnType<typeof setTimeout> | undefined
   private readonly fleetHandoffTool = createFleetHandoffTool((sessionId, input) => this.requestModelHandoff(sessionId, input))
   private readonly botCreateDraftTool = createBotCreateDraftTool((sessionId, input) => this.createBotDraftFromSession(sessionId, input))
   private readonly botUpdateDraftTool = createBotUpdateDraftTool((sessionId, input) => this.updateBotDraftFromSession(sessionId, input))
@@ -587,6 +594,7 @@ export class BotGateway {
     this.running = true
     this.stopped = false
     this.outbox.start()
+    this.scheduleNextIdleReap()
     this.started = this.boot()
     try {
       await this.started
@@ -620,6 +628,8 @@ export class BotGateway {
     if (this.approvalExpiryTimer !== undefined) clearTimeout(this.approvalExpiryTimer)
     this.approvalExpiryTimer = undefined
     this.approvalExpiryDueAt = undefined
+    if (this.idleReapTimer !== undefined) clearTimeout(this.idleReapTimer)
+    this.idleReapTimer = undefined
     // Cancel heartbeats that have not started before yielding. A callback that
     // already entered is covered by withDurableMutation below and is drained.
     for (const internal of this.internalRuns.values()) {
@@ -800,6 +810,7 @@ export class BotGateway {
   public onSessionEvent(session: SessionLike, event: unknown): void {
     if (this.stopped) return
     const id = sessionKey(session.id)
+    this.sessionActivity.set(id, Date.now())
     const previous = this.sessionEventLanes.get(id) ?? Promise.resolve()
     let task: Promise<void>
     task = previous
@@ -1874,8 +1885,12 @@ export class BotGateway {
       if (existingTask?.status === 'failed' || existingTask?.status === 'cancelled') {
         throw new Error('Workflow node is already terminal: ' + storageNodeId)
       }
-      const candidates = this.directory.list()
-        .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
+      const candidateIds = node.capability === undefined
+        ? this.directory.ids()
+        : this.directory.botsWithCapability(node.capability)
+      const candidates = candidateIds
+        .map(id => this.directory.get(id))
+        .filter((bot): bot is BotDescriptor => bot !== undefined && bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
         .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
         .filter(bot => !bot.approvalRequired && this.config.collaboration?.approvalMode !== 'always')
         .sort((left, right) => Number(this.activeBotRuns.has(left.id)) - Number(this.activeBotRuns.has(right.id)) || left.id.localeCompare(right.id))
@@ -4615,6 +4630,51 @@ export class BotGateway {
     }
   }
 
+  /** Periodically stop direct-chat Agent sessions that have been idle too long. */
+  private scheduleNextIdleReap(): void {
+    if (this.stopped) return
+    const timeoutMs = Math.max(1_000, Math.floor(this.config.collaboration?.sessionIdleTimeoutMs ?? 0))
+    if (timeoutMs <= 0 || this.idleReapTimer !== undefined) return
+    const checkMs = Math.max(100, Math.floor(this.config.collaboration?.sessionIdleCheckMs ?? 30_000))
+    this.idleReapTimer = setTimeout(() => {
+      this.idleReapTimer = undefined
+      void this.reapIdleSessions().catch(error => {
+        if (!this.stopped) this.log('warn', `idle session reaping failed: ${String(error)}`)
+      })
+    }, checkMs)
+    this.idleReapTimer.unref?.()
+  }
+
+  private async reapIdleSessions(): Promise<void> {
+    if (this.stopped) return
+    const timeoutMs = Math.max(1_000, Math.floor(this.config.collaboration?.sessionIdleTimeoutMs ?? 0))
+    if (timeoutMs <= 0) return
+    const cutoff = Date.now() - timeoutMs
+    const pendingWal = await this.wal.pending()
+    const busySessionIds = new Set(
+      pendingWal.map(item => item.sessionId).filter((value): value is string => typeof value === 'string'),
+    )
+    const activeRuns = new Set(this.internalRunBySession.keys())
+    for (const [sessionId, lastActiveAt] of [...this.sessionActivity.entries()]) {
+      if (lastActiveAt > cutoff || busySessionIds.has(sessionId) || activeRuns.has(sessionId)) continue
+      if (this.reapedSessions.has(sessionId)) continue
+      const agent = this.bridge?.getAgent(sessionId as SessionId)
+      if (!agent) {
+        this.sessionActivity.delete(sessionId)
+        this.reapedSessions.add(sessionId)
+        continue
+      }
+      this.bridge?.stop(agent)
+      this.reapedSessions.add(sessionId)
+      this.sessionActivity.delete(sessionId)
+      await this.tasks.audit('run', sessionId, 'system', 'session.idle_reaped', {
+        idleMs: Date.now() - lastActiveAt,
+        timeoutMs,
+      }, sessionId)
+    }
+    this.scheduleNextIdleReap()
+  }
+
   private dispatchHandoff(handoff: HandoffRecord): Promise<void> {
     return this.withRunLock(handoff.runId, () => this.dispatchHandoffLocked(handoff))
   }
@@ -4715,10 +4775,29 @@ export class BotGateway {
       }
       const parallelLimit = Math.max(1, Math.min(6, Math.floor(this.config.collaboration?.maxParallelRuns ?? 6)))
       if (this.activeBotRuns.size >= parallelLimit) return
+      const perUserMax = Math.max(0, Math.floor(this.config.collaboration?.perUserMaxRuns ?? 0))
+      let requesterActive: Map<string, number> | undefined
+      if (perUserMax > 0) {
+        requesterActive = new Map()
+        for (const item of await this.mailbox.snapshot()) {
+          // Only in-flight deliveries consume a requester's quota; queued items
+          // wait for a slot instead of deadlocking the user out.
+          if (item.state !== 'claimed' && item.state !== 'acknowledged' && item.state !== 'running') continue
+          const requester = typeof item.envelope.payload.requester === 'string' ? item.envelope.payload.requester : undefined
+          if (requester === undefined || requester === '') continue
+          requesterActive.set(requester, (requesterActive.get(requester) ?? 0) + 1)
+        }
+      }
       const lease = await this.mailbox.claim(
         this.runnableBotIds(),
         this.collaborationWorkerId,
         new Set(this.activeBotRuns.keys()),
+        Date.now(),
+        requesterActive === undefined ? undefined : (item) => {
+          const requester = typeof item.envelope.payload.requester === 'string' ? item.envelope.payload.requester : undefined
+          if (requester === undefined || requester === '') return true
+          return (requesterActive.get(requester) ?? 0) < perUserMax
+        },
       )
       if (!lease) {
         await this.scheduleNextCollaborationWake()

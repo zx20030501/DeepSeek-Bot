@@ -201,6 +201,12 @@ export interface BotCollaborationConfig {
   readonly mailboxRetryMaxMs?: number
   readonly botRunMaxAttempts?: number
   readonly maxParallelRuns?: number
+  /** Per-requester cap on concurrently active Bot runs; 0 (default) is unlimited. */
+  readonly perUserMaxRuns?: number
+  /** Idle direct-chat Agent sessions are stopped after this many ms; 0 (default) disables reaping. */
+  readonly sessionIdleTimeoutMs?: number
+  /** How often the idle-session reaper runs. */
+  readonly sessionIdleCheckMs?: number
   readonly defaultSessionScope?: BotSessionScope
   readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
   readonly approvalTtlMs?: number
