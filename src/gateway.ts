@@ -4942,7 +4942,9 @@ export class BotGateway {
         }
         return
       }
-      const error = result.status === 'cancelled' ? 'External runtime request cancelled' : 'External runtime request failed'
+      const error = result.status === 'cancelled'
+        ? 'External runtime request cancelled'
+        : (typeof result.text === 'string' && result.text.trim() !== '' ? result.text : 'External runtime request failed')
       try {
         await this.withDurableMutation(() => this.finishInternalRun(internal.runId, undefined, error))
       } catch (finishError: unknown) {
@@ -5305,6 +5307,19 @@ export class BotGateway {
       if (typeof internal.envelope.payload.workflowDefinitionId === 'string') {
         await this.failCompiledWorkflow(internal, failureError)
         void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow failure drain failed: ${String(nextError)}`))
+        return
+      }
+      if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
+        await this.sendRemoteResult(internal, String(failureError), 'failed').catch(reportError => {
+          this.log('warn', 'remote failure report failed: ' + String(reportError))
+        })
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_failure_reported', {
+          taskId: internal.envelope.taskId,
+          remoteSourceNodeId: internal.envelope.payload.__dshRemoteSourceNodeId,
+          error: String(failureError).slice(0, 500),
+        }, internal.envelope.correlationId)
+        this.cleanupInternalRun(internal)
+        void this.drainCollaboration().catch(nextError => this.log('warn', `Remote failure continuation failed: ${String(nextError)}`))
         return
       }
       if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
