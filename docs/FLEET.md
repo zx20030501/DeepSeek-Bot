@@ -166,6 +166,7 @@ BotMesh 内部 Bot Session 还会获得受限 DSH Tool `bot_fleet_handoff`。模
 - `/bot create <id> [名称]`：创建当前用户私有草稿；
 - `/bot confirm <code>`：确认并激活草稿；
 - `/bot list`、`/bot status`、`/bot edit`、`/bot clone`、`/bot disable`、`/bot enable`、`/bot delete`：管理动态 Bot；`/bot status` 会返回 Fleet membership、当前 Revision、忙碌 Run 和最近失败原因；
+- `/teams`、`/team create`、`/team add`、`/team remove`、`/team manager`、`/team status`：显式维护 Team 成员；自动加入 Fleet 不会自动加入任何 Team；
 - `/fleet <任务>`：自动工作流；
 - `/tasks`：最近 Task；
 - `/task <id>`：按需查看自己 Task 的完整详情、Run、Handoff 和 Workflow；
