@@ -775,7 +775,10 @@ function validateReferencesAndGraph(
       if (!nodeMap.has(node.map.templateNodeId)) diagnostic(diagnostics, 'WORKFLOW_UNKNOWN_NODE', `${path}.map.templateNodeId`, `Unknown map template node: ${node.map.templateNodeId}`)
       addRelation(adjacency, node.id, node.map.templateNodeId)
     }
-    if (node.compensation !== undefined && !nodeMap.has(node.compensation.nodeId)) diagnostic(diagnostics, 'WORKFLOW_UNKNOWN_NODE', `${path}.compensation.nodeId`, `Unknown compensation node: ${node.compensation.nodeId}`)
+    if (node.compensation !== undefined) {
+      if (!nodeMap.has(node.compensation.nodeId)) diagnostic(diagnostics, 'WORKFLOW_UNKNOWN_NODE', path + '.compensation.nodeId', 'Unknown compensation node: ' + node.compensation.nodeId)
+      else addRelation(adjacency, node.id, node.compensation.nodeId)
+    }
   }
   for (const [index, output] of definition.outputs.entries()) addReference(output.source, `outputs[${index}].source`)
   const entry = nodeMap.get(definition.entryNodeId)

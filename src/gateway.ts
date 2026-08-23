@@ -43,6 +43,7 @@ import { botActivationFingerprint, BotRegistry, runtimeProfileFor } from './bot-
 import { TeamStore } from './team-store.js'
 import { TeamRouter, teamMentionHandle } from './team-router.js'
 import {
+  compensationNodeIds,
   evaluateWorkflowCondition,
   mapWorkflowValues,
   parseWorkflowResult,
@@ -133,6 +134,7 @@ interface CompiledWorkflowNodeRequest {
   readonly inputOverride?: Readonly<Record<string, unknown>>
   readonly mapNodeId?: string
   readonly mapIndex?: number
+  readonly compensationTrigger?: 'failure' | 'cancel' | 'timeout'
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -1301,6 +1303,11 @@ export class BotGateway {
           workflowMapNodeId: request.mapNodeId,
           workflowMapIndex: request.mapIndex ?? null,
         }),
+        ...(request.compensationTrigger === undefined ? {} : {
+          workflowCompensation: true,
+          workflowCompensationTargetNodeId: nodeId,
+          workflowCompensationTrigger: request.compensationTrigger,
+        }),
       }
       validatePeerPayload(payload, peerPolicy.maxPayloadBytes)
       const envelope = createPeerEnvelope({
@@ -1328,6 +1335,7 @@ export class BotGateway {
         storageNodeId,
         mapNodeId: request.mapNodeId ?? null,
         mapIndex: request.mapIndex ?? null,
+        compensationTrigger: request.compensationTrigger ?? null,
         taskId: task.id,
         runId: run.id,
         botId: selectedBot.id,
@@ -4192,10 +4200,195 @@ export class BotGateway {
         workflowRunId,
         rootTaskId,
         workflowName: definition.name,
+        definition,
         replyTarget,
         correlationId: root.workflowTraceId ?? internal.envelope.correlationId,
       }, error)
     }
+  }
+
+  private async advanceCompiledWorkflowCompensationLocked(
+    input: {
+      readonly definition: WorkflowDefinition
+      readonly workflowRunId: string
+      readonly rootTaskId: string
+      readonly requester: string
+      readonly replyTarget: BotTarget
+      readonly correlationId: string
+      readonly latestOutput: string
+    },
+    root: TaskRecord,
+    state: Record<string, unknown>,
+  ): Promise<void> {
+    const trigger = state.trigger === 'cancel' || state.trigger === 'timeout' ? state.trigger : 'failure'
+    const reason = typeof state.reason === 'string' ? state.reason : 'Workflow compensation was requested'
+    const targetNodeIds = Array.isArray(state.targetNodeIds)
+      ? state.targetNodeIds.filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+      : []
+    const prefix = 'compensation:' + trigger + ':'
+    const snapshot = await this.tasks.snapshot()
+    const compensationTasks = snapshot.tasks.filter(task => (
+      task.workflowDefinitionId === input.definition.id
+      && task.workflowRunId === input.workflowRunId
+      && typeof task.workflowNodeId === 'string'
+      && task.workflowNodeId.startsWith(prefix)
+    ))
+    const failed = compensationTasks.find(task => task.status === 'failed' || task.status === 'cancelled')
+    if (failed) {
+      const detail = reason + '; compensation ' + (failed.workflowNodeId ?? failed.id) + ' failed: ' + (failed.error ?? failed.status)
+      await this.cancelCompiledWorkflowChildren(input.definition.id, input.workflowRunId, detail)
+      await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+      await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
+      await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_failed', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        trigger,
+        targetNodeId: failed.workflowNodeId ?? null,
+        error: detail.slice(0, 500),
+      }, input.correlationId)
+      return
+    }
+
+    const completedByNode = new Map(
+      compensationTasks
+        .filter(task => task.workflowNodeId !== undefined)
+        .map(task => [task.workflowNodeId as string, task]),
+    )
+    if (targetNodeIds.every(nodeId => completedByNode.get(prefix + nodeId)?.status === 'completed')) {
+      const detail = reason + '; compensation completed'
+      await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+      await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
+      await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_completed', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        trigger,
+        targetNodeIds,
+      }, input.correlationId)
+      return
+    }
+
+    const deliveries = await this.mailbox.snapshot()
+    const activeTaskIds = new Set(
+      deliveries
+        .filter(item => (
+          isActiveMailboxState(item.state)
+          && item.envelope.payload.workflowDefinitionId === input.definition.id
+          && item.envelope.payload.workflowRunId === input.workflowRunId
+        ))
+        .map(item => item.envelope.taskId),
+    )
+    const requests: CompiledWorkflowNodeRequest[] = []
+    for (const nodeId of targetNodeIds) {
+      const storageNodeId = prefix + nodeId
+      const task = completedByNode.get(storageNodeId)
+      if (task?.status === 'completed') continue
+      if (task?.status === 'failed' || task?.status === 'cancelled') continue
+      if (task === undefined || !activeTaskIds.has(task.id)) {
+        requests.push({
+          nodeId,
+          storageNodeId,
+          compensationTrigger: trigger,
+        })
+      }
+    }
+    const activeCount = compensationTasks.filter(task => (
+      activeTaskIds.has(task.id)
+      && (task.status === 'pending' || task.status === 'running' || task.status === 'waiting')
+    )).length
+    const capacity = Math.min(
+      Math.max(0, input.definition.policy.budget.maxParallel - activeCount),
+      input.definition.policy.budget.maxFanOut,
+    )
+    if (requests.length === 0 || capacity <= 0) return
+    const selected = requests.slice(0, capacity)
+    const dispatched = await this.queueCompiledWorkflowNodes(
+      input.definition,
+      compileWorkflowLaunch(input.definition),
+      input.workflowRunId,
+      root,
+      selected,
+      input.requester,
+      input.replyTarget,
+      input.correlationId,
+    )
+    await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_queued', {
+      workflowRunId: input.workflowRunId,
+      rootTaskId: input.rootTaskId,
+      trigger,
+      nodeIds: selected.map(request => request.nodeId),
+      messageIds: dispatched.map(message => message.id),
+    }, input.correlationId)
+  }
+
+  private async beginCompiledWorkflowCompensationLocked(
+    input: {
+      readonly definition: WorkflowDefinition
+      readonly workflowRunId: string
+      readonly rootTaskId: string
+      readonly requester: string
+      readonly replyTarget: BotTarget
+      readonly correlationId: string
+      readonly latestOutput: string
+    },
+    error: unknown,
+    trigger: 'failure' | 'cancel' | 'timeout' = 'failure',
+  ): Promise<boolean> {
+    const root = await this.tasks.task(input.rootTaskId)
+    if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return false
+    let state = asRecord(root.workflowInputs?.__dshWorkflowCompensation)
+    if (state.active !== true) {
+      const snapshot = await this.tasks.snapshot()
+      const completedNodeIds = snapshot.tasks
+        .filter(task => (
+          task.workflowDefinitionId === input.definition.id
+          && task.workflowRunId === input.workflowRunId
+          && task.workflowNodeId !== undefined
+          && task.workflowNodeId !== '__root__'
+          && task.status === 'completed'
+          && !task.workflowNodeId.startsWith('map:')
+          && !task.workflowNodeId.startsWith('compensation:')
+        ))
+        .sort((left, right) => left.updatedAt - right.updatedAt || left.id.localeCompare(right.id))
+        .map(task => task.workflowNodeId as string)
+      const targetNodeIds = compensationNodeIds(input.definition, completedNodeIds, trigger)
+      if (targetNodeIds.length === 0) return false
+      for (const nodeId of targetNodeIds) {
+        const node = input.definition.nodes.find(candidate => candidate.id === nodeId)
+        if (!node || node.kind !== 'task') {
+          throw new Error('Workflow compensation target must be a task node: ' + nodeId)
+        }
+      }
+      state = {
+        active: true,
+        trigger,
+        reason: String(error).slice(0, 2_000),
+        targetNodeIds: [...targetNodeIds],
+        startedAt: Date.now(),
+      }
+      const patched = await this.tasks.patchTask(input.rootTaskId, {
+        status: 'waiting',
+        workflowInputs: {
+          ...(root.workflowInputs ?? {}),
+          __dshWorkflowCompensation: state,
+        },
+      }, 'workflow-runtime')
+      if (!patched) return false
+      await this.cancelCompiledWorkflowChildren(
+        input.definition.id,
+        input.workflowRunId,
+        'Workflow compensation started: ' + String(error).slice(0, 500),
+      )
+      await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_started', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        trigger,
+        targetNodeIds,
+      }, input.correlationId)
+    }
+    const currentRoot = await this.tasks.task(input.rootTaskId)
+    if (!currentRoot) return false
+    await this.advanceCompiledWorkflowCompensationLocked(input, currentRoot, state)
+    return true
   }
 
   private async advanceCompiledWorkflowState(input: {
@@ -4210,6 +4403,11 @@ export class BotGateway {
     await this.withTaskLock(input.rootTaskId, async () => {
       const root = await this.tasks.task(input.rootTaskId)
       if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
+      const compensationState = asRecord(root.workflowInputs?.__dshWorkflowCompensation)
+      if (compensationState.active === true) {
+        await this.advanceCompiledWorkflowCompensationLocked(input, root, compensationState)
+        return
+      }
       const plan = compileWorkflowLaunch(input.definition)
       const snapshot = await this.tasks.snapshot()
       const workflowTasks = snapshot.tasks.filter(task => (
@@ -4580,6 +4778,7 @@ export class BotGateway {
       workflowRunId,
       rootTaskId,
       workflowName: definition?.name ?? definitionId,
+      ...(definition === undefined ? {} : { definition }),
       ...(replyTarget === undefined ? {} : { replyTarget }),
       correlationId: root?.workflowTraceId ?? envelope.correlationId,
     }, error)
@@ -4623,6 +4822,7 @@ export class BotGateway {
     readonly workflowRunId: string
     readonly rootTaskId: string
     readonly workflowName: string
+    readonly definition?: WorkflowDefinition
     readonly replyTarget?: BotTarget
     readonly correlationId?: string
   }, error: unknown): Promise<void> {
@@ -4630,6 +4830,26 @@ export class BotGateway {
       const root = await this.tasks.task(input.rootTaskId)
       if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
       const detail = String(error).slice(0, 2_000)
+      if (input.definition !== undefined && input.replyTarget !== undefined) {
+        try {
+          const started = await this.beginCompiledWorkflowCompensationLocked({
+            definition: input.definition,
+            workflowRunId: input.workflowRunId,
+            rootTaskId: input.rootTaskId,
+            requester: root.createdBy,
+            replyTarget: input.replyTarget,
+            correlationId: input.correlationId ?? root.workflowTraceId ?? 'workflow:' + input.definitionId,
+            latestOutput: '',
+          }, detail)
+          if (started) return
+        } catch (compensationError: unknown) {
+          await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_start_failed', {
+            workflowRunId: input.workflowRunId,
+            rootTaskId: input.rootTaskId,
+            error: String(compensationError).slice(0, 500),
+          }, input.correlationId)
+        }
+      }
       await this.cancelCompiledWorkflowChildren(input.definitionId, input.workflowRunId, 'Workflow root failed: ' + detail)
       if (input.replyTarget) {
         await this.sendText(input.replyTarget, 'Workflow ' + input.workflowName + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
@@ -4655,6 +4875,16 @@ export class BotGateway {
     const root = await this.tasks.task(input.rootTaskId)
     if (!root || root.status === 'completed' || root.status === 'failed' || root.status === 'cancelled') return
     const detail = String(error).slice(0, 2_000)
+    try {
+      const started = await this.beginCompiledWorkflowCompensationLocked(input, detail)
+      if (started) return
+    } catch (compensationError: unknown) {
+      await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_start_failed', {
+        workflowRunId: input.workflowRunId,
+        rootTaskId: input.rootTaskId,
+        error: String(compensationError).slice(0, 500),
+      }, input.correlationId)
+    }
     await this.cancelCompiledWorkflowChildren(input.definition.id, input.workflowRunId, 'Workflow root failed: ' + detail)
     await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
     await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')

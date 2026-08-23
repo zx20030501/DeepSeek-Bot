@@ -846,3 +846,131 @@ test('durable Workflow map fan-out dispatches bounded item Tasks and reduces the
     await rm(root, { recursive: true, force: true })
   }
 })
+
+
+test('Workflow failure waits for durable reverse-order compensation before failing root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-workflow-compensation-runtime-'))
+  let gateway
+  const agents = new Map()
+  try {
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume({ resumeSessionId }) {
+        const agent = agents.get(String(resumeSessionId))
+        if (!agent) throw new Error('not found')
+        return { agent }
+      },
+      async create({ sessionId, meta }) {
+        const preset = meta?.agentPreset ?? 'unknown'
+        const agent = withMockSession({
+          id: String(sessionId),
+          status: 'idle',
+          cancel() {},
+          followup() {
+            setTimeout(() => {
+              if (preset === 'danger') {
+                emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'error' } })
+                return
+              }
+              const response = preset === 'starter' ? 'start-result' : 'cleanup-result'
+              emitMockAgentEvent(gateway, agent, 'assistant/message', {
+                message: { content: [{ type: 'text', text: response }] },
+              })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
+            }, 0)
+          },
+        })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_user'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        starter: { capabilities: ['start'], allowedUserIds: ['ou_user'] },
+        danger: { capabilities: ['danger'], allowedUserIds: ['ou_user'] },
+        cleanup: { capabilities: ['cleanup'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        botRunMaxAttempts: 1,
+        features: { savedWorkflows: true },
+      },
+    })
+    const sent = []
+    const transport = {
+      platform: 'feishu',
+      async start() {},
+      async stop() {},
+      async send(destination, text) { sent.push({ destination, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+
+    const definition = await gateway.createWorkflowDefinition({
+      name: 'Compensation failure',
+      description: 'A failed task with a cleanup action',
+      ownerId: 'user:feishu:ou_user',
+      scope: 'user',
+      entryNodeId: 'start',
+      inputs: [],
+      outputs: [],
+      nodes: [
+        {
+          id: 'start',
+          label: 'Prepare state',
+          kind: 'task',
+          capability: 'start',
+          outputs: ['result'],
+          compensation: { nodeId: 'undo-start', on: 'failure' },
+        },
+        { id: 'danger', label: 'Failing step', kind: 'task', capability: 'danger', outputs: ['result'] },
+        { id: 'undo-start', label: 'Undo prepared state', kind: 'task', capability: 'cleanup', outputs: ['result'] },
+      ],
+      edges: [{ from: 'start', to: 'danger' }],
+      policy: {
+        budget: {
+          maxDepth: 8,
+          maxParallel: 2,
+          maxFanOut: 2,
+          maxMessages: 10,
+          maxTokens: 20_000,
+          maxCostUnits: 100,
+        },
+        allowedCapabilities: ['start', 'danger', 'cleanup'],
+        allowedPermissions: [],
+        allowExternalEffects: false,
+      },
+    }, 'user:feishu:ou_user')
+    const launch = await gateway.launchWorkflowDefinition(
+      definition.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+      { launchId: 'compensation-runtime' },
+    )
+    assert.equal(launch.dispatched.length, 1)
+    const deadline = Date.now() + 5_000
+    let detail
+    while (Date.now() < deadline) {
+      detail = await gateway.fleetTaskDetail(launch.rootTaskId, 'local-dashboard')
+      if (detail?.task.status === 'failed') break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(detail?.task.status, 'failed')
+    const snapshot = await gateway.tasks.snapshot()
+    const compensation = snapshot.tasks.find(task => (
+      task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'compensation:failure:undo-start'
+    ))
+    assert.equal(compensation?.status, 'completed')
+    assert.ok(sent.some(item => item.text.includes('compensation completed')))
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
