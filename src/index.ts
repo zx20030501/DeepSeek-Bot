@@ -175,6 +175,32 @@ export {
 } from './collaboration.js'
 export { PairingStore } from './pairing.js'
 export {
+  REMOTE_TRANSPORT_SCHEMA_VERSION,
+  HttpRemoteBotTransport,
+  LoopbackRemoteTransport,
+  RemoteDeliveryLedger,
+  RemoteTransportError,
+  RemoteTransportValidationError,
+  createRemoteTransportHandler,
+  createRemoteTransportMessage,
+  normalizeRemoteTransportPolicy,
+  signRemoteTransportBody,
+  validateRemoteTransportMessage,
+  verifyRemoteTransportSignature,
+} from './remote-transport.js'
+export type {
+  HttpRemoteTransportOptions,
+  LoopbackRemoteTransportOptions,
+  RemoteBotTransportMessage,
+  RemoteBotTransportMessageInput,
+  RemoteFenceDecision,
+  RemoteTransportHandlerOptions,
+  RemoteTransportPolicy,
+  RemoteTransportPolicyInput,
+  RemoteTransportReceipt,
+  RemoteTransportReceiver,
+} from './remote-transport.js'
+export {
   PEER_MESSAGE_SCHEMA_VERSION,
   PeerMessageValidationError,
   createPeerEnvelope,

@@ -131,6 +131,27 @@ export interface FeishuConfig {
   readonly maxMessageChars?: number
 }
 
+export interface RemoteBotRoute {
+  readonly nodeId: string
+  readonly endpoint: string
+  readonly enabled?: boolean
+}
+
+export interface RemoteBotTransportConfig {
+  /** Cross-machine Bot-to-Bot transport is disabled unless explicitly enabled. */
+  readonly enabled?: boolean
+  /** Stable node identity used for delivery fencing and correlation. */
+  readonly nodeId?: string
+  /** Environment/credential reference name; the secret itself is never config state. */
+  readonly sharedSecretEnv?: string
+  /** Local Bot handle to remote node/endpoint mapping. */
+  readonly routes?: Record<string, RemoteBotRoute>
+  readonly defaultLeaseMs?: number
+  readonly timeoutMs?: number
+  readonly maxPayloadBytes?: number
+  readonly clockSkewMs?: number
+}
+
 export interface BotAccessConfig {
   /** Secure default: an empty allowlist accepts nobody. */
   readonly mode?: 'allowlist' | 'open'
@@ -149,6 +170,7 @@ export interface BotGatewayConfig {
   readonly access?: BotAccessConfig
   readonly telegram?: TelegramConfig
   readonly feishu?: FeishuConfig
+  readonly remoteTransport?: RemoteBotTransportConfig
   readonly maxInboundAttempts?: number
   readonly outboxMaxAttempts?: number
   readonly retryBaseMs?: number
