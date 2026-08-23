@@ -265,3 +265,28 @@ export {
 } from './setup.js'
 export type * from './types.js'
 export type { HermesBotSettings } from './setup.js'
+export {
+  DshRuntimeAdapter,
+  GrokRuntimeAdapter,
+  HermesRuntimeAdapter,
+  RuntimeAdapterError,
+  RuntimeAdapterRegistry,
+  XaiGrokRuntimeAdapter,
+} from './runtime-adapter.js'
+export type {
+  DshRuntimeAdapterOptions,
+  DshRuntimeExecutor,
+  HermesRuntimeAdapterOptions,
+  HermesRuntimeEvent,
+  HermesRuntimeTransport,
+  RuntimeAdapter,
+  RuntimeAdapterKind,
+  RuntimeFetch,
+  RuntimeMessage,
+  RuntimeMessageRole,
+  RuntimeTaskRequest,
+  RuntimeTaskResult,
+  RuntimeToolDefinition,
+  RuntimeUsage,
+  XaiGrokRuntimeAdapterOptions,
+} from './runtime-adapter.js'
