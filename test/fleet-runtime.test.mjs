@@ -697,3 +697,152 @@ test('Workflow root failure cancels queued child work and fences its delivery', 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+
+test('durable Workflow map fan-out dispatches bounded item Tasks and reduces their outputs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-workflow-map-runtime-'))
+  let gateway
+  const agents = new Map()
+  const prompts = []
+  try {
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume({ resumeSessionId }) {
+        const agent = agents.get(String(resumeSessionId))
+        if (!agent) throw new Error('not found')
+        return { agent }
+      },
+      async create({ sessionId, meta }) {
+        const preset = meta?.agentPreset ?? 'unknown'
+        const agent = withMockSession({
+          id: String(sessionId),
+          status: 'idle',
+          cancel() {},
+          followup(prompt) {
+            const text = typeof prompt === 'string' ? prompt : JSON.stringify(prompt)
+            prompts.push({ preset, text })
+            const response = preset === 'starter'
+              ? '["one","two","three"]'
+              : JSON.stringify({ result: preset + '-done', status: 'completed' })
+            setTimeout(() => {
+              emitMockAgentEvent(gateway, agent, 'assistant/message', {
+                message: { content: [{ type: 'text', text: response }] },
+              })
+              emitMockAgentEvent(gateway, agent, 'turn/end', { reason: { kind: 'completed' } })
+            }, 0)
+          },
+        })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_user'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        starter: { capabilities: ['start'], allowedUserIds: ['ou_user'] },
+        worker1: { capabilities: ['map'], allowedUserIds: ['ou_user'] },
+        worker2: { capabilities: ['map'], allowedUserIds: ['ou_user'] },
+        worker3: { capabilities: ['map'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { savedWorkflows: true },
+        maxParallelRuns: 3,
+      },
+    })
+    const sent = []
+    const transport = {
+      platform: 'feishu',
+      async start() {},
+      async stop() {},
+      async send(destination, text) { sent.push({ destination, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+
+    const definition = await gateway.createWorkflowDefinition({
+      name: 'Map and reduce',
+      description: 'Expand a bounded list and collect the results',
+      ownerId: 'user:feishu:ou_user',
+      scope: 'user',
+      entryNodeId: 'start',
+      inputs: [],
+      outputs: [],
+      nodes: [
+        { id: 'start', label: 'Create list', kind: 'task', capability: 'start', outputs: ['result'] },
+        {
+          id: 'expand',
+          label: 'Expand items',
+          kind: 'map',
+          map: {
+            source: { kind: 'node-output', nodeId: 'start', output: 'result' },
+            itemInput: 'item',
+            templateNodeId: 'worker',
+            maxFanOut: 3,
+          },
+        },
+        { id: 'worker', label: 'Process item', kind: 'task', capability: 'map', outputs: ['result'] },
+        {
+          id: 'collect',
+          label: 'Collect items',
+          kind: 'reduce',
+          reduce: {
+            source: { kind: 'node-output', nodeId: 'expand', output: 'result' },
+            reducer: 'concat',
+          },
+        },
+      ],
+      edges: [
+        { from: 'start', to: 'expand' },
+        { from: 'expand', to: 'collect' },
+      ],
+      policy: {
+        budget: {
+          maxDepth: 8,
+          maxParallel: 3,
+          maxFanOut: 3,
+          maxMessages: 10,
+          maxTokens: 20_000,
+          maxCostUnits: 100,
+        },
+        allowedCapabilities: ['start', 'map'],
+        allowedPermissions: [],
+        allowExternalEffects: false,
+      },
+    }, 'user:feishu:ou_user')
+    const launch = await gateway.launchWorkflowDefinition(
+      definition.id,
+      'user:feishu:ou_user',
+      target,
+      'user:feishu:ou_user',
+      { launchId: 'map-runtime' },
+    )
+    assert.equal(launch.dispatched.length, 1)
+    const deadline = Date.now() + 5_000
+    let detail
+    while (Date.now() < deadline) {
+      detail = await gateway.fleetTaskDetail(launch.rootTaskId, 'local-dashboard')
+      if (detail?.task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(detail?.task.status, 'completed')
+    const snapshot = await gateway.tasks.snapshot()
+    const mapItems = snapshot.tasks.filter(task => (
+      task.workflowRunId === launch.workflowRunId && task.workflowNodeId?.startsWith('map:expand:')
+    ))
+    assert.equal(mapItems.length, 3)
+    assert.ok(mapItems.every(task => task.status === 'completed'))
+    assert.ok(snapshot.tasks.some(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'expand' && task.status === 'completed'))
+    assert.ok(snapshot.tasks.some(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'collect' && task.status === 'completed'))
+    assert.ok(prompts.filter(item => item.preset.startsWith('worker')).length >= 3)
+    assert.ok(sent.some(item => item.text.includes('Workflow Map and reduce 完成')))
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
