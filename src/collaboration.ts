@@ -954,6 +954,39 @@ export class TaskRunStore {
     return { ...next, acceptanceCriteria: [...next.acceptanceCriteria] }
   }
 
+  /**
+   * Apply a narrow durable Task patch for control-plane state that has no
+   * model Run, such as a waiting Workflow compensation barrier.
+   */
+  public async patchTask(
+    taskId: string,
+    patch: {
+      readonly status?: TaskStatus
+      readonly workflowInputs?: Record<string, unknown>
+      readonly result?: string
+      readonly error?: string
+    },
+    actor = 'botfleet',
+  ): Promise<TaskRecord | undefined> {
+    await this.load()
+    const task = this.tasks.get(taskId)
+    if (!task) return undefined
+    const next: TaskRecord = {
+      ...task,
+      ...(patch.status === undefined ? {} : { status: patch.status }),
+      ...(patch.workflowInputs === undefined ? {} : { workflowInputs: structuredClone(patch.workflowInputs) }),
+      ...(patch.result === undefined ? {} : { result: patch.result }),
+      ...(patch.error === undefined ? {} : { error: patch.error }),
+      updatedAt: now(),
+    }
+    await this.recordTask(next)
+    await this.audit('task', taskId, actor, 'task.patched', {
+      status: next.status,
+      workflowControl: next.workflowInputs?.__dshWorkflowCompensation === undefined ? null : 'compensation',
+    }, task.workflowTraceId)
+    return { ...next, acceptanceCriteria: [...next.acceptanceCriteria] }
+  }
+
   public async failTask(taskId: string, error: unknown, actor = 'botfleet'): Promise<TaskRecord | undefined> {
     await this.load()
     const task = this.tasks.get(taskId)
