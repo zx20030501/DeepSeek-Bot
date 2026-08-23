@@ -88,10 +88,12 @@ import {
   compensationNodeIds,
   evaluateWorkflowCondition,
   mapWorkflowValues,
+  parseWorkflowApprovalEntityId,
   parseWorkflowResult,
   resolveWorkflowInputs as resolveWorkflowControlInputs,
   reduceWorkflowValues,
   serializeWorkflowResult,
+  workflowApprovalEntityId,
 } from './workflow-controls.js'
 import {
   BotDirectory,
@@ -108,6 +110,7 @@ import type {
   ManagerPlan,
   WorkflowDefinition,
   WorkflowDraft,
+  WorkflowRetrySpec,
   WorkflowValueType,
 } from './fleet-v2-types.js'
 import type {
@@ -501,6 +504,7 @@ export class BotGateway {
   /** Direct chat sessions that have actually invoked each dynamic profile. */
   private readonly directProfileSessions = new Map<string, Set<string>>()
   private readonly workflowLanes = new Map<string, Promise<void>>()
+  private readonly workflowWakeTimers = new Set<ReturnType<typeof setTimeout>>()
   /** Serializes concurrent launches that share the same caller-provided launch ID. */
   private readonly workflowLaunchLanes = new Map<string, Promise<void>>()
   private readonly runLanes = new Map<string, Promise<void>>()
@@ -672,6 +676,8 @@ export class BotGateway {
       }
     }
     for (const internal of stoppingRuns) this.cleanupInternalRun(internal)
+    for (const timer of this.workflowWakeTimers) clearTimeout(timer)
+    this.workflowWakeTimers.clear()
     await this.outbox.stop()
   }
 
@@ -1907,6 +1913,13 @@ export class BotGateway {
       let run = task.currentRunId === undefined ? undefined : knownRuns.get(task.currentRunId)
       let createdRun = false
       if (needsNewRun) {
+        if (definitionNode.retry !== undefined) {
+          const maxAttempts = Math.max(1, Math.floor(definitionNode.retry.maxAttempts))
+          const attempts = snapshot.runs.filter(candidate => candidate.taskId === task.id).length
+          if (attempts >= maxAttempts) {
+            throw new Error('Workflow node exhausted ' + attempts + ' retries: ' + storageNodeId)
+          }
+        }
         run = await this.tasks.createRun(task.id, selectedBot.id, (run?.attempt ?? 0) + 1)
         knownRuns.set(run.id, run)
         createdRun = true
@@ -1972,6 +1985,17 @@ export class BotGateway {
         runId: run.id,
         botId: selectedBot.id,
       }, correlationId)
+      if (createdRun && definitionNode.timeout !== undefined) {
+        const timeoutMs = Math.max(1_000, Math.floor(definitionNode.timeout.timeoutMs))
+        this.scheduleWorkflowWake({
+          definition,
+          workflowRunId,
+          rootTaskId: rootTask.id,
+          requester,
+          replyTarget,
+          correlationId,
+        }, rootTask, Math.max(100, task.createdAt + timeoutMs - Date.now()))
+      }
       dispatched.push(envelope)
     }
     return dispatched
@@ -4446,6 +4470,7 @@ export class BotGateway {
       return
     }
     if (approval.kind === 'workflow') {
+      if (await this.resolveCompiledWorkflowApproval(approval, resolutionActor)) return
       const workflow = await this.tasks.workflow(approval.entityId)
       if (!workflow) return
       if (approval.status === 'rejected' || approval.status === 'expired') {
@@ -5100,13 +5125,20 @@ export class BotGateway {
     if (!internal) return
     if (error !== undefined) {
       const currentRun = await this.tasks.run(runId)
-      const maxAttempts = Math.max(1, Math.min(10, Math.floor(this.config.collaboration?.botRunMaxAttempts ?? 3)))
+      const nodeRetrySpec = await this.workflowRetrySpecForPayload(internal.envelope.payload)
+      const maxAttempts = nodeRetrySpec !== undefined
+        ? Math.max(1, Math.floor(nodeRetrySpec.maxAttempts))
+        : Math.max(1, Math.min(10, Math.floor(this.config.collaboration?.botRunMaxAttempts ?? 3)))
       const retrying = currentRun !== undefined
         && currentRun.attempt < maxAttempts
         && (internal.envelope.expiresAt === undefined || internal.envelope.expiresAt > Date.now())
+      const exhaustedByNode = nodeRetrySpec !== undefined && currentRun !== undefined && currentRun.attempt >= maxAttempts
+      const failureError = exhaustedByNode
+        ? new Error('Workflow node exhausted ' + maxAttempts + ' retries: ' + String(error))
+        : error
       const failed = retrying
-        ? await this.mailbox.fail(internal.lease, error, false)
-        : await this.mailbox.deadLetter(internal.lease, error)
+        ? await this.mailbox.fail(internal.lease, failureError, false)
+        : await this.mailbox.deadLetter(internal.lease, failureError)
       if (!failed) {
         await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.stale_failure', {
           taskId: internal.envelope.taskId,
@@ -5115,7 +5147,7 @@ export class BotGateway {
         void this.drainCollaboration().catch(nextError => this.log('warn', `stale failure recovery failed: ${String(nextError)}`))
         return
       }
-      await this.tasks.failRun(runId, error, !retrying && currentRun?.workflowId === undefined)
+      await this.tasks.failRun(runId, failureError, !retrying && currentRun?.workflowId === undefined)
       this.cleanupInternalRun(internal)
       if (retrying && currentRun) {
         const budgetError = await this.compiledWorkflowRetryBudgetError(internal.envelope, currentRun)
@@ -5172,7 +5204,10 @@ export class BotGateway {
               ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
               payload: { ...internal.envelope.payload },
             })
-          const availableAt = Date.now() + this.botRunRetryDelay(currentRun.attempt)
+          const delay = nodeRetrySpec !== undefined && nodeRetrySpec.backoffMs !== undefined
+            ? Math.max(0, Math.floor(nodeRetrySpec.backoffMs))
+            : this.botRunRetryDelay(currentRun.attempt)
+          const availableAt = Date.now() + delay
           await this.mailbox.enqueue(retryEnvelope, retryIdempotencyKey, availableAt)
           await this.tasks.audit('message', retryEnvelope.id, internal.botId, 'message.retry_queued', {
             previousRunId: currentRun.id,
@@ -5189,7 +5224,7 @@ export class BotGateway {
         return
       }
       if (typeof internal.envelope.payload.workflowDefinitionId === 'string') {
-        await this.failCompiledWorkflow(internal, error)
+        await this.failCompiledWorkflow(internal, failureError)
         void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow failure drain failed: ${String(nextError)}`))
         return
       }
@@ -5572,6 +5607,79 @@ export class BotGateway {
     return true
   }
 
+  /** Wake a compiled Workflow after a retry backoff or node timeout elapses. */
+  private scheduleWorkflowWake(input: {
+    readonly definition: WorkflowDefinition
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly requester: string
+    readonly replyTarget: BotTarget
+    readonly correlationId: string
+  }, root: TaskRecord, delayMs: number): void {
+    if (this.stopped) return
+    const timer = setTimeout(() => {
+      this.workflowWakeTimers.delete(timer)
+      if (this.stopped) return
+      void this.advanceCompiledWorkflowState({ ...input, latestOutput: '' })
+        .catch(error => this.log('warn', 'workflow wake failed: ' + String(error)))
+        .finally(() => {
+          void this.drainCollaboration().catch(error => this.log('warn', 'workflow wake drain failed: ' + String(error)))
+        })
+    }, Math.max(50, delayMs))
+    this.workflowWakeTimers.add(timer)
+    timer.unref?.()
+  }
+
+  /** Resolve an approval gate on a compiled Workflow node; false when not one. */
+  private async resolveCompiledWorkflowApproval(approval: FleetApprovalRecord, resolutionActor: string): Promise<boolean> {
+    const parsed = parseWorkflowApprovalEntityId(approval.entityId)
+    if (!parsed) return false
+    const snapshot = await this.tasks.snapshot()
+    const controlTask = snapshot.tasks.find(task => (
+      task.workflowRunId === parsed.workflowRunId && task.workflowNodeId === parsed.nodeId
+    ))
+    if (!controlTask) return true
+    if (approval.status === 'rejected' || approval.status === 'expired') {
+      await this.tasks.failTask(
+        controlTask.id,
+        approval.status === 'expired' ? 'Workflow 审批已过期' : 'Workflow 审批未获批准',
+        resolutionActor,
+      )
+    } else if (approval.status === 'approved') {
+      await this.tasks.completeTask(
+        controlTask.id,
+        serializeWorkflowResult({ approved: true, approvedBy: resolutionActor, at: Date.now() }),
+        'workflow-runtime',
+      )
+    }
+    await this.tasks.audit('workflow', controlTask.workflowDefinitionId ?? parsed.nodeId, resolutionActor, 'workflow.approval_resolved', {
+      workflowRunId: parsed.workflowRunId,
+      nodeId: parsed.nodeId,
+      status: approval.status,
+      approvalId: approval.id,
+    }, controlTask.workflowTraceId ?? parsed.workflowRunId)
+    const root = snapshot.tasks.find(task => (
+      task.workflowRunId === parsed.workflowRunId && task.workflowNodeId === '__root__'
+    ))
+    if (root && root.status !== 'completed' && root.status !== 'failed' && root.status !== 'cancelled') {
+      const definition = await this.getPinnedWorkflowDefinition(root)
+      const replyTarget = root.workflowReplyTarget
+      if (definition && replyTarget) {
+        await this.advanceCompiledWorkflowState({
+          definition,
+          workflowRunId: parsed.workflowRunId,
+          rootTaskId: root.id,
+          requester: root.createdBy,
+          replyTarget,
+          correlationId: root.workflowTraceId ?? 'workflow:' + root.workflowDefinitionId,
+          latestOutput: '',
+        })
+        void this.drainCollaboration().catch(error => this.log('warn', 'workflow approval drain failed: ' + String(error)))
+      }
+    }
+    return true
+  }
+
   private async advanceCompiledWorkflowState(input: {
     readonly definition: WorkflowDefinition
     readonly workflowRunId: string
@@ -5655,6 +5763,8 @@ export class BotGateway {
         controlProgress = false
         for (const control of plan.nodes.filter(node => (
           node.kind === 'condition' || node.kind === 'map' || node.kind === 'reduce'
+          || node.kind === 'approval' || node.kind === 'sequential' || node.kind === 'parallel'
+          || node.kind === 'retry' || node.kind === 'timeout' || node.kind === 'compensation'
         ))) {
           if (isCompleted(control.nodeId)) continue
           if (!control.dependsOn.every(isCompleted)) continue
@@ -5711,6 +5821,72 @@ export class BotGateway {
               nodeId: control.nodeId,
               reducer: definitionNode.reduce.reducer,
             }, input.correlationId)
+            controlProgress = true
+            continue
+          }
+
+          if (control.kind === 'approval') {
+            if (definitionNode.approval === undefined) throw new Error('Approval node is missing its approval specification: ' + control.nodeId)
+            let approvalTask = taskByNode.get(control.nodeId)
+            if (approvalTask === undefined) {
+              approvalTask = await this.tasks.createTask({
+                title: input.definition.name + ': ' + definitionNode.label,
+                instruction: 'Gate Workflow approval ' + control.nodeId,
+                createdBy: input.requester,
+                assignedTo: 'workflow',
+                workflowDefinitionId: input.definition.id,
+                workflowRevision: input.definition.revision,
+                workflowRunId: input.workflowRunId,
+                workflowNodeId: control.nodeId,
+                workflowReplyTarget: input.replyTarget,
+                workflowTraceId: input.correlationId,
+                ...(root.workflowInputs === undefined ? {} : { workflowInputs: root.workflowInputs }),
+              })
+              taskByNode.set(control.nodeId, approvalTask)
+            }
+            if (approvalTask.status === 'failed' || approvalTask.status === 'cancelled') continue
+            if (approvalTask.status === 'completed') {
+              workflowOutputs.set(control.nodeId, parseWorkflowResult(approvalTask.result))
+              continue
+            }
+            const entityId = workflowApprovalEntityId(input.workflowRunId, control.nodeId)
+            const pendingApproval = (await this.approvals.snapshot()).find(approval => (
+              approval.kind === 'workflow' && approval.entityId === entityId && approval.status === 'pending'
+            ))
+            if (pendingApproval === undefined) {
+              const approval = await this.approvals.create({
+                kind: 'workflow',
+                requestedBy: input.requester,
+                summary: 'Workflow ' + input.definition.name + ' 需要审批：' + (definitionNode.approval.reason || definitionNode.label),
+                entityId,
+                ...(this.config.collaboration?.approvalTtlMs === undefined ? {} : { ttlMs: this.config.collaboration.approvalTtlMs }),
+              })
+              await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.approval_required', {
+                workflowRunId: input.workflowRunId,
+                nodeId: control.nodeId,
+                approvalCode: approval.code,
+                risk: definitionNode.approval.risk,
+              }, input.correlationId)
+              this.scheduleApprovalExpiry(approval.expiresAt)
+              await this.sendText(
+                input.replyTarget,
+                'Workflow ' + input.definition.name + ' 需要审批：' + (definitionNode.approval.reason || definitionNode.label) + '\n审批码：' + approval.code,
+                'workflow-approval:' + input.workflowRunId + ':' + control.nodeId,
+              )
+            }
+            continue
+          }
+
+          if (control.kind === 'sequential' || control.kind === 'parallel' || control.kind === 'retry' || control.kind === 'timeout' || control.kind === 'compensation') {
+            // Structural pass-through: the container is a grouping marker whose
+            // own completion depends only on its declared dependencies. Ordering
+            // of the children is expressed by the edges the author wired.
+            const containerTask = await ensureControlTask(
+              control.nodeId,
+              serializeWorkflowResult({ expanded: true, childCount: (definitionNode.children ?? []).length, kind: control.kind }),
+              'Expand Workflow container ' + control.nodeId,
+            )
+            taskByNode.set(control.nodeId, containerTask)
             controlProgress = true
             continue
           }
@@ -5798,9 +5974,28 @@ export class BotGateway {
       }
 
       const taskNodes = plan.nodes.filter(node => node.kind === 'task' && !mapTemplateIds.has(node.nodeId))
-      const controlNodes = plan.nodes.filter(node => (
-        node.kind === 'condition' || node.kind === 'map' || node.kind === 'reduce'
-      ))
+      const handledControlKinds = new Set([
+        'condition', 'map', 'reduce', 'approval',
+        'sequential', 'parallel', 'retry', 'timeout', 'compensation',
+      ])
+      const controlNodes = plan.nodes.filter(node => handledControlKinds.has(node.kind))
+      // Enforce per-node timeouts before evaluating failures.
+      for (const node of taskNodes) {
+        const definitionNode = definitionById.get(node.nodeId)
+        const timeoutSpec = definitionNode?.timeout
+        if (timeoutSpec === undefined) continue
+        const task = taskByNode.get(node.nodeId)
+        if (!task || !['pending', 'running', 'waiting'].includes(task.status)) continue
+        const timeoutMs = Math.max(1_000, Math.floor(timeoutSpec.timeoutMs))
+        if (Date.now() - task.createdAt <= timeoutMs) continue
+        const failed = await this.tasks.failTask(task.id, 'Workflow node timed out after ' + timeoutMs + 'ms: ' + node.nodeId, 'workflow-runtime')
+        if (failed) taskByNode.set(node.nodeId, failed)
+        await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.node_timed_out', {
+          workflowRunId: input.workflowRunId,
+          nodeId: node.nodeId,
+          timeoutMs,
+        }, input.correlationId)
+      }
       const failedNode = taskNodes.find(node => {
         const task = taskByNode.get(node.nodeId)
         return task?.status === 'failed' || task?.status === 'cancelled'
@@ -5810,13 +6005,19 @@ export class BotGateway {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow node ' + failedNode.nodeId + ' failed: ' + (task?.error ?? task?.status ?? 'unknown'))
         return
       }
+      const failedControl = controlNodes.find(node => {
+        const task = taskByNode.get(node.nodeId)
+        return task?.status === 'failed' || task?.status === 'cancelled'
+      })
+      if (failedControl) {
+        const task = taskByNode.get(failedControl.nodeId)
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow control node ' + failedControl.nodeId + ' ' + (task?.status ?? 'failed') + ': ' + (task?.error ?? ''))
+        return
+      }
       const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => isCompleted(node.nodeId))
       const allControlsCompleted = controlNodes.every(node => isCompleted(node.nodeId))
       const unsupportedNodes = plan.nodes.filter(node => (
-        node.kind !== 'task'
-        && node.kind !== 'condition'
-        && node.kind !== 'map'
-        && node.kind !== 'reduce'
+        node.kind !== 'task' && !handledControlKinds.has(node.kind)
       ))
       if (allTasksCompleted && allControlsCompleted && unsupportedNodes.length > 0) {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow control nodes require a runtime adapter: ' + unsupportedNodes.map(node => node.nodeId).join(', '))
@@ -5917,7 +6118,13 @@ export class BotGateway {
       })
       if (ready.length === 0) {
         if (activeCount === 0) {
-          await this.markCompiledWorkflowFailedLocked(input, 'Workflow is blocked by an unresolved dependency or unsupported control node')
+          const waitingOnControl = controlNodes.some(node => {
+            const task = taskByNode.get(node.nodeId)
+            return task !== undefined && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+          })
+          if (!waitingOnControl) {
+            await this.markCompiledWorkflowFailedLocked(input, 'Workflow is blocked by an unresolved dependency or unsupported control node')
+          }
         }
         return
       }
@@ -6080,6 +6287,17 @@ export class BotGateway {
     const base = Math.max(50, this.config.collaboration?.mailboxRetryBaseMs ?? 1_000)
     const maximum = Math.max(base, this.config.collaboration?.mailboxRetryMaxMs ?? 60_000)
     return Math.min(maximum, base * 2 ** Math.max(0, attempt - 1))
+  }
+
+  /** Resolve the retry-node policy for a compiled Workflow delivery payload. */
+  private async workflowRetrySpecForPayload(payload: Readonly<Record<string, unknown>>): Promise<WorkflowRetrySpec | undefined> {
+    const rootTaskId = typeof payload.workflowRootTaskId === 'string' ? payload.workflowRootTaskId : undefined
+    const nodeId = typeof payload.workflowNodeId === 'string' ? payload.workflowNodeId : undefined
+    if (!rootTaskId || !nodeId) return undefined
+    const root = await this.tasks.task(rootTaskId)
+    if (!root) return undefined
+    const definition = await this.getPinnedWorkflowDefinition(root)
+    return definition?.nodes.find(node => node.id === nodeId)?.retry
   }
 
   private async compiledWorkflowRetryBudgetError(
@@ -6486,7 +6704,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -6658,6 +6876,69 @@ export class BotGateway {
         )
       } catch (error: unknown) {
         await this.completeWithText(message, walId, binding, 'Routine 操作失败：' + (error instanceof Error ? error.message : String(error)))
+      }
+      return true
+    }
+    if (name === 'workflow' || name === 'wf') {
+      const actor = actorForTarget(message.target)
+      const parts = args.trim().split(/\s+/u).filter(Boolean)
+      const action = (parts[0] ?? 'list').toLowerCase()
+      try {
+        if (action === 'list') {
+          const workflows = await this.listWorkflowDefinitions(actor)
+          const rows = workflows.slice(0, 20).map(workflow => (
+            workflow.id + ' · ' + workflow.status + ' · r' + workflow.revision
+              + ' · ' + workflow.name + ' · ' + workflow.nodes.length + ' 节点'
+          ))
+          await this.completeWithText(message, walId, binding, rows.length
+            ? '已保存的 Workflow：\n' + rows.join('\n')
+            : '当前没有已保存的 Workflow。')
+          return true
+        }
+        if (action === 'run') {
+          const workflowId = parts[1] ?? ''
+          const workflow = await this.getWorkflowDefinition(workflowId, actor)
+          if (workflow === undefined) throw new Error('Workflow 不存在，或当前用户不可见：' + workflowId)
+          let inputs: Record<string, unknown> = {}
+          const json = args.slice('run'.length).trim().replace(workflowId, '').trim()
+          if (json !== '') {
+            const parsed: unknown = JSON.parse(json)
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error('JSON输入必须是对象')
+            }
+            inputs = parsed as Record<string, unknown>
+          }
+          const launch = await this.launchWorkflowDefinition(workflow.id, actor, message.target, actor, {
+            launchId: 'chat:' + Date.now() + ':' + workflow.id,
+            inputs,
+          })
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            '已启动 Workflow：' + workflow.name + '\nRoot 任务：' + launch.rootTaskId + '\n已分发节点：' + launch.dispatched.length,
+          )
+          return true
+        }
+        if (action === 'stop') {
+          const workflowId = parts[1] ?? ''
+          const snapshot = await this.tasks.snapshot()
+          const roots = snapshot.tasks.filter(task => (
+            task.workflowDefinitionId === workflowId
+            && task.workflowNodeId === '__root__'
+            && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+          ))
+          let cancelled = 0
+          for (const root of roots) {
+            const stopped = await this.cancelFleetTaskUnlocked(root.id, actor)
+            if (stopped !== undefined) cancelled += 1
+          }
+          await this.completeWithText(message, walId, binding, cancelled > 0 ? '已停止 ' + cancelled + ' 个运行中的 Workflow 实例。' : '没有找到运行中的 Workflow 实例。')
+          return true
+        }
+        await this.completeWithText(message, walId, binding, '用法：/wf list | /wf run <id> [JSON输入] | /wf stop <id>')
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, 'Workflow 操作失败：' + (error instanceof Error ? error.message : String(error)))
       }
       return true
     }
