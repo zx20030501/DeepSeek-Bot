@@ -716,6 +716,10 @@ export interface SendBotMessageInput {
   readonly correlationId?: string
   readonly ttlMs?: number
   readonly expiresAt?: number
+  /** Control-plane replies to non-Bot addresses reuse the original Task/Run identity. */
+  readonly taskId?: string
+  readonly runId?: string
+  readonly attemptId?: string
 }
 
 export interface ReplyToBotMessageInput {

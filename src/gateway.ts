@@ -2106,23 +2106,31 @@ export class BotGateway {
   public async replyToMessage(input: ReplyToBotMessageInput): Promise<BotMessageEnvelope> {
     const targetBot = input.to ?? input.message.from
     const target = this.directory.get(targetBot)
-    if (!target) throw new Error('reply target is not an available Bot: ' + targetBot)
+    // Replies may target the user who asked: the reply is a control-plane
+    // completion recorded against the durable Ask, delivered by the ask waiter.
+    const userTarget = target === undefined
+      && input.to === undefined
+      && (input.message.fromAddress?.type === 'user' || input.message.from.startsWith('user:'))
+    if (!target && !userTarget) throw new Error('reply target is not an available Bot: ' + targetBot)
     const askId = typeof input.message.payload?.askId === 'string' && input.message.payload.askId.trim() !== ''
       ? input.message.payload.askId.trim()
       : undefined
     const replyPayload = askId === undefined
       ? input.payload
       : { ...(input.payload ?? {}), askId, __dshAsk: true }
+    const toAddress = input.toAddress ?? (userTarget
+      ? (input.message.fromAddress ?? { id: input.message.from, type: 'user' as const })
+      : { id: target!.id, type: 'bot' as const })
     return this.sendBotMessage({
       from: input.from,
-      to: target.id,
+      to: toAddress.id,
       instruction: input.instruction,
       replyTarget: input.replyTarget,
       kind: 'reply',
       ...(input.title === undefined ? {} : { title: input.title }),
       ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
       ...(input.fromAddress === undefined ? {} : { fromAddress: input.fromAddress }),
-      ...(input.toAddress === undefined ? {} : { toAddress: input.toAddress }),
+      toAddress,
       ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
       ...(input.toSessionId === undefined ? {} : { toSessionId: input.toSessionId }),
       ...(input.idempotencyKey === undefined && askId === undefined ? {} : {
@@ -2133,6 +2141,11 @@ export class BotGateway {
       ...(input.message.conversationId === undefined ? {} : { conversationId: input.message.conversationId }),
       replyTo: input.message.id,
       traceId: input.message.traceId ?? input.message.correlationId,
+      ...(userTarget ? {
+        taskId: input.message.taskId,
+        runId: input.message.runId,
+        attemptId: input.message.attemptId,
+      } : {}),
     })
   }
 
@@ -2235,9 +2248,11 @@ export class BotGateway {
   private async sendBotMessageUnlocked(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
     const requestedBotId = input.to.trim().toLowerCase()
-    const bot = this.directory.get(requestedBotId)
-    const remoteRoute = bot === undefined ? this.remoteRouteForBot(requestedBotId) : undefined
-    if (!bot && remoteRoute === undefined) throw new Error('Bot is unavailable or not authorized: ' + input.to)
+    const userReplyTarget = input.kind === 'reply'
+      && (input.toAddress?.type === 'user' || requestedBotId.startsWith('user:'))
+    const bot = userReplyTarget ? undefined : this.directory.get(requestedBotId)
+    const remoteRoute = bot === undefined && !userReplyTarget ? this.remoteRouteForBot(requestedBotId) : undefined
+    if (!bot && remoteRoute === undefined && !userReplyTarget) throw new Error('Bot is unavailable or not authorized: ' + input.to)
     if (bot && !this.directory.canInvoke(bot.id, input.replyTarget)) {
       throw new Error('Bot is unavailable or not authorized: ' + input.to)
     }
@@ -2272,7 +2287,7 @@ export class BotGateway {
     if (
       typeof toAddress.id !== 'string'
       || toAddress.id.toLowerCase() !== targetBotId
-      || (toAddress.type !== undefined && toAddress.type !== 'bot')
+      || (!userReplyTarget && toAddress.type !== undefined && toAddress.type !== 'bot')
     ) {
       throw new Error('toAddress must identify the selected Bot')
     }
@@ -2287,29 +2302,33 @@ export class BotGateway {
     const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
     validatePeerPayload(messagePayload, peerPolicy.maxPayloadBytes)
 
-    const task = await this.tasks.createTask({
-      title: input.title ?? input.instruction,
-      instruction: input.instruction,
-      createdBy: input.from,
-      assignedTo: targetBotId,
-      ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
-    })
-    try {
-      if (bot !== undefined) {
-        await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+    let task: TaskRecord | undefined
+    let run: RunRecord | undefined
+    if (!userReplyTarget) {
+      task = await this.tasks.createTask({
+        title: input.title ?? input.instruction,
+        instruction: input.instruction,
+        createdBy: input.from,
+        assignedTo: targetBotId,
+        ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
+      })
+      try {
+        if (bot !== undefined) {
+          await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+        }
+      } catch (error: unknown) {
+        await this.tasks.cancelTask(task.id, 'system:admission')
+        throw error
       }
-    } catch (error: unknown) {
-      await this.tasks.cancelTask(task.id, 'system:admission')
-      throw error
+      run = await this.tasks.createRun(task.id, targetBotId, 1)
     }
-    const run = await this.tasks.createRun(task.id, targetBotId, 1)
     const envelope = createPeerEnvelope({
       kind: input.kind ?? 'request',
       from: fromAddress,
       to: toAddress,
-      taskId: task.id,
-      runId: run.id,
-      attemptId: run.attemptId,
+      taskId: input.taskId ?? task?.id ?? 'ask-reply:' + randomUUID(),
+      runId: input.runId ?? run?.id ?? 'ask-reply-run:' + randomUUID(),
+      attemptId: input.attemptId ?? run?.attemptId ?? 'ask-reply-attempt:' + randomUUID(),
       ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
       ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
       ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
@@ -2339,6 +2358,11 @@ export class BotGateway {
         }, envelope.correlationId)
       }
     }
+    if (userReplyTarget) {
+      // Control-plane reply to the asking user: no Task/Run/Mailbox delivery;
+      // the ask waiter delivers the aggregated answer to the chat.
+      return envelope
+    }
     if (remoteRoute !== undefined) {
       try {
         await this.dispatchRemoteEnvelope(envelope, remoteRoute)
@@ -2348,22 +2372,22 @@ export class BotGateway {
         // without creating a second local Task/Run.
         await this.tasks.audit('message', envelope.id, input.from, 'message.remote_send_failed', {
           targetNodeId: remoteRoute.nodeId,
-          taskId: task.id,
-          runId: run.id,
+          taskId: task!.id,
+          runId: run!.id,
           error: String(error).slice(0, 500),
         }, envelope.correlationId)
         throw error
       }
       await this.tasks.audit('message', envelope.id, input.from, 'message.remote_sent', {
         targetNodeId: remoteRoute.nodeId,
-        taskId: task.id,
-        runId: run.id,
+        taskId: task!.id,
+        runId: run!.id,
       }, envelope.correlationId)
       return envelope
     }
     await this.mailbox.enqueue(envelope, peerMessageIdempotencyKey(envelope))
     await this.tasks.audit('message', envelope.id, input.from, 'message.queued', {
-      taskId: task.id,
+      taskId: task!.id,
       to: bot!.id,
       schemaVersion: envelope.schemaVersion ?? null,
       hop: envelope.hop ?? 0,

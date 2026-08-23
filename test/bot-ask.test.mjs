@@ -327,8 +327,12 @@ test('/ask chat command asks a Bot and delivers the answer', async () => {
     assert.equal(pending[0].question, 'What is the answer?')
     const askId = pending[0].askId
     assert.ok(sent.some(item => item.text.includes('已向 @answerer 提问')))
-    // The target Bot's reply completes the Ask; the /ask waiter delivers it.
-    await gateway.askRegistry.recordReply(askId, { from: 'answerer', text: 'forty-two', messageId: 'reply-1' })
+    // The target Bot replies through the peer reply seam; because the asker is
+    // a user, the reply is a control-plane completion recorded against the Ask.
+    const mailbox = await gateway.mailbox.snapshot()
+    const item = mailbox.find(entry => entry.envelope.payload.askId === askId)
+    assert.ok(item, 'the ask envelope should be in the mailbox')
+    await gateway.replyToMessage({ message: item.envelope, from: 'answerer', instruction: 'forty-two', replyTarget })
 
     const answerDeadline = Date.now() + 3_000
     while (Date.now() < answerDeadline && !sent.some(entry => entry.text.includes('forty-two'))) {
@@ -336,6 +340,40 @@ test('/ask chat command asks a Bot and delivers the answer', async () => {
     }
     assert.ok(sent.some(entry => entry.text.includes('forty-two')), 'the answer should be delivered to the chat')
     assert.ok(sent.some(entry => entry.text.includes(askId)))
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a bot replies to a user-asked bot_ask as a control-plane completion (no mailbox delivery)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-ask-user-reply-'))
+  let gateway
+  try {
+    gateway = await makeGateway(root)
+    const ask = await gateway.botAsk({
+      from: 'user:feishu:ou_user',
+      to: ['answerer'],
+      question: 'What is the answer?',
+      replyTarget,
+    })
+    const mailboxBefore = (await gateway.mailbox.snapshot()).length
+    const reply = await gateway.replyToMessage({
+      message: ask.envelopes[0],
+      from: 'answerer',
+      instruction: 'answer-42',
+      replyTarget,
+    })
+    assert.equal(reply.kind, 'reply')
+    assert.equal(reply.to, 'user:feishu:ou_user')
+    assert.equal(reply.toAddress.type, 'user')
+    assert.equal(reply.payload.askId, ask.askId)
+    // No Task/Run/Mailbox delivery is created for a user-targeted reply.
+    assert.equal((await gateway.mailbox.snapshot()).length, mailboxBefore)
+    const result = await gateway.botWait(ask.askId, { timeoutMs: 2_000 })
+    assert.equal(result.status, 'answered')
+    assert.equal(result.replies[0].from, 'answerer')
+    assert.equal(result.replies[0].text, 'answer-42')
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
