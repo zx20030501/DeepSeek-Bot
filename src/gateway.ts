@@ -43,6 +43,13 @@ import { botActivationFingerprint, BotRegistry, runtimeProfileFor } from './bot-
 import { TeamStore } from './team-store.js'
 import { TeamRouter, teamMentionHandle } from './team-router.js'
 import {
+  evaluateWorkflowCondition,
+  parseWorkflowResult,
+  resolveWorkflowInputs as resolveWorkflowControlInputs,
+  reduceWorkflowValues,
+  serializeWorkflowResult,
+} from './workflow-controls.js'
+import {
   BotDirectory,
   BotMailbox,
   FleetApprovalStore,
@@ -1257,10 +1264,11 @@ export class BotGateway {
         createdRun = true
       }
       if (run === undefined) throw new Error('Workflow node Run could not be recovered: ' + nodeId)
+      const workflowOutputs = this.workflowOutputMap(knownTasks.values())
       const workflowInputs = this.resolveWorkflowNodeInputs(
         definitionNode,
         rootTask.workflowInputs ?? {},
-        knownTasks,
+        workflowOutputs,
       )
       const payload: Record<string, unknown> = {
         workflowDefinitionId: definition.id,
@@ -1311,25 +1319,18 @@ export class BotGateway {
   private resolveWorkflowNodeInputs(
     node: WorkflowDefinition['nodes'][number],
     launchInputs: Readonly<Record<string, unknown>>,
-    tasksByNode: ReadonlyMap<string, TaskRecord>,
+    workflowOutputs: ReadonlyMap<string, unknown>,
   ): Record<string, unknown> {
-    const resolved: Record<string, unknown> = {}
-    for (const binding of node.inputs ?? []) {
-      let value: unknown
-      if (binding.source.kind === 'input') {
-        value = launchInputs[binding.source.name]
-      } else if (binding.source.kind === 'constant') {
-        value = binding.source.value
-      } else {
-        const sourceTask = tasksByNode.get(binding.source.nodeId)
-        if (sourceTask?.status !== 'completed' || sourceTask.result === undefined) {
-          throw new Error(`Workflow input ${binding.name} is not available from node ${binding.source.nodeId}`)
-        }
-        value = sourceTask.result
-      }
-      if (value !== undefined) resolved[binding.name] = structuredClone(value)
+    return resolveWorkflowControlInputs(node, launchInputs, workflowOutputs)
+  }
+
+  private workflowOutputMap(tasks: Iterable<TaskRecord>): Map<string, unknown> {
+    const outputs = new Map<string, unknown>()
+    for (const task of tasks) {
+      if (task.workflowNodeId === undefined || task.workflowNodeId === '__root__' || task.status !== 'completed') continue
+      outputs.set(task.workflowNodeId, parseWorkflowResult(task.result))
     }
-    return resolved
+    return outputs
   }
 
   /** Public typed Bot-to-Bot seam retained from the collaboration-core prototype. */
@@ -4190,13 +4191,108 @@ export class BotGateway {
       const plan = compileWorkflowLaunch(input.definition)
       const snapshot = await this.tasks.snapshot()
       const workflowTasks = snapshot.tasks.filter(task => (
-        task.workflowDefinitionId === input.definition.id && task.workflowRunId === input.workflowRunId && task.workflowNodeId !== '__root__'
+        task.workflowDefinitionId === input.definition.id
+        && task.workflowRunId === input.workflowRunId
+        && task.workflowNodeId !== '__root__'
       ))
       const taskByNode = new Map(
         workflowTasks
           .filter(task => task.workflowNodeId !== undefined)
           .map(task => [task.workflowNodeId as string, task]),
       )
+      const workflowOutputs = this.workflowOutputMap(taskByNode.values())
+      const isCompleted = (nodeId: string): boolean => taskByNode.get(nodeId)?.status === 'completed'
+      const definitionById = new Map(input.definition.nodes.map(node => [node.id, node]))
+
+      const ensureControlTask = async (nodeId: string, result: string, instruction: string): Promise<TaskRecord> => {
+        const definitionNode = definitionById.get(nodeId)
+        if (!definitionNode) throw new Error('Workflow control node is missing: ' + nodeId)
+        let task = taskByNode.get(nodeId)
+        if (!task) {
+          task = await this.tasks.createTask({
+            title: input.definition.name + ': ' + definitionNode.label,
+            instruction,
+            createdBy: input.requester,
+            assignedTo: 'workflow',
+            workflowDefinitionId: input.definition.id,
+            workflowRevision: input.definition.revision,
+            workflowRunId: input.workflowRunId,
+            workflowNodeId: nodeId,
+            workflowReplyTarget: input.replyTarget,
+            workflowTraceId: input.correlationId,
+            ...(root.workflowInputs === undefined ? {} : { workflowInputs: root.workflowInputs }),
+          })
+          taskByNode.set(nodeId, task)
+        }
+        if (task.status === 'failed' || task.status === 'cancelled') {
+          throw new Error('Workflow control node is already terminal: ' + nodeId)
+        }
+        if (task.status !== 'completed') {
+          task = await this.tasks.completeTask(task.id, result, 'workflow-runtime') ?? task
+          taskByNode.set(nodeId, task)
+        }
+        workflowOutputs.set(nodeId, parseWorkflowResult(task.result))
+        return task
+      }
+
+      // Condition and reduce are durable virtual Tasks: no model Run is
+      // created, but the result is journaled so restart recovery re-evaluates
+      // the same node idempotently.
+      for (const control of plan.nodes.filter(node => node.kind === 'condition' || node.kind === 'reduce')) {
+        if (isCompleted(control.nodeId)) continue
+        if (!control.dependsOn.every(isCompleted)) continue
+        const definitionNode = definitionById.get(control.nodeId)
+        if (!definitionNode) throw new Error('Workflow node is missing: ' + control.nodeId)
+        if (control.kind === 'condition') {
+          if (definitionNode.condition === undefined) throw new Error('Condition node is missing its condition: ' + control.nodeId)
+          const evaluation = evaluateWorkflowCondition(definitionNode.condition, root.workflowInputs ?? {}, workflowOutputs)
+          const selectedNodeId = evaluation.matched ? definitionNode.condition.whenTrue : definitionNode.condition.whenFalse
+          if (selectedNodeId === undefined) {
+            throw new Error('Condition node has no branch for the evaluated result: ' + control.nodeId)
+          }
+          const conditionResult = serializeWorkflowResult({
+            matched: evaluation.matched,
+            selectedNodeId,
+            value: evaluation.value,
+          })
+          await ensureControlTask(
+            control.nodeId,
+            conditionResult,
+            'Evaluate Workflow condition ' + control.nodeId,
+          )
+          const skippedNodeId = evaluation.matched ? definitionNode.condition.whenFalse : definitionNode.condition.whenTrue
+          if (skippedNodeId !== undefined && !taskByNode.has(skippedNodeId)) {
+            const skipped = await ensureControlTask(
+              skippedNodeId,
+              serializeWorkflowResult({ skipped: true, conditionNodeId: control.nodeId }),
+              'Skip unselected Workflow branch ' + skippedNodeId,
+            )
+            taskByNode.set(skippedNodeId, skipped)
+            workflowOutputs.set(skippedNodeId, parseWorkflowResult(skipped.result))
+          }
+          await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.condition_evaluated', {
+            workflowRunId: input.workflowRunId,
+            nodeId: control.nodeId,
+            matched: evaluation.matched,
+            selectedNodeId,
+            skippedNodeId: skippedNodeId ?? null,
+          }, input.correlationId)
+        } else {
+          if (definitionNode.reduce === undefined) throw new Error('Reduce node is missing its reducer: ' + control.nodeId)
+          const reduced = reduceWorkflowValues(definitionNode.reduce, root.workflowInputs ?? {}, workflowOutputs)
+          await ensureControlTask(
+            control.nodeId,
+            serializeWorkflowResult(reduced),
+            'Reduce Workflow values ' + control.nodeId,
+          )
+          await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.reduce_completed', {
+            workflowRunId: input.workflowRunId,
+            nodeId: control.nodeId,
+            reducer: definitionNode.reduce.reducer,
+          }, input.correlationId)
+        }
+      }
+
       const taskNodes = plan.nodes.filter(node => node.kind === 'task')
       const failedNode = taskNodes.find(node => {
         const task = taskByNode.get(node.nodeId)
@@ -4207,8 +4303,8 @@ export class BotGateway {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow node ' + failedNode.nodeId + ' failed: ' + (task?.error ?? task?.status ?? 'unknown'))
         return
       }
-      const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => taskByNode.get(node.nodeId)?.status === 'completed')
-      const unsupportedNodes = plan.nodes.filter(node => node.kind !== 'task')
+      const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => isCompleted(node.nodeId))
+      const unsupportedNodes = plan.nodes.filter(node => node.kind !== 'task' && node.kind !== 'condition' && node.kind !== 'reduce')
       if (allTasksCompleted && unsupportedNodes.length > 0) {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow control nodes require a runtime adapter: ' + unsupportedNodes.map(node => node.nodeId).join(', '))
         return
@@ -4217,14 +4313,12 @@ export class BotGateway {
         const parts = taskNodes
           .map(node => {
             const task = taskByNode.get(node.nodeId)
-            return task?.result === undefined || task.result.trim() === '' ? '' : node.nodeId + ': ' + task.result.trim()
+            return task?.result === undefined || task.result.trim() === '' || task.result.includes('"skipped":true')
+              ? ''
+              : node.nodeId + ': ' + task.result.trim()
           })
           .filter(Boolean)
         const finalResult = (parts.join('\n\n') || input.latestOutput || 'Workflow 没有产生文本结果。').slice(0, 50_000)
-        // Persist the idempotent outbound result before making the root
-        // terminal. If the process stops between these writes, Outbox recovery
-        // can still deliver the result and Workflow recovery can safely repeat
-        // this enqueue by key before completing the root.
         await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 完成：\n' + finalResult, 'workflow-result:' + input.workflowRunId)
         await this.tasks.completeTask(input.rootTaskId, finalResult, 'workflow-runtime')
         await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.completed', {
@@ -4280,10 +4374,7 @@ export class BotGateway {
       }
       const ready = taskNodes.filter(node => {
         if (taskByNode.has(node.nodeId)) return false
-        return node.dependsOn.every(dependencyId => {
-          const dependencyNode = plan.nodes.find(candidate => candidate.nodeId === dependencyId)
-          return dependencyNode?.kind === 'task' && taskByNode.get(dependencyId)?.status === 'completed'
-        })
+        return node.dependsOn.every(isCompleted)
       })
       if (ready.length === 0) {
         if (activeCount === 0) {
