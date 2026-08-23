@@ -2118,3 +2118,83 @@ test('chat Team commands keep membership explicit and owner-scoped', async () =>
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('@team creates a durable Team Thread and bounded Group Room from chat', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-team-router-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, agentOptions }) {
+        const agent = withMockSession({
+          id: String(sessionId),
+          status: 'idle',
+          options: agentOptions ?? {},
+          cancel() {},
+          followup() {},
+        })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_team'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        researcher: { capabilities: ['research'], allowedUserIds: ['ou_team'] },
+        reviewer: { capabilities: ['review'], allowedUserIds: ['ou_team'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        maxGroupRounds: 1,
+        maxGroupMessages: 10,
+      },
+    })
+    const sent = []
+    let inbound
+    const transport = {
+      platform: 'feishu',
+      async start(handler) { inbound = handler },
+      async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    const requester = 'user:feishu:ou_team'
+    const team = await gateway.teams.createTeam({
+      name: 'Research Team',
+      scope: 'user',
+      ownerId: requester,
+      memberBotIds: ['researcher', 'reviewer'],
+      managerBotId: 'reviewer',
+    }, requester)
+    await inbound({
+      id: 'team-router-message',
+      target: { platform: 'feishu', chatId: 'oc_team', chatType: 'dm', userId: 'ou_team' },
+      text: `@team:${team.id} 请研究并复核`,
+      receivedAt: Date.now(),
+    })
+    const deadline = Date.now() + 2_000
+    while (!sent.some(item => /已创建 Team Research Team 协作 Thread\/Room/u.test(item.text)) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.ok(sent.some(item => /已创建 Team Research Team 协作 Thread\/Room/u.test(item.text)))
+    const threads = await gateway.teams.listThreads(team.id)
+    assert.equal(threads.length, 1)
+    assert.equal(threads[0]?.status, 'open')
+    assert.deepEqual(threads[0]?.participantBotIds, ['reviewer', 'researcher'])
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.tasks.length, 1)
+    assert.equal(snapshot.fleet.rooms.length, 1)
+    assert.ok(snapshot.fleet.mailbox.queued + snapshot.fleet.mailbox.claimed + snapshot.fleet.mailbox.acknowledged + snapshot.fleet.mailbox.running >= 1)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
