@@ -21,6 +21,8 @@ import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool
 import { generateManagerPlan } from './manager-policy.js'
 import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
+import { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
+import type { BotAskInput, BotAskRecord, BotAskResult, BotAskWaitOptions } from './bot-ask.js'
 import {
   HttpRemoteBotTransport,
   RemoteDeliveryLedger,
@@ -446,6 +448,7 @@ export class BotGateway {
   private readonly rooms: GroupRoomStore
   private readonly approvals: FleetApprovalStore
   private readonly workflows: WorkflowStore
+  private readonly askRegistry: BotAskRegistry
   private readonly routines: RoutineStore
   private readonly registry: BotRegistry
   private readonly routineScheduler: RoutineScheduler
@@ -518,6 +521,7 @@ export class BotGateway {
     this.remoteDeliveryLedger = new RemoteDeliveryLedger(join(stateDir, 'remote-inbox.jsonl'))
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
     this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
+    this.askRegistry = new BotAskRegistry(join(stateDir, 'bot-asks.jsonl'))
     this.routines = new RoutineStore(join(stateDir, 'routines.jsonl'))
     this.routineScheduler = new RoutineScheduler({
       store: this.routines,
@@ -907,13 +911,14 @@ export class BotGateway {
   private async fleetStatusUnlocked(): Promise<Record<string, unknown>> {
     const approvals = await this.approvals.snapshot()
     await this.reconcileFleetApprovals(approvals)
-    const [mailbox, taskSnapshot, rooms, registryEntries] = await Promise.all([
+    const [mailbox, taskSnapshot, rooms, registryEntries, asks] = await Promise.all([
       this.mailbox.dashboardSnapshot(),
       this.tasks.dashboardSnapshot(),
       this.rooms.snapshot(),
       this.config.collaboration?.features?.dynamicRegistry === true
         ? this.registry.list(undefined, true)
         : Promise.resolve([] as BotRegistryEntry[]),
+      this.askRegistry.snapshot(),
     ])
     const pendingActivation = new Map(
       approvals
@@ -1013,6 +1018,24 @@ export class BotGateway {
           closed: room.closed,
           updatedAt: room.updatedAt,
         })),
+        asks: asks.slice(-50).reverse().map(ask => ({
+          askId: ask.askId,
+          from: ask.from,
+          to: [...ask.to],
+          status: ask.status,
+          question: ask.question.slice(0, 120),
+          replyCount: ask.replies.length,
+          ...(ask.teamId === undefined ? {} : { teamId: ask.teamId }),
+          ...(ask.threadId === undefined ? {} : { threadId: ask.threadId }),
+          ...(ask.parentAskId === undefined ? {} : { parentAskId: ask.parentAskId }),
+          updatedAt: ask.updatedAt,
+        })),
+        askCounts: {
+          pending: asks.filter(ask => ask.status === 'pending').length,
+          answered: asks.filter(ask => ask.status === 'answered').length,
+          'timed-out': asks.filter(ask => ask.status === 'timed-out').length,
+          cancelled: asks.filter(ask => ask.status === 'cancelled').length,
+        },
         deadLetters: mailbox.deadLetters.map(item => ({
           id: item.id,
           state: item.state,
@@ -1607,6 +1630,12 @@ export class BotGateway {
     const targetBot = input.to ?? input.message.from
     const target = this.directory.get(targetBot)
     if (!target) throw new Error('reply target is not an available Bot: ' + targetBot)
+    const askId = typeof input.message.payload?.askId === 'string' && input.message.payload.askId.trim() !== ''
+      ? input.message.payload.askId.trim()
+      : undefined
+    const replyPayload = askId === undefined
+      ? input.payload
+      : { ...(input.payload ?? {}), askId, __dshAsk: true }
     return this.sendBotMessage({
       from: input.from,
       to: target.id,
@@ -1619,13 +1648,106 @@ export class BotGateway {
       ...(input.toAddress === undefined ? {} : { toAddress: input.toAddress }),
       ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
       ...(input.toSessionId === undefined ? {} : { toSessionId: input.toSessionId }),
-      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-      ...(input.payload === undefined ? {} : { payload: input.payload }),
+      ...(input.idempotencyKey === undefined && askId === undefined ? {} : {
+        idempotencyKey: input.idempotencyKey ?? askReplyIdempotencyKey(askId!, input.from),
+      }),
+      ...(replyPayload === undefined ? {} : { payload: replyPayload }),
       correlationId: input.message.correlationId,
       ...(input.message.conversationId === undefined ? {} : { conversationId: input.message.conversationId }),
       replyTo: input.message.id,
       traceId: input.message.traceId ?? input.message.correlationId,
     })
+  }
+
+  /**
+   * Ask one or more Bots a question and durably remember the Ask until every
+   * target replies or the deadline passes. Returns immediately with an askId;
+   * use botWait() to block for the aggregated answers. Replies are correlated
+   * across Teams/Threads by the Ask's correlationId/traceId, and a late reply
+   * to an expired Ask is still recorded for audit.
+   */
+  public async botAsk(input: BotAskInput): Promise<BotAskResult> {
+    return this.withDurableMutation(async () => {
+      if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
+      if (this.config.collaboration?.features?.peerMessaging !== true) {
+        throw new Error('Peer Messaging is disabled; enable collaboration.features.peerMessaging first')
+      }
+      const targets = [...new Set(input.to.map(id => String(id).trim().toLowerCase()).filter(Boolean))]
+      if (targets.length === 0) throw new Error('bot ask requires at least one target Bot')
+      for (const to of targets) {
+        const bot = this.directory.get(to)
+        const remote = bot === undefined ? this.remoteRouteForBot(to) : undefined
+        if (!bot && remote === undefined) throw new Error('Bot is unavailable or not authorized: ' + to)
+        if (bot && !this.directory.canInvoke(bot.id, input.replyTarget)) {
+          throw new Error('Bot is unavailable or not authorized: ' + to)
+        }
+      }
+      const ask = await this.askRegistry.register({
+        from: input.from,
+        to: targets,
+        question: input.question,
+        ...(input.ttlMs === undefined ? {} : { ttlMs: input.ttlMs }),
+        ...(input.maxReplies === undefined ? {} : { maxReplies: input.maxReplies }),
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.traceId === undefined ? {} : { traceId: input.traceId }),
+        ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
+        ...(input.teamId === undefined ? {} : { teamId: input.teamId }),
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
+        ...(input.parentAskId === undefined ? {} : { parentAskId: input.parentAskId }),
+      })
+      const remainingTtl = Math.max(1_000, ask.deadline - Date.now())
+      const envelopes: BotMessageEnvelope[] = []
+      for (const to of targets) {
+        const envelope = await this.sendBotMessageUnlocked({
+          from: input.from,
+          to,
+          instruction: input.question,
+          replyTarget: input.replyTarget,
+          kind: 'request',
+          ...(input.fromAddress === undefined ? {} : { fromAddress: input.fromAddress }),
+          ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+          correlationId: ask.correlationId,
+          traceId: ask.traceId,
+          ttlMs: remainingTtl,
+          payload: { ...(input.payload ?? {}), askId: ask.askId, __dshAsk: true },
+        })
+        envelopes.push(envelope)
+      }
+      await this.tasks.audit('message', ask.askId, input.from, 'ask.registered', {
+        to: targets,
+        correlationId: ask.correlationId,
+        deadline: ask.deadline,
+        envelopeCount: envelopes.length,
+      }, ask.correlationId)
+      return this.askResult(ask, envelopes)
+    })
+  }
+
+  /** Block until the Ask is answered, expires, or the caller's budget elapses. */
+  public async botWait(askId: string, options: BotAskWaitOptions = {}): Promise<BotAskResult> {
+    const record = await this.askRegistry.wait(askId, options)
+    return this.askResult(record)
+  }
+
+  /** Non-blocking Ask status, including any replies collected so far. */
+  public async botAskStatus(askId: string): Promise<BotAskResult | undefined> {
+    const record = await this.askRegistry.get(askId)
+    return record && this.askResult(record)
+  }
+
+  private askResult(record: BotAskRecord, envelopes?: readonly BotMessageEnvelope[]): BotAskResult {
+    return {
+      askId: record.askId,
+      correlationId: record.correlationId,
+      status: record.status,
+      question: record.question,
+      from: record.from,
+      to: [...record.to],
+      replies: record.replies.map(reply => ({ ...reply })),
+      ...(envelopes === undefined ? {} : { envelopes: envelopes.map(envelope => ({ ...envelope })) }),
+      timedOut: record.status === 'pending',
+    }
   }
 
   /** Public typed Bot-to-Bot seam backed by Task/Run and the durable Mailbox. */
@@ -1722,6 +1844,24 @@ export class BotGateway {
       ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
       payload: messagePayload,
     }, this.config.collaboration ?? {})
+    if (input.kind === 'reply') {
+      const askId = typeof messagePayload.askId === 'string' && messagePayload.askId.trim() !== ''
+        ? messagePayload.askId.trim()
+        : undefined
+      if (askId !== undefined) {
+        // A reply carrying an askId answers a durable bot_ask. Record it before
+        // enqueue so aggregation is complete before any delivery is observed.
+        await this.askRegistry.recordReply(askId, {
+          from: fromAddress.id,
+          text: input.instruction,
+          messageId: envelope.id,
+        })
+        await this.tasks.audit('message', envelope.id, fromAddress.id, 'ask.reply_recorded', {
+          askId,
+          to: input.to,
+        }, envelope.correlationId)
+      }
+    }
     if (remoteRoute !== undefined) {
       try {
         await this.dispatchRemoteEnvelope(envelope, remoteRoute)

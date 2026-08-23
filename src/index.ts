@@ -174,6 +174,17 @@ export {
   parseBotMentions,
 } from './collaboration.js'
 export { PairingStore } from './pairing.js'
+export { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
+export type {
+  BotAskInput,
+  BotAskRecord,
+  BotAskReply,
+  BotAskRegisterInput,
+  BotAskReplyInput,
+  BotAskResult,
+  BotAskStatus,
+  BotAskWaitOptions,
+} from './bot-ask.js'
 export {
   REMOTE_TRANSPORT_SCHEMA_VERSION,
   HttpRemoteBotTransport,
