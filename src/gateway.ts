@@ -4642,9 +4642,21 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
+      return true
+    }
+    if (name === 'teams' || name === 'team') {
+      const actor = actorForTarget(message.target)
+      try {
+        await this.withDurableMutation(async () => {
+          const text = await this.teamCommandText(message, binding, args, actor)
+          await this.completeWithText(message, walId, binding, text)
+        })
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, `Team 操作失败：${error instanceof Error ? error.message : String(error)}`)
+      }
       return true
     }
     if (name === 'status') {
@@ -4868,6 +4880,107 @@ export class BotGateway {
       return true
     }
     return false
+  }
+
+  private async teamCommandText(
+    message: InboundMessage,
+    binding: ChatBinding,
+    args: string,
+    actor: string,
+  ): Promise<string> {
+    if (this.config.collaboration?.enabled === false) {
+      throw new Error('Bot Fleet 当前未启用，请先在本机设置页开启。')
+    }
+    const parts = args.trim().split(/\s+/u).filter(Boolean)
+    const action = (parts[0] ?? 'list').toLowerCase()
+    const context = { actorId: actor, sessionId: binding.sessionId }
+    const visibleTeams = await this.teams.listTeams(context)
+    const findTeam = (teamId: string) => visibleTeams.find(team => team.id === teamId)
+    const formatTeam = (team: (typeof visibleTeams)[number]): string => {
+      const manager = team.managerBotId === undefined ? '无' : `@${team.managerBotId}`
+      return `${team.id} · ${team.name} · ${team.status} · 成员：${team.memberBotIds.map(id => '@' + id).join('、')} · Manager：${manager} · v${team.version}`
+    }
+    const usage = [
+      '/teams — 查看当前用户可见的 Team',
+      '/team create <名称> <bot-id>[,bot-id...] — 创建私有 Team',
+      '/team add <team-id> <bot-id> — 显式加入一个 Bot',
+      '/team remove <team-id> <bot-id> — 显式移除一个 Bot',
+      '/team manager <team-id> <bot-id|none> — 设置或清除 Manager',
+      '/team status <team-id> — 查看 Team 成员、版本和 Thread 状态',
+    ].join('\n')
+    if (action === 'help') return usage
+    if (action === 'list' || action === 'ls') {
+      return visibleTeams.length
+        ? `可见 Team：\n${visibleTeams.map(formatTeam).join('\n')}`
+        : '当前没有可见 Team。使用 /team create <名称> <bot-id> 创建一个私有 Team。'
+    }
+    if (action === 'create') {
+      const name = parts[1] ?? ''
+      const members = [...new Set(parts.slice(2)
+        .flatMap(value => value.split(/[,，]/u))
+        .map(value => value.trim().toLowerCase())
+        .filter(Boolean))]
+      if (name === '' || members.length === 0) {
+        throw new Error('用法：/team create <名称> <bot-id>[,bot-id...]')
+      }
+      for (const botId of members) {
+        if (!this.directory.canInvoke(botId, message.target)) {
+          throw new Error(`你无权把 @${botId} 加入 Team，或这个 Bot 不存在。`)
+        }
+      }
+      const team = await this.teams.createTeam({
+        name,
+        scope: 'user',
+        ownerId: actor,
+        memberBotIds: members,
+        maxConcurrency: Math.min(3, members.length),
+      }, actor)
+      return `Team 已创建：${team.id}\n${formatTeam(team)}\n后续可用 /team add ${team.id} <bot-id> 显式扩展成员。`
+    }
+    const teamId = parts[1] ?? ''
+    const team = findTeam(teamId)
+    if (team === undefined) throw new Error(`找不到当前用户可管理的 Team：${teamId || 'team-id'}`)
+    if (action === 'status') {
+      const threads = await this.teams.listThreads(team.id)
+      const openThreads = threads.filter(thread => thread.status === 'open' || thread.status === 'waiting').length
+      return `${formatTeam(team)}\nThreads：${threads.length}（开放 ${openThreads}）`
+    }
+    if (action === 'add' || action === 'remove') {
+      const botId = (parts[2] ?? '').trim().toLowerCase()
+      if (botId === '') throw new Error(`用法：/team ${action} <team-id> <bot-id>`)
+      const hasMember = team.memberBotIds.includes(botId)
+      if (action === 'add') {
+        if (hasMember) return `@${botId} 已经是 Team ${team.id} 的成员。`
+        if (!this.directory.canInvoke(botId, message.target)) {
+          throw new Error(`你无权把 @${botId} 加入 Team，或这个 Bot 不存在。`)
+        }
+        const updated = await this.teams.updateTeam(team.id, {
+          memberBotIds: [...team.memberBotIds, botId],
+          maxConcurrency: Math.min(3, team.memberBotIds.length + 1),
+        }, actor, team.version)
+        return `已将 @${botId} 显式加入 Team。\n${formatTeam(updated)}`
+      }
+      if (!hasMember) return `@${botId} 不是 Team ${team.id} 的成员。`
+      if (team.memberBotIds.length <= 1) throw new Error('Team 至少需要保留一个 Bot 成员。')
+      const updated = await this.teams.updateTeam(team.id, {
+        memberBotIds: team.memberBotIds.filter(id => id !== botId),
+        ...(team.managerBotId === botId ? { managerBotId: null } : {}),
+        maxConcurrency: Math.min(team.maxConcurrency, team.memberBotIds.length - 1),
+      }, actor, team.version)
+      return `已将 @${botId} 显式移出 Team。\n${formatTeam(updated)}`
+    }
+    if (action === 'manager') {
+      const manager = (parts[2] ?? '').trim().toLowerCase()
+      if (manager === '') throw new Error('用法：/team manager <team-id> <bot-id|none>')
+      if (manager !== 'none' && !team.memberBotIds.includes(manager)) {
+        throw new Error(`Manager @${manager} 必须先是 Team 成员。`)
+      }
+      const updated = await this.teams.updateTeam(team.id, {
+        managerBotId: manager === 'none' ? null : manager,
+      }, actor, team.version)
+      return `Team Manager 已更新。\n${formatTeam(updated)}`
+    }
+    throw new Error(`不支持的 Team 操作：${action}。\n${usage}`)
   }
 
   private async handleDynamicBotCommand(

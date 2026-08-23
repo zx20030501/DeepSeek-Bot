@@ -133,7 +133,7 @@ Google Drive is only for large development artifacts such as disposable stress l
 | Versioned saved Workflow definitions | Implemented behind gate | Immutable revisions, validation, import/export |
 | Durable task-node DAG continuation | Implemented subset | Task nodes, dependency outputs, concurrency/fan-out, restart recovery |
 | Full condition/map/reduce/approval/compensation execution | Not complete | Schema exists; runtime adapters remain future work |
-| Team-wide `@team` routing | Not complete | Parser and durable Team data exist; Router integration remains future work |
+| Team-wide `@team` routing | Not complete | Explicit Team membership commands now exist; canonical Router integration remains future work |
 | 500 logical Bot roster | Data-path tested | Not 500 simultaneous model sessions |
 | Distributed workers and cross-machine transport | Not implemented | Single-node runtime only |
 
@@ -200,7 +200,7 @@ Rollback: disable new Workflow admission. Let already-admitted pinned revisions 
 
 ### Phase A — Product hardening
 
-Progress on main: PR #18 delivered membership reasons, bounded Bot activity and failure projection, roster filters, and owner-facing `/bot status <id>`. Remaining Phase A work is explicit Team membership commands, complete help/setup gate explanations, and manual Feishu/Telegram acceptance.
+Progress on main: PR #18 delivered membership reasons, bounded Bot activity and failure projection, roster filters, and owner-facing `/bot status <id>`. Remaining Phase A work is complete help/setup gate explanations and manual Feishu/Telegram acceptance; explicit Team membership commands are now available through `/teams` and `/team`.
 
 Deliverables:
 
@@ -339,7 +339,7 @@ Exit gate: operators can detect, contain, recover, and explain a failed Fleet ru
 ### A. 产品收口
 
 1. 在帮助、设置页和状态页完整显示动态 Bot 创建条件、Revision、Fleet membership、阻塞原因、繁忙状态和失败原因。
-2. 增加显式 Team 加入/移除命令，不把 roster 自动加入误解为 Team 自动扩权。
+2. 已增加 `/teams`、`/team add`、`/team remove` 和 `/team manager`，不把 roster 自动加入误解为 Team 自动扩权。
 3. 分别完成飞书和 Telegram 的人工验收：创建、修改、旧码拒绝、确认、调用、停用、重启恢复。
 4. 对 UI 保存、Gateway 重载和 Registry 修改做并发测试。
 

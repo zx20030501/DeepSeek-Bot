@@ -55,6 +55,8 @@ export function formatHelp(): string {
     '/bot list — 查看自己的动态 Bot、状态和待确认码',
     '/bot status <id> — 查看动态 Bot 的 Fleet 加入、忙碌和最近失败状态',
     '/bot edit|disable|enable|delete|clone … — 管理自己的动态 Bot',
+    '/teams — 查看当前用户可见的 Team',
+    '/team create|add|remove|manager|status … — 显式管理 Team 成员和状态',
     '/mesh — 查看你自己的 BotMesh mailbox、task、run 和 handoff 状态',
     '/fleet <任务> — 自动规划并行 Bot 工作流（执行→验证→汇总）',
     '/tasks — 查看自己最近的 Fleet 任务',

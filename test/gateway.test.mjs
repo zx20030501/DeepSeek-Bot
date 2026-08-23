@@ -2057,3 +2057,59 @@ test('normal Hermes Agent receives a scoped natural-language Bot draft tool with
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('chat Team commands keep membership explicit and owner-scoped', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-team-command-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      access: { userIds: ['ou_a', 'ou_b'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        researcher: { capabilities: ['research'] },
+        reviewer: { capabilities: ['review'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'never' },
+    })
+    const sent = []
+    let inbound
+    const transport = {
+      platform: 'feishu',
+      async start(handler) { inbound = handler },
+      async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    const send = async (id, userId, text) => {
+      const before = sent.length
+      await inbound({
+        id,
+        target: { platform: 'feishu', chatId: `oc_${userId}`, chatType: 'dm', userId },
+        text,
+        receivedAt: Date.now(),
+      })
+      const deadline = Date.now() + 2_000
+      while (sent.length <= before && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      return sent[sent.length - 1]?.text ?? ''
+    }
+    const created = await send('team-create', 'ou_a', '/team create Research researcher')
+    assert.match(created, /Team 已创建：/u)
+    const teamId = created.match(/Team 已创建：([0-9a-f-]{36})/u)?.[1]
+    assert.ok(teamId)
+    assert.match(await send('team-add', 'ou_a', `/team add ${teamId} reviewer`), /显式加入 Team/u)
+    const status = await send('team-status', 'ou_a', `/team status ${teamId}`)
+    assert.match(status, /@researcher/u)
+    assert.match(status, /@reviewer/u)
+    assert.match(await send('team-manager', 'ou_a', `/team manager ${teamId} reviewer`), /Team Manager 已更新/u)
+    assert.match(await send('team-remove', 'ou_a', `/team remove ${teamId} researcher`), /显式移出 Team/u)
+    assert.doesNotMatch(await send('team-owner-privacy', 'ou_b', '/teams'), new RegExp(teamId, 'u'))
+    assert.doesNotMatch(await send('team-owner-privacy-name', 'ou_b', '/teams'), /Research/u)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
