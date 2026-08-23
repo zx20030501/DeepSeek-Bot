@@ -6879,7 +6879,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf', 'ask'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf', 'ask', 'manager'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -7140,27 +7140,30 @@ export class BotGateway {
     }
     if (name === 'ask') {
       const actor = actorForTarget(message.target)
-      const firstSpace = args.indexOf(' ')
-      const rawBot = firstSpace < 0 ? args : args.slice(0, firstSpace)
-      const question = (firstSpace < 0 ? '' : args.slice(firstSpace + 1)).trim()
-      const botId = rawBot.replace(/^@/u, '').trim().toLowerCase()
-      if (botId === '' || question === '') {
-        await this.completeWithText(message, walId, binding, '用法：/ask @bot <问题>。例如 /ask @analyst 帮我分析这组数据。')
+      const targets = [...new Set(
+        [...args.matchAll(/@([a-z0-9][a-z0-9_-]*)/giu)].map(match => String(match[1]).toLowerCase()),
+      )]
+      const question = args.replace(/@[a-z0-9][a-z0-9_-]*/giu, '').trim()
+      if (targets.length === 0 || question === '') {
+        await this.completeWithText(message, walId, binding, '用法：/ask @bot <问题>。可同时 @多个 Bot 扇出提问。例如 /ask @analyst @researcher 帮我交叉验证这组数据。')
         return true
       }
-      const bot = this.directory.get(botId)
-      if (!bot) {
-        await this.completeWithText(message, walId, binding, '没有找到这个 Bot：' + botId)
-        return true
+      for (const botId of targets) {
+        const bot = this.directory.get(botId)
+        const remote = bot === undefined ? this.remoteRouteForBot(botId) : undefined
+        if (!bot && remote === undefined) {
+          await this.completeWithText(message, walId, binding, '没有找到这个 Bot：' + botId)
+          return true
+        }
       }
       try {
         const ask = await this.botAsk({
           from: actor,
-          to: [botId],
+          to: targets,
           question,
           replyTarget: message.target,
         })
-        await this.completeWithText(message, walId, binding, '已向 @' + botId + ' 提问。askId：' + ask.askId)
+        await this.completeWithText(message, walId, binding, '已向 ' + targets.map(id => '@' + id).join('、') + ' 提问。askId：' + ask.askId)
         void this.botWait(ask.askId, { timeoutMs: 60_000, pollMs: 300 }).then(async result => {
           if (result.status === 'answered') {
             const answer = result.replies.map(reply => '@' + reply.from + '：\n' + reply.text).join('\n\n')
@@ -7174,6 +7177,37 @@ export class BotGateway {
         await this.completeWithText(message, walId, binding, '提问失败：' + (error instanceof Error ? error.message : String(error)))
         return true
       }
+    }
+    if (name === 'manager') {
+      const action = (args.trim().split(/\s+/u)[0] ?? 'status').toLowerCase()
+      try {
+        if (action === 'status') {
+          const observation = await this.managerObserve({ maxBots: 30 })
+          const counts = {
+            available: observation.bots.filter(bot => bot.status === 'available').length,
+            busy: observation.bots.filter(bot => bot.status === 'busy').length,
+            failed: observation.bots.filter(bot => bot.status === 'failed' || bot.status === 'timeout').length,
+            unavailable: observation.bots.filter(bot => bot.status === 'unavailable').length,
+          }
+          const rows = observation.bots.slice(0, 30).map(bot => (
+            '@' + bot.id + ' · ' + bot.status
+            + (bot.inFlight > 0 ? ' · in-flight ' + bot.inFlight : '')
+            + (bot.paused === undefined ? '' : ' · paused')
+          ))
+          await this.completeWithText(message, walId, binding, [
+            'Manager 状态（' + new Date(observation.now).toLocaleTimeString() + '）',
+            `Bot：${observation.bots.length}（可用 ${counts.available} / 忙碌 ${counts.busy} / 失败或超时 ${counts.failed} / 不可用 ${counts.unavailable}）`,
+            `Ask：${observation.asks.pending} 待答 · ${observation.asks.answered} 已答`,
+            `Workflow：${observation.workflows.active} 运行中 · ${observation.workflows.completed} 完成 · ${observation.workflows.failed} 失败`,
+            rows.length === 0 ? '（当前没有逻辑 Bot）' : rows.join('\n'),
+          ].join('\n'))
+          return true
+        }
+        await this.completeWithText(message, walId, binding, '用法：/manager status')
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, 'Manager 操作失败：' + (error instanceof Error ? error.message : String(error)))
+      }
+      return true
     }
     if (name === 'tasks') {
       const snapshot = await this.tasks.snapshot()

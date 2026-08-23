@@ -379,3 +379,80 @@ test('a bot replies to a user-asked bot_ask as a control-plane completion (no ma
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('/ask fan-out asks multiple Bots and delivers the aggregated answers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-ask-fanout-command-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, meta }) {
+        const agent = withMockSession({ id: String(sessionId), status: 'idle', cancel() {}, followup() {} })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? registry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_user'] },
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: { answerer: { capabilities: ['answer'] }, analyst: { capabilities: ['analyze'] } },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { peerMessaging: true },
+      },
+    })
+    let inbound
+    const sent = []
+    gateway.transports = [{
+      platform: 'feishu',
+      async start(handler) { inbound = handler },
+      async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }]
+    gateway.transportByPlatform.set('feishu', gateway.transports[0])
+    await gateway.start()
+
+    await inbound({
+      id: 'ask-fanout-1',
+      target: { platform: 'feishu', chatId: 'oc_ask', chatType: 'dm', userId: 'ou_user' },
+      text: '/ask @answerer @analyst cross-verify the numbers',
+      receivedAt: Date.now(),
+    })
+
+    let pending = []
+    const registeredDeadline = Date.now() + 2_000
+    while (Date.now() < registeredDeadline) {
+      pending = await gateway.askRegistry.pending()
+      if (pending.length >= 1 && sent.some(item => item.text.includes('@answerer、@analyst'))) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(pending.length, 1)
+    assert.deepEqual([...pending[0].to].sort(), ['analyst', 'answerer'])
+    const askId = pending[0].askId
+    assert.ok(sent.some(item => item.text.includes('@answerer、@analyst')))
+
+    const mailbox = await gateway.mailbox.snapshot()
+    const answererItem = mailbox.find(entry => entry.envelope.payload.askId === askId && entry.envelope.to === 'answerer')
+    const analystItem = mailbox.find(entry => entry.envelope.payload.askId === askId && entry.envelope.to === 'analyst')
+    assert.ok(answererItem && analystItem, 'both ask envelopes should be delivered')
+    await gateway.replyToMessage({ message: answererItem.envelope, from: 'answerer', instruction: '42', replyTarget })
+    await gateway.replyToMessage({ message: analystItem.envelope, from: 'analyst', instruction: 'matches', replyTarget })
+
+    const answerDeadline = Date.now() + 3_000
+    while (Date.now() < answerDeadline && !sent.some(entry => entry.text.includes('matches'))) {
+      await new Promise(resolve => setTimeout(resolve, 30))
+    }
+    const answer = sent.find(entry => entry.text.includes('@answerer：'))
+    assert.ok(answer, 'the aggregated answer should mention the first reply')
+    assert.ok(answer.text.includes('@analyst：\nmatches'))
+    assert.ok(answer.text.includes('@answerer：\n42'))
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
