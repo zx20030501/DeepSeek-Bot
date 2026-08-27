@@ -535,6 +535,8 @@ export interface TaskRecord {
   readonly workflowRevision?: number
   readonly workflowRunId?: string
   readonly workflowNodeId?: string
+  /** Logical definition node; differs from workflowNodeId for map/compensation instances. */
+  readonly workflowLogicalNodeId?: string
   readonly workflowReplyTarget?: BotTarget
   readonly workflowTraceId?: string
   /** JSON-safe launch inputs retained for restart-safe data-flow resolution. */

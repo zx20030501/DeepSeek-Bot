@@ -98,6 +98,43 @@ test('routine launch failures retry with the same durable launch ID', async () =
   }
 })
 
+test('routine inputs are JSON-safe and pending launches keep their original payload', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-routine-inputs-'))
+  try {
+    const file = join(root, 'routines.jsonl')
+    const at = minute('2026-08-23T11:30:00.000Z')
+    const store = new RoutineStore(file, 3, 1_000, 60_000, 30_000)
+    await assert.rejects(
+      () => store.create({
+        name: 'invalid input',
+        ownerId: 'user:test',
+        workflowId: 'wf_invalid',
+        cron: '* * * * *',
+        inputs: { when: new Date(at) },
+      }, at),
+      error => error?.code === 'ROUTINE_INVALID_INPUTS',
+    )
+    const routine = await store.create({
+      name: 'snapshot input',
+      ownerId: 'user:test',
+      workflowId: 'wf_old',
+      cron: '* * * * *',
+      inputs: { version: 'old' },
+    }, at)
+    const first = (await store.claimDue(at + 60_000))[0]
+    await store.update(routine.id, {
+      workflowId: 'wf_new',
+      inputs: { version: 'new' },
+    }, at + 60_001)
+    const recovered = (await store.claimDue(at + 90_001))[0]
+    assert.equal(recovered.id, first.id)
+    assert.equal(recovered.workflowId, 'wf_old')
+    assert.deepEqual(recovered.inputs, { version: 'old' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('scheduler creates only structured Workflow launches', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-routine-scheduler-'))
   try {
@@ -129,4 +166,31 @@ test('scheduler creates only structured Workflow launches', async () => {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('scheduler stop waits for an in-flight claim and does not dispatch after stopping', async () => {
+  let claimStarted
+  let releaseClaim
+  const claimReady = new Promise(resolve => { claimStarted = resolve })
+  const claimed = new Promise(resolve => { releaseClaim = resolve })
+  const launches = []
+  const scheduler = new RoutineScheduler({
+    store: {
+      async claimDue() {
+        claimStarted()
+        return claimed
+      },
+      async recordLaunchResult() {},
+    },
+    launch: async launch => {
+      launches.push(launch)
+      return { status: 'started' }
+    },
+  })
+  scheduler.start()
+  await claimReady
+  const stopping = scheduler.stop()
+  releaseClaim([])
+  await stopping
+  assert.deepEqual(launches, [])
 })

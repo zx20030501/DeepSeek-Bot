@@ -27,6 +27,20 @@ test('Workflow controls resolve structured and legacy outputs deterministically'
     ],
   }, { topic: 'Hermes' }, outputs), { score: 0.9, topic: 'Hermes' })
   assert.equal(serializeWorkflowResult({ ok: true }), '{"ok":true}')
+  assert.equal(parseWorkflowResult(serializeWorkflowResult(undefined)), undefined)
+})
+
+test('condition equality is stable for canonically distinct Unicode keys', () => {
+  const composed = '\u00e9'
+  const decomposed = 'e\u0301'
+  const left = { [composed]: 1, [decomposed]: 2 }
+  const right = { [decomposed]: 2, [composed]: 1 }
+  assert.equal(evaluateWorkflowCondition({
+    source: { kind: 'constant', value: left },
+    operator: 'equals',
+    value: right,
+    whenTrue: 'yes',
+  }, {}, new Map()).matched, true)
 })
 
 test('condition operators cover equality, existence, truthiness and containment', () => {

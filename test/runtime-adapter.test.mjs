@@ -95,6 +95,43 @@ test('Grok adapter cancellation aborts an in-flight request', async () => {
   assert.equal(result.status, 'cancelled')
 })
 
+test('Grok adapter returns structured function calls instead of misclassifying them as empty output', async () => {
+  const adapter = new GrokRuntimeAdapter({
+    apiKey: 'test-xai-key',
+    fetch: async () => new Response(JSON.stringify({
+      id: 'resp-tool',
+      output: [{
+        type: 'function_call',
+        id: 'call-1',
+        name: 'search_docs',
+        arguments: '{"query":"Fleet"}',
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  const result = await adapter.run(request({ requestId: 'tool-call' }))
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(result.toolCalls, [{ name: 'search_docs', arguments: { query: 'Fleet' }, callId: 'call-1' }])
+  assert.match(result.text, /search_docs/u)
+})
+
+test('Grok adapter classifies an abort while reading the response body as a timeout', async () => {
+  const adapter = new GrokRuntimeAdapter({
+    apiKey: 'test-xai-key',
+    timeoutMs: 10,
+    fetch: async (_url, init) => ({
+      ok: true,
+      status: 200,
+      text: () => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('body aborted')), { once: true })
+      }),
+    }),
+  })
+  await assert.rejects(
+    () => adapter.run(request({ requestId: 'body-timeout' })),
+    error => error instanceof RuntimeAdapterError && error.code === 'grok.timeout',
+  )
+})
+
 class FakeHermesTransport {
   constructor() {
     this.listeners = new Set()
@@ -143,8 +180,10 @@ class FakeHermesTransport {
 test('Hermes adapter uses the public JSON-RPC session and prompt boundary', async () => {
   const transport = new FakeHermesTransport()
   const adapter = new HermesRuntimeAdapter({ transport, timeoutMs: 2_000 })
-  const first = await adapter.run(request({ requestId: 'hermes-1' }))
-  const second = await adapter.run(request({ requestId: 'hermes-2', instruction: 'Follow up' }))
+  const [first, second] = await Promise.all([
+    adapter.run(request({ requestId: 'hermes-1' })),
+    adapter.run(request({ requestId: 'hermes-2', instruction: 'Follow up' })),
+  ])
   assert.equal(first.text, 'Hermes result')
   assert.equal(second.text, 'Hermes result')
   assert.equal(transport.sessionCreates, 1)

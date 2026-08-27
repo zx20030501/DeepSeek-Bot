@@ -119,6 +119,142 @@ test('Workflow compiler preserves dependency order and stable launch keys', () =
   assert.equal(workflowDispatchKey('wf_compiler', 2, 'research'), workflowDispatchKey('wf_compiler', 2, 'research'))
 })
 
+test('Workflow compiler derives data-flow dependencies from node references', () => {
+  const plan = compileWorkflowLaunch({
+    schemaVersion: 1,
+    id: 'wf_implicit_dependency',
+    revision: 1,
+    status: 'active',
+    createdAt: 1,
+    updatedAt: 1,
+    ...workflowDraft(),
+    edges: [],
+  })
+  assert.deepEqual(plan.nodeOrder, ['research', 'write'])
+  assert.deepEqual(plan.nodes.find(node => node.nodeId === 'write')?.dependsOn, ['research'])
+})
+
+test('Workflow compiler gates condition branches and map templates behind their control nodes', () => {
+  const conditionPlan = compileWorkflowLaunch({
+    schemaVersion: 1,
+    id: 'wf_condition_dependencies',
+    revision: 1,
+    status: 'active',
+    createdAt: 1,
+    updatedAt: 1,
+    name: 'Condition dependencies',
+    ownerId: 'user:feishu:ou_user',
+    scope: 'user',
+    entryNodeId: 'start',
+    inputs: [],
+    outputs: [],
+    nodes: [
+      { id: 'start', label: 'Start', kind: 'task', capability: 'start', outputs: ['result'] },
+      {
+        id: 'choose',
+        label: 'Choose branch',
+        kind: 'condition',
+        condition: {
+          source: { kind: 'node-output', nodeId: 'start', output: 'result' },
+          operator: 'truthy',
+          whenTrue: 'yes',
+          whenFalse: 'no',
+        },
+      },
+      { id: 'yes', label: 'Yes', kind: 'task', capability: 'yes', outputs: ['result'] },
+      { id: 'no', label: 'No', kind: 'task', capability: 'no', outputs: ['result'] },
+    ],
+    edges: [{ from: 'start', to: 'choose' }],
+    policy: {
+      budget: { maxDepth: 6, maxParallel: 2, maxFanOut: 2, maxMessages: 10, maxTokens: 10_000, maxCostUnits: 100 },
+      allowedCapabilities: ['start', 'yes', 'no'],
+      allowedPermissions: [],
+      allowExternalEffects: false,
+    },
+  })
+  assert.deepEqual(conditionPlan.nodes.find(node => node.nodeId === 'yes')?.dependsOn, ['choose'])
+  assert.deepEqual(conditionPlan.nodes.find(node => node.nodeId === 'no')?.dependsOn, ['choose'])
+
+  const mapPlan = compileWorkflowLaunch({
+    schemaVersion: 1,
+    id: 'wf_map_entry',
+    revision: 1,
+    status: 'active',
+    createdAt: 1,
+    updatedAt: 1,
+    name: 'Map entry',
+    ownerId: 'user:feishu:ou_user',
+    scope: 'user',
+    entryNodeId: 'expand',
+    inputs: [{ name: 'items', type: 'array', required: true }],
+    outputs: [],
+    nodes: [
+      {
+        id: 'expand',
+        label: 'Expand',
+        kind: 'map',
+        children: ['worker'],
+        map: {
+          source: { kind: 'input', name: 'items' },
+          itemInput: 'item',
+          templateNodeId: 'worker',
+          maxFanOut: 2,
+        },
+      },
+      { id: 'worker', label: 'Process item', kind: 'task', capability: 'worker', outputs: ['result'] },
+    ],
+    edges: [],
+    policy: {
+      budget: { maxDepth: 4, maxParallel: 2, maxFanOut: 2, maxMessages: 10, maxTokens: 10_000, maxCostUnits: 100 },
+      allowedCapabilities: ['worker'],
+      allowedPermissions: [],
+      allowExternalEffects: false,
+    },
+  })
+  assert.deepEqual(mapPlan.entryTaskIds, [])
+  assert.deepEqual(mapPlan.nodes.find(node => node.nodeId === 'worker')?.dependsOn, ['expand'])
+})
+
+test('Workflow compiler keeps a shared condition branch executable', () => {
+  const plan = compileWorkflowLaunch({
+    schemaVersion: 1,
+    id: 'wf_shared_condition_branch',
+    revision: 1,
+    status: 'active',
+    createdAt: 1,
+    updatedAt: 1,
+    name: 'Shared condition branch',
+    ownerId: 'user:feishu:ou_user',
+    scope: 'user',
+    entryNodeId: 'choose',
+    inputs: [],
+    outputs: [],
+    nodes: [
+      {
+        id: 'choose',
+        label: 'Choose',
+        kind: 'condition',
+        condition: {
+          source: { kind: 'constant', value: true },
+          operator: 'truthy',
+          whenTrue: 'shared',
+          whenFalse: 'shared',
+        },
+      },
+      { id: 'shared', label: 'Shared branch', kind: 'task', capability: 'shared', outputs: ['result'] },
+    ],
+    edges: [],
+    policy: {
+      budget: { maxDepth: 4, maxParallel: 1, maxFanOut: 1, maxMessages: 5, maxTokens: 1_000, maxCostUnits: 10 },
+      allowedCapabilities: ['shared'],
+      allowedPermissions: [],
+      allowExternalEffects: false,
+    },
+  })
+  assert.deepEqual(plan.entryTaskIds, [])
+  assert.deepEqual(plan.nodes.find(node => node.nodeId === 'shared')?.dependsOn, ['choose'])
+})
+
 test('Gateway rejects Manager and Saved Workflow entrypoints while their feature flags are off', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-runtime-feature-gates-'))
   let gateway
@@ -694,6 +830,82 @@ test('Workflow root failure cancels queued child work and fences its delivery', 
   } finally {
     if (gateway) await gateway.stop()
     if (first) await first.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('cancelling a compiled Workflow root fences every child Task and Run', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-workflow-manual-cancel-'))
+  let gateway
+  try {
+    const config = {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      access: { userIds: ['ou_user'] },
+      profiles: {
+        researcher: { capabilities: ['research'], allowedUserIds: ['ou_user'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'never', managerBotId: 'manager', features: runtimeFeatures },
+    }
+    gateway = new BotGateway({}, config)
+    const workflow = await gateway.createWorkflowDefinition(workflowDraft(), 'user:feishu:ou_user')
+    const workflowRunId = 'workflow-run:' + workflow.id + ':1:manual-cancel'
+    const correlationId = 'workflow:' + workflow.id + ':1:manual-cancel'
+    const rootTask = await gateway['tasks'].createTask({
+      title: 'Workflow: ' + workflow.name,
+      instruction: workflow.name,
+      createdBy: 'user:feishu:ou_user',
+      assignedTo: 'workflow',
+      workflowDefinitionId: workflow.id,
+      workflowRevision: 1,
+      workflowRunId,
+      workflowNodeId: '__root__',
+      workflowReplyTarget: target,
+      workflowTraceId: correlationId,
+    })
+    const child = await gateway['tasks'].createTask({
+      title: 'Research',
+      instruction: 'Research',
+      createdBy: 'user:feishu:ou_user',
+      assignedTo: 'researcher',
+      workflowDefinitionId: workflow.id,
+      workflowRevision: 1,
+      workflowRunId,
+      workflowNodeId: 'research',
+      workflowReplyTarget: target,
+      workflowTraceId: correlationId,
+    })
+    const childRun = await gateway['tasks'].createRun(child.id, 'researcher', 1)
+    const childEnvelope = createEnvelope({
+      kind: 'request',
+      from: 'service:workflow:' + workflow.id,
+      to: 'researcher',
+      taskId: child.id,
+      runId: childRun.id,
+      attemptId: childRun.attemptId,
+      correlationId,
+      payload: {
+        workflowDefinitionId: workflow.id,
+        workflowRevision: 1,
+        workflowRunId,
+        workflowRootTaskId: rootTask.id,
+        workflowNodeId: 'research',
+        instruction: 'Research',
+        requester: 'user:feishu:ou_user',
+        replyTarget: target,
+      },
+    })
+    const childKey = workflowDispatchKey(workflow.id, 1, 'research', workflowRunId)
+    await gateway['mailbox'].enqueue(childEnvelope, childKey)
+
+    const cancelled = await gateway.cancelFleetTask(rootTask.id, 'user:feishu:ou_user')
+    assert.equal(cancelled?.status, 'cancelled')
+    assert.equal((await gateway['tasks'].task(child.id))?.status, 'cancelled')
+    assert.equal((await gateway['tasks'].run(childRun.id))?.status, 'cancelled')
+    assert.equal((await gateway['mailbox'].getByIdempotencyKey(childKey))?.state, 'failed')
+  } finally {
+    if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
   }
 })
