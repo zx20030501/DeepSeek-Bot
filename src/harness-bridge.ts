@@ -170,6 +170,7 @@ export class HarnessBridge {
    * workflow agents are never blocked from receiving fleet handoff tools.
    */
   public async configureUserFleetTools(sessionId: SessionId, setup: AgentSetupLike): Promise<boolean> {
+    if (String(sessionId).startsWith('hermes-bot-')) return false
     const agent = this.agents.get(sessionId)
     if (!agent || this.userToolsConfigured.has(agent as object)) return false
     const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx

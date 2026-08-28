@@ -2489,6 +2489,7 @@ export class BotGateway {
     const record = asRecord(event)
     if (record.type !== 'turn/start') return
     const id = sessionKey(session.id)
+    if (this.isHermesBotWorkerSession(id) || this.internalRunBySession.has(id)) return
     if (this.ownerWebRegistrationChecked.has(id)) return
     this.ownerWebRegistrationChecked.add(id)
     if (!this.shouldRegisterOwnerWebSessionAtTurnStart(id)) return
@@ -3349,7 +3350,7 @@ export class BotGateway {
     }
     await this.rememberSessionTarget(binding.sessionId, message.target)
     if (message.target.platform === 'local' && this.webDynamicBotCreationEnabled()) {
-      void this.registerLocalWebOwnerSession(binding.sessionId)
+      await this.registerLocalWebOwnerSession(binding.sessionId)
     }
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)
@@ -3404,17 +3405,14 @@ export class BotGateway {
       const registryEntry = await this.registry.getByHandle(profile.name)
       const dynamicProfile = registryEntry !== undefined && registryEntry.definition.source !== 'config'
       const invokeProfile = async (): Promise<boolean> => {
-        // Bot creation tools (bot_create_draft, bot_update_draft) are ONLY installed on
-        // local DSH web sessions (platform === 'local'). All other platforms (feishu,
-        // telegram, undefined, etc.) NEVER receive these tools. This prevents workflow
-        // agents and transport agents from getting bot creation capabilities.
-        const isStrictlyLocalWebSession = message.target.platform === 'local'
-        const shouldInstallBotTools = this.webDynamicBotCreationEnabled() && isStrictlyLocalWebSession
+        // Owner bot-creation tools are installed only via registerLocalWebOwnerSession
+        // -> configureUserFleetTools. Never pass installUserFleetTools through
+        // resumeOrCreate's internal setup path — that poisons internalToolsConfigured
+        // and blocks fleet handoff tools on workflow worker agents.
         const agent = await this.bridge!.resumeOrCreate(
           binding.sessionId as SessionId,
           profile,
           binding.modelOverride,
-          shouldInstallBotTools ? agentCtx => this.installUserFleetTools(agentCtx) : undefined,
         )
         if (dynamicProfile) await this.rememberDirectProfileSession(profile.name, binding.sessionId)
         // Hermes routes known DSH commands natively; an unknown /xxx is still a

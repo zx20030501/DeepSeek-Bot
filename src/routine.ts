@@ -625,6 +625,7 @@ export class RoutineScheduler {
   private readonly active = new Set<Promise<void>>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private running = false
+  private tickInFlight: Promise<void> | undefined
 
   public constructor(private readonly options: RoutineSchedulerOptions) {
     this.pollMs = Math.max(250, options.pollMs ?? 15_000)
@@ -643,11 +644,23 @@ export class RoutineScheduler {
     this.running = false
     if (this.timer !== undefined) clearTimeout(this.timer)
     this.timer = undefined
+    const tick = this.tickInFlight
+    if (tick !== undefined) await tick
     await Promise.allSettled([...this.active])
   }
 
   private async tick(): Promise<void> {
     if (!this.running) return
+    const body = this.runTick()
+    this.tickInFlight = body
+    try {
+      await body
+    } finally {
+      if (this.tickInFlight === body) this.tickInFlight = undefined
+    }
+  }
+
+  private async runTick(): Promise<void> {
     try {
       const launches = await this.options.store.claimDue(this.now(), this.maxDuePerTick)
       for (const launch of launches) {
