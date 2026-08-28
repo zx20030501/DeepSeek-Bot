@@ -120,6 +120,18 @@ function actorForTarget(target: BotTarget): string {
   return `user:${target.platform}:${target.userId ?? target.chatId}`
 }
 
+/**
+ * Default target for unbound DSH web sessions (no Feishu/Telegram identity).
+ * Used when webChatBotCreation is enabled and the session has no transport binding.
+ * Actor becomes 'user:local:local-owner', owner is the local DSH installation.
+ */
+const LOCAL_WEB_TARGET: BotTarget = {
+  platform: 'local',
+  chatId: 'local-dashboard',
+  chatType: 'dm',
+  userId: 'local-owner',
+}
+
 function splitBotLabels(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；]+/u).map(item => item.trim()).filter(Boolean))]
 }
@@ -1131,15 +1143,16 @@ export class BotGateway {
 
   private async createBotDraftFromSession(sessionId: string, input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
     if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
-    if (target === undefined) throw new Error('无法确认当前 Agent 会话对应的用户')
+    // Use Feishu/Telegram target if bound, otherwise fall back to local DSH web target.
+    // This allows unbound DSH web sessions to create bots with only webChatBotCreation enabled.
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
     return this.createDynamicBotDraft(input, target)
   }
 
   private async updateBotDraftFromSession(sessionId: string, input: BotUpdateDraftToolInput): Promise<BotUpdateDraftToolResult> {
     if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
-    if (target === undefined) throw new Error('无法确认当前 Agent 会话对应的用户')
+    // Use Feishu/Telegram target if bound, otherwise fall back to local DSH web target.
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
     return this.updateDynamicBotDraft(input, target)
   }
 
@@ -1170,7 +1183,7 @@ export class BotGateway {
    * activations, while remote users cannot.
    */
   private isLocalOwner(actor: string): boolean {
-    return actor === 'local-dashboard' || actor.startsWith('system:')
+    return actor === 'local-dashboard' || actor.startsWith('system:') || actor.startsWith('user:local:')
   }
 
   private async ensureBotActivationApproval(entry: BotRegistryEntry, actor: string): Promise<FleetApprovalRecord> {

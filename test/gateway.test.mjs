@@ -2076,48 +2076,51 @@ test('Feishu /bot create is blocked when webChatBotCreation is ON but dynamicReg
   }
 })
 
-test('DSH Web bot creation works with dynamicRegistry OFF but webChatBotCreation ON', async () => {
-  // This is the KEY CRO requirement: webChatBotCreation works without dynamicRegistry.
-  // "do not turn on the dynamic registry flag; only DSH web conversation create is allowed"
-  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-create-no-registry-'))
+test('unbound DSH web session can create+confirm bot with only webChatBotCreation ON, no Feishu identity required', async () => {
+  // BLOCKER TEST: DSH web sessions without Feishu/Telegram binding must be able to create bots.
+  // This tests the local-owner web target fallback for unbound sessions.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-unbound-web-create-'))
   let gateway
   try {
-    const agents = {
-      get() { return undefined },
-      async resume() { throw new Error('not found') },
-      async create() { throw new Error('commands should not create an Agent') },
-    }
-    gateway = new BotGateway({ get: name => name === 'agents' ? agents : undefined }, {
+    gateway = new BotGateway({}, {
       stateDir: root,
-      access: { userIds: ['ou_web'] },
+      access: { userIds: [] }, // No Feishu users - pure local DSH web
       telegram: { enabled: false }, feishu: { enabled: false },
       collaboration: {
         features: {
-          dynamicRegistry: false, // "启用动态 Bot 注册表" switch is OFF
+          dynamicRegistry: false, // "启用动态 Bot 注册表" switch is OFF per CRO
           chatBotCreation: false, // Feishu /bot create is OFF
-          webChatBotCreation: true, // DSH Web tool creation is ON - works WITHOUT dynamicRegistry
+          webChatBotCreation: true, // ONLY this flag is ON
         },
       },
     })
-    const transport = {
-      platform: 'feishu', async start() {}, async stop() {}, async send() {},
-    }
-    gateway.transports = [transport]
-    gateway.transportByPlatform.set('feishu', transport)
     await gateway.start()
-    // Create a bot via API (simulating DSH Web tool call) - this MUST work even with dynamicRegistry: false
+    // Create a bot with local target (simulating DSH web session without Feishu binding)
+    // The local target represents a pure DSH web user with no external identity
+    const localTarget = { platform: 'local', chatId: 'local-dashboard', chatType: 'dm', userId: 'local-owner' }
     const botDraft = await gateway.createDynamicBotDraft({
-      handle: 'web-created-bot',
-      title: 'Bot Created from DSH Web',
-      description: 'This bot was created via DSH web chat with dynamicRegistry OFF',
-    }, { platform: 'feishu', chatId: 'oc_web', userId: 'ou_web' })
+      handle: 'local-web-bot',
+      title: 'Bot from Local DSH Web Session',
+    }, localTarget)
     assert.equal(botDraft.status, 'draft')
     assert.ok(botDraft.confirmationCode, 'Should have a confirmation code')
-    // Confirm the bot via local-dashboard (DSH Web)
-    await gateway.resolveApproval(botDraft.confirmationCode, 'approved', 'local-dashboard')
-    // Verify the bot is in the roster and active
-    const botEntry = gateway.directory.get('web-created-bot')
-    assert.ok(botEntry, 'Bot should be in the roster after confirmation')
+    // Check bot status before approval
+    const beforeApproval = await gateway.registry.getByHandle('local-web-bot')
+    assert.equal(beforeApproval?.definition.status, 'draft', 'Bot should be draft before approval')
+    // Confirm the bot - user:local:* actors are recognized as local owners
+    const approval = await gateway.resolveApproval(botDraft.confirmationCode, 'approved', 'user:local:local-owner')
+    assert.equal(approval?.status, 'approved', 'Approval should be approved')
+    // Check bot status after approval
+    const afterApproval = await gateway.registry.getByHandle('local-web-bot')
+    assert.equal(afterApproval?.definition.status, 'active', 'Bot should be active after approval')
+    assert.equal(afterApproval?.definition.ownerId, 'user:local:local-owner', 'Owner should be local')
+    assert.equal(afterApproval?.definition.scope, 'user', 'Scope should be user')
+    // Debug: list all profiles and check directory
+    const allProfiles = [...gateway.profiles.keys()]
+    assert.ok(allProfiles.length > 0, `Should have profiles, got: ${allProfiles.join(', ')}`)
+    // Verify the bot is in the roster
+    const botEntry = gateway.directory.get('local-web-bot')
+    assert.ok(botEntry, `Bot should be in the roster after confirmation. Profiles: ${allProfiles.join(', ')}`)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
