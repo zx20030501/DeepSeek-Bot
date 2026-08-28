@@ -78,31 +78,32 @@ test('Fleet roster settings round-trip roles, ACLs, session isolation, and limit
     collaboration: {
       approvalMode: 'auto-planned',
       maxGroupRounds: 3,
-      features: { dynamicRegistry: true, chatBotCreation: false },
+      features: { dynamicRegistry: true, chatBotCreation: false, webChatBotCreation: false },
     },
   }
   const settings = settingsFromGatewayConfig(base)
   assert.equal(settings.profiles[0]?.id, 'researcher')
   assert.deepEqual(settings.profiles[0]?.allowedUserIds, ['ou_a'])
-  assert.deepEqual(settings.collaboration.features, { dynamicRegistry: true, chatBotCreation: false })
+  assert.deepEqual(settings.collaboration.features, { dynamicRegistry: true, chatBotCreation: false, webChatBotCreation: false })
   settings.profiles[0].approvalRequired = true
   settings.collaboration.features.chatBotCreation = true
+  settings.collaboration.features.webChatBotCreation = true
   settings.collaboration.maxParallelRuns = 4
   const next = gatewayConfigFromSettings(base, settings)
   assert.equal(next.profiles?.researcher?.approvalRequired, true)
   assert.equal(next.profiles?.researcher?.sessionScope, 'requester')
   assert.equal(next.collaboration?.maxParallelRuns, 4)
   assert.equal(next.collaboration?.maxGroupRounds, 3)
-  assert.deepEqual(next.collaboration?.features, { dynamicRegistry: true, chatBotCreation: true })
+  assert.deepEqual(next.collaboration?.features, { dynamicRegistry: true, chatBotCreation: true, webChatBotCreation: true })
 })
 
 test('pre-Phase-2 saved Fleet settings inherit secure-off dynamic Bot features', () => {
-  const base = { collaboration: { features: { dynamicRegistry: false, chatBotCreation: false } } }
+  const base = { collaboration: { features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false } } }
   const projected = settingsFromGatewayConfig(base)
   const legacy = {
     ...projected,
     collaboration: Object.fromEntries(Object.entries(projected.collaboration).filter(([key]) => key !== 'features')),
   }
   const next = gatewayConfigFromSettings(base, legacy)
-  assert.deepEqual(next.collaboration?.features, { dynamicRegistry: false, chatBotCreation: false })
+  assert.deepEqual(next.collaboration?.features, { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false })
 })

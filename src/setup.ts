@@ -36,6 +36,7 @@ export interface HermesBotSettings {
     features: {
       dynamicRegistry: boolean
       chatBotCreation: boolean
+      webChatBotCreation: boolean
     }
   }
   profiles: HermesBotProfileSettings[]
@@ -102,7 +103,8 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
     features: z.object({
       dynamicRegistry: z.boolean().default(false),
       chatBotCreation: z.boolean().default(false),
-    }).default({ dynamicRegistry: false, chatBotCreation: false }),
+      webChatBotCreation: z.boolean().default(false),
+    }).default({ dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false }),
   }),
   profiles: z.array(ProfileSettingsSchema).default([]),
 })
@@ -163,6 +165,8 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
         dynamicRegistry: config.collaboration?.features?.dynamicRegistry === true,
         chatBotCreation: config.collaboration?.features?.dynamicRegistry === true
           && config.collaboration?.features?.chatBotCreation === true,
+        webChatBotCreation: config.collaboration?.features?.dynamicRegistry === true
+          && config.collaboration?.features?.webChatBotCreation === true,
       },
     },
     profiles: Object.entries(config.profiles ?? {}).map(([id, profile]) => profileSettings(id, profile)),
@@ -236,6 +240,7 @@ export function gatewayConfigFromSettings(
         ...base.collaboration?.features,
         dynamicRegistry: collaborationFeatures.dynamicRegistry,
         chatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.chatBotCreation,
+        webChatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.webChatBotCreation,
       },
     },
   }

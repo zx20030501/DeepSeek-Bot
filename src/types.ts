@@ -181,6 +181,7 @@ export interface BotCollaborationConfig {
 export interface BotFleetFeatureFlags {
   readonly dynamicRegistry?: boolean
   readonly chatBotCreation?: boolean
+  readonly webChatBotCreation?: boolean
   readonly peerMessaging?: boolean
   readonly managerAgent?: boolean
   readonly savedWorkflows?: boolean
