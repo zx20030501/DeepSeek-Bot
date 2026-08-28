@@ -9,7 +9,9 @@
 | **URL** | `POST /api/dsh-hermes-bot/setup` |
 | **常量** | `HERMES_BOT_SETUP_ROUTE`（`src/setup-constants.ts`） |
 | **GET** | 返回当前 settings + diagnostics 快照（右栏轮询用） |
-| **安全** | 仅 loopback 可信请求；检查 Host、Origin、Fetch Metadata、socket 对端 |
+| **OPTIONS** | CORS 预检；`allow-methods: GET, POST, OPTIONS` |
+| **安全** | Host + socket 必须 loopback。允许无 Origin、`origin: null`、`vscode-webview:`、loopback 上的 `sec-fetch-site: cross-site`。仅当 Origin 是**外部** `http(s)` 非 loopback 才拒绝。见 `src/setup-security.ts` |
+| **CORS** | 信任通过后回写 `access-control-allow-origin`（Cursor Simple Browser / webview 需要） |
 
 完整设置页 action（`save_settings`、`fleet_task_replay` 等）见 `src/setup-route.ts`；本文只列 **DSH Web Fleet UI 专用** 扩展。
 
@@ -121,7 +123,7 @@ Content-Type: application/json
 
 ### 后续
 
-右栏点「确认激活」或创建时选「创建并激活」，走 `fleet_approval_resolve`。不要再往会话里塞 `/bot confirm`。
+右栏点「确认激活」或创建时选「创建并激活」，走 **`bot_registry_status`**（`status: "active"`）。不要走 `fleet_approval_resolve`（那是 Workflow 审批），也不要往会话里塞 `/bot confirm`。
 
 ### 前置条件
 
@@ -130,24 +132,71 @@ Content-Type: application/json
 
 ---
 
-## `owner_web_command`
+## `bot_update`
 
-仅用于右栏「派任务」对话框：把 `@bot` / `@team` 自然语言任务注入 owner 会话。Web UI **不再**用它注入 `/bot confirm`、`/routine list` 等斜杠命令。
+右栏 ⋯「编辑档案」。draft / active 都能改；Gateway `updateWebDashboardBot`。
 
 ### 请求
 
-```http
-POST /api/dsh-hermes-bot/setup
-Content-Type: application/json
-
+```json
 {
-  "action": "owner_web_command",
-  "sessionId": "<owner-dsh-session-id>",
-  "text": "@researcher 请根据当前仓库做代码审查"
+  "action": "bot_update",
+  "handle": "researcher",
+  "title": "研究员",
+  "description": "负责调研",
+  "capabilities": "research,analysis",
+  "soul": "先列证据再下结论",
+  "fleetRole": "worker"
 }
 ```
 
-「自动规划」也会走此通道，但界面是对话框，用户看不到斜杠。
+至少提供一个可改字段。`handle` 必填。
+
+---
+
+## `bot_registry_status`
+
+右栏「确认激活 / 停用 / 删除」。Web **确认激活**走这条，把 draft 直接改成 `active`。
+
+```json
+{ "action": "bot_registry_status", "botId": "researcher", "status": "active" }
+```
+
+`status`：`active` | `disabled` | `deleted`。
+
+---
+
+## `fleet_dispatch` / `fleet_plan`
+
+点对点派任务、右栏底部「自动规划」。目标是 local web，不灌 `/fleet`。
+
+```json
+{ "action": "fleet_dispatch", "to": "researcher", "instruction": "审查当前仓库" }
+```
+
+```json
+{ "action": "fleet_plan", "instruction": "把发布清单拆成可执行步骤" }
+```
+
+---
+
+## `fleet_team_dispatch` / `fleet_room_dispatch`
+
+Team「发任务」、群聊「继续协作」。local 平台 **房间创建完即 HTTP 返回**，ack 后台 flush，不要再 `await outbox.flush()`。
+
+```json
+{ "action": "fleet_team_dispatch", "teamId": "team_xxx", "instruction": "一起写发布说明" }
+```
+
+```json
+{ "action": "fleet_room_dispatch", "botIds": ["researcher", "reviewer"], "instruction": "继续刚才的审查" }
+```
+
+---
+
+## `owner_web_command`
+
+遗留通道：把文本注入 owner 会话。右栏主路径**不要**再用它灌 `/bot confirm`、`/fleet`、`/routine create`。派任务请走 `fleet_dispatch` / `fleet_team_dispatch`。
 
 ---
 
@@ -187,7 +236,7 @@ Content-Type: application/json
 }
 ```
 
-`memberBotIds` 也接受逗号/空格分隔的字符串。
+`memberBotIds` 也接受逗号/空格分隔的字符串。Gateway 对**同名 + 同成员集**会复用已有 Team，避免右栏刷屏。
 
 ### 响应
 
@@ -199,8 +248,18 @@ Content-Type: application/json
     "memberBotIds": ["researcher", "reviewer", "writer"],
     "status": "active"
   },
-  "message": "Team team_xxx 已创建，可在对话中使用 @team_xxx 或 @team 协作。"
+  "message": "Team「Launch」已就绪，可在群组里点「发任务」开始协作。"
 }
+```
+
+---
+
+## `team_delete`
+
+右栏群组 ⋯「删除」。
+
+```json
+{ "action": "team_delete", "teamId": "team_xxx" }
 ```
 
 ---
@@ -290,4 +349,4 @@ Content-Type: application/json
 npm test -- test/setup-route.test.mjs
 ```
 
-覆盖 `save_fleet_config`、`bot_create_draft`、`owner_web_command`、`team_create` 等 action。
+覆盖 `save_fleet_config`、`bot_create_draft`、`bot_update`、`team_create`、`team_delete`、CORS / webview Origin 等。以 `src/setup-route.ts` 的 action 白名单为准。

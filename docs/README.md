@@ -6,15 +6,18 @@
 
 | 文档 | 用途 |
 |------|------|
-| [HANDOFF-DSH-WEB-FLEET-UI.md](HANDOFF-DSH-WEB-FLEET-UI.md) | **云端 → 本地交接主文档**（分支 `cursor/hermes-fleet-sidebar-cf56`，PR #38） |
+| [HANDOFF-DSH-WEB-FLEET-UI.md](HANDOFF-DSH-WEB-FLEET-UI.md) | **跨机器交接主文档**（分支 `cursor/hermes-fleet-sidebar-cf56`，PR #38，功能 HEAD `2c7ff5b`） |
 | [DSH_WEB_FLEET_UI.md](DSH_WEB_FLEET_UI.md) | 右栏 BOTS UI 产品形态、槽位挂载、Phase A–E 进度 |
 | [DSH_WEB_SETUP_API.md](DSH_WEB_SETUP_API.md) | `/api/dsh-hermes-bot/setup` Web 专用 action 参考 |
 | [DSH_WEB_LOCAL_VERIFICATION.md](DSH_WEB_LOCAL_VERIFICATION.md) | 本地 3080 手测流程与检查清单（含验证记录模板） |
 
-本地新开会话可直接说：
+另一台机器 / 新开会话可直接粘贴：
 
 ```text
-请阅读 docs/HANDOFF-DSH-WEB-FLEET-UI.md 并接手本地测试。
+请阅读 docs/HANDOFF-DSH-WEB-FLEET-UI.md。
+分支 cursor/hermes-fleet-sidebar-cf56（PR #38），功能 HEAD 至少 2c7ff5b。
+目标：DSH Web 右栏 BOTS 通讯录，不 fork Harness。禁止斜杠命令当主交互。
+先 git pull、npm run build:all、接入 3080，再按文档「下一步」继续。优先：群聊中栏多人消息头。
 ```
 
 ## 产品与架构
@@ -51,4 +54,4 @@
 | 分支 / PR | 内容 | 是否在 main |
 |-----------|------|-------------|
 | main @ `1674cf5+` | Gateway owner-web、Group Room（#36/#37） | 是 |
-| `cursor/hermes-fleet-sidebar-cf56` / **#38** | Hermes 右栏 BOTS UI + Web setup API | **否（Draft）** |
+| `cursor/hermes-fleet-sidebar-cf56` / **#38** | Hermes 右栏 BOTS：点击化 + 暗色 + CORS/webview + Team 去重删除 | **否（Draft）** |

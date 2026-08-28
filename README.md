@@ -74,13 +74,13 @@ dsh web
 
 **接手与手测**（必读）：
 
-- [docs/HANDOFF-DSH-WEB-FLEET-UI.md](docs/HANDOFF-DSH-WEB-FLEET-UI.md) — 云端交接主文档
+- [docs/HANDOFF-DSH-WEB-FLEET-UI.md](docs/HANDOFF-DSH-WEB-FLEET-UI.md) — 跨机器交接（另一台机器请先读这篇）
 - [docs/DSH_WEB_LOCAL_VERIFICATION.md](docs/DSH_WEB_LOCAL_VERIFICATION.md) — 本地 3080 手测清单
 - [docs/DSH_WEB_FLEET_UI.md](docs/DSH_WEB_FLEET_UI.md) — 右栏 UI 技术说明
 - [docs/DSH_WEB_SETUP_API.md](docs/DSH_WEB_SETUP_API.md) — Web setup API 参考
 - [docs/README.md](docs/README.md) — 全文档索引
 
-快速路径：`git checkout cursor/hermes-fleet-sidebar-cf56` → `npm run build:client` → `dsh plugin add .` → 打开 3080 → 右栏 **一键启用** → **+ New Agent** → **创建并激活**。
+快速路径：读 [交接文档](docs/HANDOFF-DSH-WEB-FLEET-UI.md) → `git checkout cursor/hermes-fleet-sidebar-cf56` → `npm run build:all` → `dsh plugin --profile web add . --ignore-scripts` → 打开 3080 → 右栏 **一键启用** → **+ New Agent** → **确认激活**。
 
 ## 配置
 
