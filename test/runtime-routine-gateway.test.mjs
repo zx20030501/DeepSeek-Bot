@@ -50,6 +50,43 @@ test('Gateway exposes durable owner-scoped Workflow routines', async () => {
   }
 })
 
+test('local DSH web dashboard creates a cron Bot dispatch without slash commands', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-cron-'))
+  const gateway = new BotGateway({}, {
+    stateDir: root,
+    telegram: { enabled: false },
+    feishu: { enabled: false },
+    profiles: {
+      analyst: { fleetRole: 'worker', capabilities: ['research'] },
+    },
+    collaboration: {
+      features: {
+        savedWorkflows: true,
+        routines: true,
+      },
+    },
+  })
+  try {
+    await gateway.start()
+    const routine = await gateway.createWebDashboardRoutine({
+      name: 'morning brief',
+      cron: '0 9 * * 1-5',
+      timezone: 'Asia/Shanghai',
+      to: 'analyst',
+      instruction: 'write the morning brief',
+    })
+    assert.equal(routine.status, 'enabled')
+    assert.equal(routine.workflowId, 'cron-bot:analyst')
+    assert.equal(routine.inputs.to, 'analyst')
+    assert.equal(routine.cron, '0 9 * * 1-5')
+    const listed = await gateway.listRoutines()
+    assert.equal(listed.some(item => item.id === routine.id), true)
+  } finally {
+    await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('Gateway selects explicit Hermes/Grok profile runtimes and accepts host adapters', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-runtime-gateway-'))
   const gateway = new BotGateway({}, {

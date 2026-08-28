@@ -461,6 +461,25 @@ main 已有 Gateway owner-web + Group Room（PR #36/#37），本分支补 UI 和
 
 ---
 
-**文档版本**：1.0  
-**对应 commit**：`daa5c31`  
+**文档版本**：1.1  
+**对应 commit**：`97d61d9`（含 handoff 文档本身）  
 **维护**：本地会话完成手测后，请在本文件末尾追加「本地验证记录」一节（日期、环境、截图路径、发现的问题）。
+
+---
+
+## 16. 本地文档套件（2026-08-28 本地接手）
+
+本地会话已 checkout `cursor/hermes-fleet-sidebar-cf56` 并补充以下文档（与本文互补，不重复粘贴全文）：
+
+| 文档 | 用途 |
+|------|------|
+| [docs/README.md](README.md) | 全仓库文档索引 |
+| [docs/DSH_WEB_FLEET_UI.md](DSH_WEB_FLEET_UI.md) | 右栏 UI 架构、Phase A–E、槽位与交互 |
+| [docs/DSH_WEB_SETUP_API.md](DSH_WEB_SETUP_API.md) | `save_fleet_config` 等 Web API 参考 |
+| [docs/DSH_WEB_LOCAL_VERIFICATION.md](DSH_WEB_LOCAL_VERIFICATION.md) | 3080 手测清单与验证记录模板 |
+
+**本地 git 状态说明**：若之前在 `main` 有未提交改动，已 `git stash` 为 `local-main-work-before-handoff-cf56`；需要时可 `git stash list` / `git stash pop` 合并。
+
+### 本地验证记录 — 待填写
+
+_（接手后完成 `npm run build:client` + DSH 3080 手测，在此或 [DSH_WEB_LOCAL_VERIFICATION.md](DSH_WEB_LOCAL_VERIFICATION.md) 填写。）_

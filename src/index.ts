@@ -138,8 +138,17 @@ export function apply(ctx: Context, config: unknown = {}): void {
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
     registerLocalWebOwnerSession: sessionId => gateway.registerLocalWebOwnerSession(sessionId),
     createWebDashboardBotDraft: input => gateway.createWebDashboardBotDraft(input),
+    updateWebDashboardBot: input => gateway.updateWebDashboardBot(input),
     createWebDashboardTeam: (name, memberBotIds) => gateway.createWebDashboardTeam(name, memberBotIds),
+    deleteWebDashboardTeam: teamId => gateway.deleteWebDashboardTeam(teamId),
     dispatchOwnerWebCommand: (sessionId, text) => gateway.dispatchOwnerWebCommand(sessionId, text),
+    dispatchWebDashboardTask: (to, instruction) => gateway.dispatchWebDashboardTask(to, instruction),
+    planWebDashboardTask: instruction => gateway.planWebDashboardTask(instruction),
+    dispatchWebDashboardTeamTask: (teamId, instruction) => gateway.dispatchWebDashboardTeamTask(teamId, instruction),
+    dispatchWebDashboardRoomTask: (botIds, instruction) => gateway.dispatchWebDashboardRoomTask(botIds, instruction),
+    createWebDashboardRoutine: input => gateway.createWebDashboardRoutine(input),
+    updateRoutine: (routineId, patch) => gateway.updateRoutine(routineId, patch),
+    deleteRoutine: routineId => gateway.deleteRoutine(routineId),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {

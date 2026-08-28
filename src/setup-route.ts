@@ -50,8 +50,24 @@ export interface SetupRouteActions {
   registerLocalWebOwnerSession?: (sessionId: string) => Promise<void>
   saveAndApplySettings?: (settings: HermesBotSettings, appSecret?: string) => Promise<void>
   createWebDashboardBotDraft?: (input: BotCreateDraftToolInput) => Promise<BotCreateDraftToolResult>
+  updateWebDashboardBot?: (input: {
+    handle: string
+    title?: string
+    description?: string
+    capabilities?: readonly string[]
+    soul?: string
+    role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  }) => Promise<{ botId: string; handle: string; version: number; status: string }>
   createWebDashboardTeam?: (name: string, memberBotIds: readonly string[]) => Promise<TeamDefinition>
+  deleteWebDashboardTeam?: (teamId: string) => Promise<void>
   dispatchOwnerWebCommand?: (sessionId: string, text: string) => Promise<void>
+  dispatchWebDashboardTask?: (to: string, instruction: string) => Promise<{ taskId?: string; handle: string }>
+  planWebDashboardTask?: (instruction: string) => Promise<{ workflowId: string; taskId: string; status: string }>
+  dispatchWebDashboardTeamTask?: (teamId: string, instruction: string) => Promise<{ teamId: string; taskId?: string }>
+  dispatchWebDashboardRoomTask?: (botIds: readonly string[], instruction: string) => Promise<{ botIds: string[] }>
+  createWebDashboardRoutine?: (input: { name: string; cron: string; timezone?: string; to: string; instruction: string }) => Promise<{ id: string; name: string; cron: string; timezone: string; status: string; nextRunAt: number }>
+  updateRoutine?: (routineId: string, patch: { enabled?: boolean }) => Promise<{ id: string; status: string }>
+  deleteRoutine?: (routineId: string) => Promise<boolean>
 }
 
 class SetupRequestError extends Error {
@@ -60,12 +76,27 @@ class SetupRequestError extends Error {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
+function corsHeaders(req: IncomingMessage): Record<string, string> {
+  const origin = req.headers.origin
+  if (typeof origin !== 'string' || origin === '' || origin === 'null') return {}
+  return {
+    'access-control-allow-origin': origin,
+    vary: 'Origin',
+  }
+}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  value: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const body = JSON.stringify(value)
   res.writeHead(status, {
     'cache-control': 'no-store',
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
+    ...extraHeaders,
   })
   res.end(body)
 }
@@ -181,6 +212,42 @@ function botDraftInputFromBody(body: Record<string, unknown>): BotCreateDraftToo
   }
 }
 
+function botUpdateInputFromBody(body: Record<string, unknown>): {
+  handle: string
+  title?: string
+  description?: string
+  capabilities?: string[]
+  soul?: string
+  role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+} {
+  const handle = typeof body.handle === 'string' ? body.handle.trim().replace(/^@/u, '').toLowerCase() : ''
+  if (handle === '') throw new SetupRequestError(400, '缺少 Bot handle。')
+  const title = typeof body.title === 'string' ? body.title.trim() : undefined
+  const description = typeof body.description === 'string' ? body.description : undefined
+  const soul = typeof body.soul === 'string' ? body.soul : undefined
+  const capabilities = typeof body.capabilities === 'string'
+    ? body.capabilities.split(/[\s,，、;；\r\n]+/u).map(item => item.trim()).filter(Boolean)
+    : Array.isArray(body.capabilities)
+      ? body.capabilities.map(item => String(item).trim()).filter(Boolean)
+      : undefined
+  const roleRaw = typeof body.fleetRole === 'string' ? body.fleetRole.trim() : undefined
+  let role: 'worker' | 'verifier' | 'synthesizer' | 'generalist' | undefined
+  if (roleRaw === 'worker' || roleRaw === 'verifier' || roleRaw === 'synthesizer' || roleRaw === 'generalist') {
+    role = roleRaw
+  }
+  if (title === undefined && description === undefined && capabilities === undefined && soul === undefined && role === undefined) {
+    throw new SetupRequestError(400, '至少要提供一个需要修改的 Bot 字段。')
+  }
+  return {
+    handle,
+    ...(title === undefined || title === '' ? {} : { title }),
+    ...(description === undefined ? {} : { description: description.trim() }),
+    ...(soul === undefined ? {} : { soul }),
+    ...(capabilities === undefined ? {} : { capabilities }),
+    ...(role === undefined ? {} : { role }),
+  }
+}
+
 async function readSnapshot(
   ctx: Context,
   source: () => HermesBotSettings,
@@ -211,17 +278,31 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  const cors = corsHeaders(req)
+  const replyJson = (status: number, value: unknown): void => {
+    sendJson(res, status, value, cors)
+  }
   if (!isTrustedLocalRequest(req)) {
-    sendJson(res, 403, { error: '此设置接口只接受本机请求。' })
+    replyJson(403, { error: '此设置接口只接受本机请求。' })
+    return
+  }
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      ...cors,
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'accept, content-type',
+      'access-control-max-age': '600',
+    })
+    res.end()
     return
   }
 
   if (req.method === 'GET') {
-    sendJson(res, 200, await readSnapshot(ctx, source, diagnostics))
+    replyJson(200, await readSnapshot(ctx, source, diagnostics))
     return
   }
   if (req.method !== 'POST') {
-    res.writeHead(405, { allow: 'GET, POST' })
+    res.writeHead(405, { allow: 'GET, POST, OPTIONS', ...cors })
     res.end()
     return
   }
@@ -241,8 +322,16 @@ async function handleRequest(
     && action !== 'register_owner_web_session'
     && action !== 'save_fleet_config'
     && action !== 'bot_create_draft'
+    && action !== 'bot_update'
     && action !== 'owner_web_command'
+    && action !== 'fleet_dispatch'
+    && action !== 'fleet_plan'
+    && action !== 'fleet_team_dispatch'
+    && action !== 'fleet_room_dispatch'
+    && action !== 'routine_create'
     && action !== 'team_create'
+    && action !== 'team_delete'
+    && action !== 'routine_update'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -253,7 +342,7 @@ async function handleRequest(
     const candidate = await actions.approvePairing(code)
     if (candidate === undefined) throw new SetupRequestError(404, '配对码不存在、已使用或已过期。请让用户重新给机器人发一条私聊消息。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, {
+    replyJson(200, {
       ...snapshot,
       pairingCandidate: candidate,
       message: '配对成功。该用户会收到提示，请在飞书同一个聊天中发送 /new 开始新的会话；UID 已追加到用户 ID 列表，点击“保存并启动”即可长期保存。',
@@ -268,7 +357,7 @@ async function handleRequest(
     const removed = await actions.revokePairing(platform, userId)
     if (!removed) throw new SetupRequestError(404, '没有找到这条已确认的配对记录。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, { ...snapshot, message: '已取消该用户的配对权限。' })
+    replyJson(200, { ...snapshot, message: '已取消该用户的配对权限。' })
     return
   }
   if (action === 'fleet_approval_resolve') {
@@ -284,7 +373,7 @@ async function handleRequest(
       ? fleet?.registryBots?.find(bot => bot.id === approval.entityId)
       : undefined
     const activationApplied = activationTarget?.status === 'active' && activationTarget.runtimeReady === true
-    sendJson(res, 200, {
+    replyJson(200, {
       ...snapshot,
       message: approval.kind === 'bot-activation'
         ? approval.status === 'approved'
@@ -300,7 +389,7 @@ async function handleRequest(
     if (actions.fleetTaskDetail === undefined) throw new SetupRequestError(503, 'Fleet 任务服务还没有准备好。')
     const taskDetail = await actions.fleetTaskDetail(taskId)
     if (taskDetail === undefined) throw new SetupRequestError(404, '没有找到这个任务。')
-    sendJson(res, 200, { taskDetail })
+    replyJson(200, { taskDetail })
     return
   }
   if (action === 'fleet_task_cancel') {
@@ -310,7 +399,7 @@ async function handleRequest(
     const task = await actions.cancelFleetTask(taskId)
     if (task === undefined) throw new SetupRequestError(409, '任务不存在或已经结束，无法取消。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, { ...snapshot, message: `已取消任务 ${task.id}，并停止关联的待处理或运行中 Bot。` })
+    replyJson(200, { ...snapshot, message: `已取消任务 ${task.id}，并停止关联的待处理或运行中 Bot。` })
     return
   }
   if (action === 'fleet_task_replay') {
@@ -320,7 +409,7 @@ async function handleRequest(
     const replay = await actions.replayFleetTask(taskId)
     if (replay === undefined) throw new SetupRequestError(409, '任务不存在、仍在运行，或者原 Bot 已不可用，无法重放。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, {
+    replyJson(200, {
       ...snapshot,
       replay,
       message: `已创建新的重放任务 ${replay.taskId}；旧任务和历史记录保持不变。`,
@@ -341,7 +430,7 @@ async function handleRequest(
     if (bot === undefined) throw new SetupRequestError(404, '没有找到这个动态 Bot。')
     const snapshot = await readSnapshot(ctx, source, diagnostics)
     const verb = status === 'active' ? '启用' : status === 'disabled' ? '停用' : '删除'
-    sendJson(res, 200, { ...snapshot, message: `已${verb} @${bot.definition.handle}。` })
+    replyJson(200, { ...snapshot, message: `已${verb} @${bot.definition.handle}。` })
     return
   }
   if (action === 'register_owner_web_session') {
@@ -352,7 +441,7 @@ async function handleRequest(
     }
     await actions.registerLocalWebOwnerSession(sessionId)
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, { ...snapshot, message: '已为本机 DSH Web 对话会话安装 Bot 创建工具。' })
+    replyJson(200, { ...snapshot, message: '已为本机 DSH Web 对话会话安装 Bot 创建工具。' })
     return
   }
   if (action === 'save_fleet_config') {
@@ -361,7 +450,7 @@ async function handleRequest(
     const merged = mergeFleetSettings(snapshot.settings, body)
     await actions.saveAndApplySettings(merged)
     const next = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, {
+    replyJson(200, {
       ...next,
       message: 'Fleet 设置已保存并启用；右栏 BOTS 与 Web Bot 创建现已可用。',
     })
@@ -377,7 +466,30 @@ async function handleRequest(
     }
     const draft = await actions.createWebDashboardBotDraft(botDraftInputFromBody(body))
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, { ...snapshot, draft, message: draft.message })
+    replyJson(200, {
+      ...snapshot,
+      draft,
+      message: `已建立 Bot 草稿 @${draft.handle}。请在右栏点击「确认激活」，或创建时选择「创建并激活」。`,
+    })
+    return
+  }
+  if (action === 'bot_update') {
+    if (actions.updateWebDashboardBot === undefined) {
+      throw new SetupRequestError(503, 'Web Bot 更新服务还没有准备好。')
+    }
+    const patch = botUpdateInputFromBody(body)
+    let updated: { botId: string; handle: string; version: number; status: string }
+    try {
+      updated = await actions.updateWebDashboardBot(patch)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, {
+      ...snapshot,
+      bot: updated,
+      message: `已更新 @${updated.handle} 档案（v${updated.version}）。`,
+    })
     return
   }
   if (action === 'owner_web_command') {
@@ -389,7 +501,119 @@ async function handleRequest(
     }
     await actions.dispatchOwnerWebCommand(sessionId, text)
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, { ...snapshot, message: '已向当前 DSH Web 会话注入命令。' })
+    replyJson(200, { ...snapshot, message: '已向当前 DSH Web 会话注入命令。' })
+    return
+  }
+  if (action === 'fleet_dispatch') {
+    const to = typeof body.to === 'string' ? body.to.trim().replace(/^@/u, '').toLowerCase() : ''
+    const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+    if (to === '' || instruction === '') throw new SetupRequestError(400, '缺少 Bot 或任务内容。')
+    if (actions.dispatchWebDashboardTask === undefined) {
+      throw new SetupRequestError(503, 'Web 派任务服务还没有准备好。')
+    }
+    let dispatched: { taskId?: string; handle: string }
+    try {
+      dispatched = await actions.dispatchWebDashboardTask(to, instruction)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, {
+      ...snapshot,
+      dispatch: dispatched,
+      message: `已派任务给 @${dispatched.handle}。`,
+    })
+    return
+  }
+  if (action === 'fleet_plan') {
+    const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+    if (instruction === '') throw new SetupRequestError(400, '缺少要规划的任务。')
+    if (actions.planWebDashboardTask === undefined) {
+      throw new SetupRequestError(503, 'Web 自动规划服务还没有准备好。')
+    }
+    let planned: { workflowId: string; taskId: string; status: string }
+    try {
+      planned = await actions.planWebDashboardTask(instruction)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, {
+      ...snapshot,
+      plan: planned,
+      message: planned.status === 'pending-approval'
+        ? '已生成 Fleet 执行计划，请在右栏点批准。'
+        : '已生成并启动 Fleet 计划。',
+    })
+    return
+  }
+  if (action === 'fleet_team_dispatch') {
+    const teamId = typeof body.teamId === 'string' ? body.teamId.trim().replace(/^@/u, '') : ''
+    const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+    if (teamId === '' || instruction === '') throw new SetupRequestError(400, '缺少 Team 或任务内容。')
+    if (actions.dispatchWebDashboardTeamTask === undefined) {
+      throw new SetupRequestError(503, 'Web Team 派任务服务还没有准备好。')
+    }
+    try {
+      await actions.dispatchWebDashboardTeamTask(teamId, instruction)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, { ...snapshot, message: `已向 Team 发送任务。` })
+    return
+  }
+  if (action === 'fleet_room_dispatch') {
+    const botIds = Array.isArray(body.botIds)
+      ? body.botIds.map(item => String(item).trim().replace(/^@/u, '').toLowerCase()).filter(Boolean)
+      : typeof body.botIds === 'string'
+        ? body.botIds.split(/[\s,，、;；]+/u).map(item => item.trim().replace(/^@/u, '').toLowerCase()).filter(Boolean)
+        : []
+    const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+    if (botIds.length === 0 || instruction === '') throw new SetupRequestError(400, '缺少 Bot 或任务内容。')
+    if (actions.dispatchWebDashboardRoomTask === undefined) {
+      throw new SetupRequestError(503, 'Web 群聊协作服务还没有准备好。')
+    }
+    try {
+      await actions.dispatchWebDashboardRoomTask(botIds, instruction)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, { ...snapshot, message: '已继续群聊协作。' })
+    return
+  }
+  if (action === 'routine_create') {
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const cron = typeof body.cron === 'string' ? body.cron.trim() : ''
+    const timezone = typeof body.timezone === 'string' ? body.timezone.trim() : 'Asia/Shanghai'
+    const to = typeof body.to === 'string' ? body.to.trim().replace(/^@/u, '').toLowerCase() : ''
+    const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+    if (name === '' || cron === '' || to === '' || instruction === '') {
+      throw new SetupRequestError(400, '缺少名称、时间表、Bot 或任务内容。')
+    }
+    if (actions.createWebDashboardRoutine === undefined) {
+      throw new SetupRequestError(503, '定时任务服务还没有准备好。')
+    }
+    let routine: { id: string; name: string; cron: string; timezone: string; status: string; nextRunAt: number }
+    try {
+      routine = await actions.createWebDashboardRoutine({ name, cron, timezone, to, instruction })
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, {
+      ...snapshot,
+      routine: {
+        id: routine.id,
+        name: routine.name,
+        cron: routine.cron,
+        timezone: routine.timezone,
+        status: routine.status,
+        nextRunAt: routine.nextRunAt,
+      },
+      message: `已创建定时任务「${routine.name}」，下次 ${new Date(routine.nextRunAt).toLocaleString()}。`,
+    })
     return
   }
   if (action === 'team_create') {
@@ -407,7 +631,7 @@ async function handleRequest(
     }
     const team = await actions.createWebDashboardTeam(name, members)
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    sendJson(res, 200, {
+    replyJson(200, {
       ...snapshot,
       team: {
         id: team.id,
@@ -415,7 +639,48 @@ async function handleRequest(
         memberBotIds: [...team.memberBotIds],
         status: team.status,
       },
-      message: `Team ${team.id} 已创建，可在对话中使用 @${team.id} 或 @team 协作。`,
+      message: `Team「${team.name}」已就绪，可在群组里点「发任务」开始协作。`,
+    })
+    return
+  }
+  if (action === 'team_delete') {
+    const teamId = typeof body.teamId === 'string' ? body.teamId.trim() : ''
+    if (teamId === '') throw new SetupRequestError(400, '缺少 Team。')
+    if (actions.deleteWebDashboardTeam === undefined) throw new SetupRequestError(503, 'Team 删除服务还没有准备好。')
+    try {
+      await actions.deleteWebDashboardTeam(teamId)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, { ...snapshot, message: '已删除该 Team。' })
+    return
+  }
+  if (action === 'routine_update') {
+    const routineId = typeof body.routineId === 'string' ? body.routineId.trim() : ''
+    if (routineId === '') throw new SetupRequestError(400, '缺少定时任务 ID。')
+    const remove = body.delete === true
+    if (remove) {
+      if (actions.deleteRoutine === undefined) throw new SetupRequestError(503, '定时任务服务还没有准备好。')
+      const deleted = await actions.deleteRoutine(routineId)
+      if (!deleted) throw new SetupRequestError(404, '没有找到这个定时任务。')
+      const snapshot = await readSnapshot(ctx, source, diagnostics)
+      replyJson(200, { ...snapshot, message: '已删除该定时任务。' })
+      return
+    }
+    const enabled = body.enabled === true ? true : body.enabled === false ? false : undefined
+    if (enabled === undefined) throw new SetupRequestError(400, '请指定启用、停用或删除。')
+    if (actions.updateRoutine === undefined) throw new SetupRequestError(503, '定时任务服务还没有准备好。')
+    let routine: { id: string; status: string }
+    try {
+      routine = await actions.updateRoutine(routineId, { enabled })
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, {
+      ...snapshot,
+      message: enabled ? `已启用定时任务 ${routine.id}。` : `已停用定时任务 ${routine.id}。`,
     })
     return
   }
@@ -495,7 +760,7 @@ async function handleRequest(
   const discovery = action === 'diagnose' ? actions.beginDiscovery!() : undefined
   if (action === 'save') actions.clearDiscovery?.()
   const snapshot = await readSnapshot(ctx, source, diagnostics)
-  sendJson(res, 200, {
+  replyJson(200, {
     ...snapshot,
     ...(discovery === undefined
       ? { message: '已保存，机器人正在自动启动。请在飞书同一个聊天中发送 /new 开始新的会话，然后再正常使用。' }
@@ -517,11 +782,11 @@ export function installSetupRoute(
       handler: (req, res) => {
         void handleRequest(ctx, source, diagnostics, actions, req, res).catch(error => {
           if (error instanceof SetupRequestError) {
-            sendJson(res, error.status, { error: error.message })
+            sendJson(res, error.status, { error: error.message }, corsHeaders(req))
             return
           }
           webCtx.logger.error(error instanceof Error ? error : new Error(String(error)))
-          sendJson(res, 500, { error: '保存飞书机器人设置时发生内部错误。' })
+          sendJson(res, 500, { error: '保存飞书机器人设置时发生内部错误。' }, corsHeaders(req))
         })
       },
     }

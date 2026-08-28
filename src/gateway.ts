@@ -201,9 +201,21 @@ const LOCAL_WEB_TARGET: BotTarget = {
 
 const LOCAL_WEB_PLUGIN = 'dsh-hermes-bot'
 const OWNER_WEB_FLEET_COMMANDS = new Set(['fleet', 'approve', 'reject'])
+const CRON_BOT_WORKFLOW_PREFIX = 'cron-bot:'
 
 function splitBotLabels(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；]+/u).map(item => item.trim()).filter(Boolean))]
+}
+
+function sameBotSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  const expected = new Set(left.map(id => id.toLowerCase()))
+  return right.every(id => expected.has(id.toLowerCase()))
+}
+
+function groupRoomTitle(participants: readonly string[]): string {
+  const labels = participants.map(id => '@' + id)
+  return labels.length === 0 ? '群聊' : `群聊 · ${labels.join('、')}`
 }
 
 function sessionKey(sessionId: unknown): string {
@@ -989,7 +1001,22 @@ export class BotGateway {
         runs: taskSnapshot.runs,
         handoffs: taskSnapshot.handoffs,
         workflows: taskSnapshot.workflows,
-        approvals: approvals.slice(0, 50),
+        approvals: (() => {
+          const latestPending = new Map<string, (typeof approvals)[number]>()
+          const rest: typeof approvals = []
+          for (const approval of approvals) {
+            if (approval.status === 'pending') {
+              const key = `${approval.kind}:${approval.entityId}`
+              const prev = latestPending.get(key)
+              if (prev === undefined || approval.createdAt >= prev.createdAt) latestPending.set(key, approval)
+            } else {
+              rest.push(approval)
+            }
+          }
+          return [...latestPending.values(), ...rest]
+            .sort((left, right) => right.createdAt - left.createdAt)
+            .slice(0, 40)
+        })(),
         registryBots: registryEntries.map(entry => {
           const runtimeRef = this.profileRuntimeRefs.get(entry.definition.handle)
           const runtimeReady = runtimeProfileFor(entry) !== undefined
@@ -1022,6 +1049,8 @@ export class BotGateway {
             revision: entry.definition.currentRevision,
             fleetRole: entry.revision.fleetRole,
             capabilities: [...entry.revision.capabilities],
+            ...(entry.revision.description === undefined ? {} : { description: entry.revision.description }),
+            ...(entry.revision.soul === undefined ? {} : { soul: entry.revision.soul }),
             runtimeReady,
             fleetMembership,
             membershipReason,
@@ -1035,19 +1064,35 @@ export class BotGateway {
             ...(pendingActivation.get(entry.definition.id)?.code === undefined
               ? {}
               : { activationCode: pendingActivation.get(entry.definition.id)!.code }),
+            ...(this.directory.get(entry.definition.handle)?.canonicalSessionId === undefined
+              ? {}
+              : { canonicalSessionId: this.directory.get(entry.definition.handle)!.canonicalSessionId }),
             updatedAt: entry.definition.updatedAt,
           }
         }),
-        rooms: rooms.slice(-20).reverse().map(room => ({
-          id: room.id,
-          taskId: room.taskId,
-          participants: [...room.participants],
-          epoch: room.epoch,
-          roundCount: room.roundCount,
-          messageCount: room.messageCount,
-          closed: room.closed,
-          updatedAt: room.updatedAt,
-        })),
+        rooms: (() => {
+          const latest = new Map<string, (typeof rooms)[number]>()
+          for (const room of rooms) {
+            if (room.closed === true) continue
+            const key = [...room.participants].map(id => id.toLowerCase()).sort().join(',')
+            const prev = latest.get(key)
+            if (prev === undefined || room.updatedAt >= prev.updatedAt) latest.set(key, room)
+          }
+          return [...latest.values()]
+            .sort((left, right) => right.updatedAt - left.updatedAt)
+            .slice(0, 12)
+            .map(room => ({
+              id: room.id,
+              taskId: room.taskId,
+              title: groupRoomTitle(room.participants),
+              participants: [...room.participants],
+              epoch: room.epoch,
+              roundCount: room.roundCount,
+              messageCount: room.messageCount,
+              closed: room.closed,
+              updatedAt: room.updatedAt,
+            }))
+        })(),
         deadLetters: mailbox.deadLetters.map(item => ({
           id: item.id,
           state: item.state,
@@ -1060,7 +1105,10 @@ export class BotGateway {
           },
           updatedAt: item.updatedAt,
         })),
-        teams: visibleTeams.slice(0, 30).map(team => ({
+        teams: visibleTeams
+          .filter(team => team.status === 'active')
+          .slice(0, 30)
+          .map(team => ({
           id: team.id,
           name: team.name,
           status: team.status,
@@ -1293,6 +1341,16 @@ export class BotGateway {
   }
 
   private async launchRoutine(launch: RoutineLaunch): Promise<RoutineLaunchResult> {
+    const to = typeof launch.inputs.to === 'string' ? launch.inputs.to.trim().replace(/^@/u, '').toLowerCase() : ''
+    const instruction = typeof launch.inputs.instruction === 'string' ? launch.inputs.instruction.trim() : ''
+    if (launch.workflowId.startsWith(CRON_BOT_WORKFLOW_PREFIX) && to !== '' && instruction !== '') {
+      try {
+        const dispatched = await this.dispatchWebDashboardTask(to, instruction)
+        return { status: 'started', ...(dispatched.taskId === undefined ? {} : { runId: dispatched.taskId }) }
+      } catch (error: unknown) {
+        return { status: 'failed', error: String(error), retryable: true }
+      }
+    }
     try {
       const replyTarget = launch.replyTarget ?? { platform: 'internal', chatId: launch.ownerId }
       const result = await this.launchWorkflowDefinition(
@@ -2245,6 +2303,19 @@ export class BotGateway {
       }
       const current = await this.registry.get(botId)
       if (current === undefined || current.definition.source === 'config') return undefined
+      if (current.definition.status === 'draft' && status === 'active') {
+        if (!this.isLocalOwner(actor)) {
+          throw new Error('草稿必须先通过 8 位确认码激活；不需要的草稿可以直接删除。')
+        }
+        const approval = await this.ensureBotActivationApproval(current, actor)
+        const resolved = await this.resolveFleetApprovalUnlocked(approval.code, 'approved', actor)
+        if (resolved?.status !== 'approved') {
+          throw new Error('激活草稿失败。请再点一次确认激活。')
+        }
+        const activated = await this.registry.get(botId)
+        if (activated === undefined) throw new Error('激活后找不到该 Bot。')
+        return activated
+      }
       if (current.definition.status === 'draft' && status !== 'deleted') {
         throw new Error('草稿必须先通过 8 位确认码激活；不需要的草稿可以直接删除。')
       }
@@ -2546,9 +2617,179 @@ export class BotGateway {
     }, id))
   }
 
+  /** Trusted local-dashboard Bot task dispatch (no owner-session command injection). */
+  public async dispatchWebDashboardTask(to: string, instruction: string): Promise<{ taskId?: string; handle: string }> {
+    const handle = to.trim().replace(/^@/u, '').toLowerCase()
+    const text = instruction.trim()
+    if (handle === '' || text === '') throw new Error('Bot 和任务内容不能为空。')
+    const envelope = await this.sendBotMessage({
+      from: actorForTarget(LOCAL_WEB_TARGET),
+      to: handle,
+      instruction: text,
+      replyTarget: LOCAL_WEB_TARGET,
+      title: text.slice(0, 80),
+    })
+    return { handle, taskId: envelope.taskId }
+  }
+
+  /** Trusted local-dashboard Fleet auto-plan (no `/fleet` command injection). */
+  public async planWebDashboardTask(instruction: string): Promise<{ workflowId: string; taskId: string; status: string }> {
+    const text = instruction.trim()
+    if (text === '') throw new Error('任务内容不能为空。')
+    if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet 当前未启用，请先在本机设置页开启。')
+    if (this.config.collaboration?.autoPlanner === false) throw new Error('自动 Fleet Planner 当前未启用。')
+    const message: InboundMessage = {
+      id: `local-web:plan:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    return this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法创建 Fleet 计划（重复请求）。')
+      }
+      const sessionId = this.latestLocalWebOwnerSession() ?? 'local-web:dashboard'
+      const claimed = await this.wal.claim(accepted.item.id, sessionId)
+      if (!claimed) throw new Error('无法锁定 Fleet 计划。')
+      const plan = this.planner.plan(text, this.directory, LOCAL_WEB_TARGET, this.config.collaboration?.maxGroupBots ?? 6)
+      const plannedBots = [...new Set([
+        ...plan.workerBotIds,
+        ...(plan.verifierBotId === undefined ? [] : [plan.verifierBotId]),
+        plan.synthesizerBotId,
+      ])]
+      const workflow = await this.createFleetWorkflow(
+        message,
+        accepted.item.id,
+        actorForTarget(LOCAL_WEB_TARGET),
+        text,
+        plan,
+        this.requiresFleetApproval(plannedBots, true),
+      )
+      return { workflowId: workflow.id, taskId: workflow.taskId, status: workflow.status }
+    })
+  }
+
+  /** Trusted local-dashboard Team task (no owner-session @mention injection). */
+  public async dispatchWebDashboardTeamTask(teamId: string, instruction: string): Promise<{ teamId: string; taskId?: string }> {
+    const reference = teamId.trim().replace(/^@/u, '')
+    const text = instruction.trim()
+    if (reference === '' || text === '') throw new Error('Team 和任务内容不能为空。')
+    const binding = await this.bindingForLocalWeb(LOCAL_WEB_TARGET)
+    if (binding === undefined) throw new Error('请先点「Owner 会话」，再给 Team 发任务。')
+    const message: InboundMessage = {
+      id: `local-web:team:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    await this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法发送 Team 任务（重复请求）。')
+      }
+      await this.handleTeamMention(message, accepted.item.id, binding, reference, text)
+    })
+    return { teamId: reference }
+  }
+
+  /** Trusted local-dashboard Group Room continuation (no owner-session @mention injection). */
+  public async dispatchWebDashboardRoomTask(botIds: readonly string[], instruction: string): Promise<{ botIds: string[] }> {
+    const ids = [...new Set(botIds.map(value => value.trim().replace(/^@/u, '').toLowerCase()).filter(Boolean))]
+    const text = instruction.trim()
+    if (ids.length === 0 || text === '') throw new Error('Bot 和任务内容不能为空。')
+    const binding = await this.bindingForLocalWeb(LOCAL_WEB_TARGET)
+    if (binding === undefined) throw new Error('请先点「Owner 会话」，再继续群聊协作。')
+    const message: InboundMessage = {
+      id: `local-web:room:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    await this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法继续群聊协作（重复请求）。')
+      }
+      await this.handleCollaborationRequest(message, accepted.item.id, binding, ids, text)
+    })
+    return { botIds: ids }
+  }
+
+  /** Trusted local-dashboard Cron: recurring Bot task, no slash commands. */
+  public async createWebDashboardRoutine(input: {
+    name: string
+    cron: string
+    timezone?: string
+    to: string
+    instruction: string
+  }): Promise<RoutineRecord> {
+    const name = input.name.trim()
+    const cron = input.cron.trim()
+    const to = input.to.trim().replace(/^@/u, '').toLowerCase()
+    const instruction = input.instruction.trim()
+    if (name === '' || cron === '' || to === '' || instruction === '') {
+      throw new Error('名称、时间表、Bot 和任务内容不能为空。')
+    }
+    if (!this.directory.canInvoke(to, LOCAL_WEB_TARGET)) {
+      throw new Error(`Bot @${to} 不存在或当前用户无权使用。`)
+    }
+    return this.createRoutine({
+      name,
+      ownerId: actorForTarget(LOCAL_WEB_TARGET),
+      workflowId: CRON_BOT_WORKFLOW_PREFIX + to,
+      cron,
+      timezone: input.timezone?.trim() || 'Asia/Shanghai',
+      inputs: { to, instruction },
+      replyTarget: LOCAL_WEB_TARGET,
+    })
+  }
+
   /** Trusted local-dashboard Bot draft creation (no Feishu/Telegram binding required). */
   public async createWebDashboardBotDraft(input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
     return this.createDynamicBotDraft(input, LOCAL_WEB_TARGET)
+  }
+
+  /**
+   * Trusted local-dashboard Bot archive edit. Works for both draft and active
+   * registry Bots owned by the local web owner; never requires `/bot edit`.
+   */
+  public async updateWebDashboardBot(input: {
+    readonly handle: string
+    readonly title?: string
+    readonly description?: string
+    readonly capabilities?: readonly string[]
+    readonly soul?: string
+    readonly role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  }): Promise<{ botId: string; handle: string; version: number; status: string }> {
+    return this.withBotNamespaceMutation(async () => {
+      if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用，请先在本机 Fleet 设置中开启。')
+      const actor = actorForTarget(LOCAL_WEB_TARGET)
+      const handle = input.handle.trim().replace(/^@/u, '').toLowerCase()
+      if (handle === '') throw new Error('Bot handle 不能为空。')
+      const entry = await this.registry.getByHandle(handle)
+      if (entry === undefined || entry.definition.source === 'config' || entry.definition.ownerId !== actor) {
+        throw new Error(`找不到当前用户的动态 Bot：@${handle}`)
+      }
+      if (entry.definition.status === 'deleted') throw new Error('已删除的 Bot 不能修改。')
+      const patch: Partial<BotRevisionDraft> = {
+        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(input.description === undefined ? {} : { description: input.description }),
+        ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
+        ...(input.soul === undefined ? {} : { soul: input.soul }),
+        ...(input.role === undefined ? {} : { fleetRole: input.role }),
+        changeSummary: 'Updated from the web dashboard',
+      }
+      if (Object.keys(patch).length === 1) throw new Error('至少要提供一个需要修改的 Bot 字段')
+      const revised = await this.registry.revise(entry.definition.id, patch, actor, entry.definition.version)
+      if (revised.definition.status === 'active') await this.refreshBotDirectory()
+      return {
+        botId: revised.definition.id,
+        handle: revised.definition.handle,
+        version: revised.definition.version,
+        status: revised.definition.status,
+      }
+    })
   }
 
   /** Trusted local-dashboard Team creation for the web BOTS panel. */
@@ -2561,6 +2802,9 @@ export class BotGateway {
         throw new Error(`Bot @${botId} 不存在或当前用户无权使用。`)
       }
     }
+    const existing = (await this.teams.listTeams({ actorId: actor }))
+      .find(team => team.status === 'active' && team.name === name.trim() && sameBotSet(team.memberBotIds, members))
+    if (existing !== undefined) return existing
     return this.teams.createTeam({
       name: name.trim(),
       scope: 'user',
@@ -2568,6 +2812,17 @@ export class BotGateway {
       memberBotIds: members,
       maxConcurrency: Math.min(3, members.length),
     }, actor)
+  }
+
+  /** Trusted local-dashboard Team deletion (soft-delete; keeps the durable record). */
+  public async deleteWebDashboardTeam(teamId: string): Promise<void> {
+    const actor = actorForTarget(LOCAL_WEB_TARGET)
+    const id = teamId.trim()
+    if (id === '') throw new Error('缺少 Team。')
+    const team = await this.teams.getTeam(id)
+    if (team === undefined || team.ownerId !== actor) throw new Error('找不到这个 Team。')
+    if (team.status === 'deleted') return
+    await this.teams.updateTeam(team.id, { status: 'deleted' }, actor, team.version)
   }
 
   private latestLocalWebOwnerSession(): string | undefined {
@@ -3655,7 +3910,7 @@ export class BotGateway {
       const suffix = skipped.length > 0
         ? ` 未路由成员：${skipped.map(botId => '@' + botId).join('、')}。`
         : ''
-      await this.sendText(
+      await this.sendAck(
         message.target,
         roomId === undefined
           ? `已将 Team ${route.team.name} 的任务交给 ${route.participantBotIds.map(botId => '@' + botId).join('、')}。任务 ID：${task.id}。${suffix}`
@@ -3818,7 +4073,7 @@ export class BotGateway {
         roomId: roomId ?? null,
       }, envelope.correlationId)
       const label = validBots.map(botId => `@${botId}`).join('、')
-      await this.sendText(
+      await this.sendAck(
         message.target,
         roomId === undefined
           ? `已将任务交给 ${label}。任务 ID：${task.id}`
@@ -7088,6 +7343,15 @@ export class BotGateway {
     }
     const delivered = this.bridge.deliverLocalWebNotice(sessionId as SessionId, text)
     if (!delivered) throw new Error('could not deliver local DSH web collaboration reply into the owner session')
+  }
+
+  private async sendAck(target: BotTarget, text: string, key: string): Promise<void> {
+    await this.outbox.enqueue({ key, target, text })
+    if (target.platform === 'local') {
+      void this.outbox.flush().catch(error => this.log('warn', 'Local dashboard ack flush failed: ' + String(error)))
+      return
+    }
+    await this.outbox.flush()
   }
 
   private async sendText(target: BotTarget, text: string, key: string): Promise<void> {
