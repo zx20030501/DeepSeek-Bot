@@ -136,6 +136,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
     replayFleetTask: taskId => gateway.replayFleetTask(taskId),
     setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
+    registerLocalWebOwnerSession: sessionId => gateway.registerLocalWebOwnerSession(sessionId),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
@@ -151,7 +152,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
     requestGatewayRefresh()
   })
 
-  ctx.on('session/event', (session, event) => gateway.onSessionEvent(session, event))
+  ctx.on('session/event', (session, event) => {
+    gateway.tryRegisterOwnerWebSession(session, event)
+    gateway.onSessionEvent(session, event)
+  })
   ctx.effect(() => {
     void gateway.start().catch(error => {
       logger?.error?.(`[dsh-hermes-bot] startup failed: ${String(error)}`)

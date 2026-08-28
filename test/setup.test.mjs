@@ -94,6 +94,7 @@ test('Fleet roster settings round-trip roles, ACLs, session isolation, and limit
   assert.deepEqual(settings.collaboration.features, {
     dynamicRegistry: true,
     chatBotCreation: false,
+    webChatBotCreation: false,
     peerMessaging: true,
     managerAgent: true,
     savedWorkflows: true,
@@ -111,6 +112,7 @@ test('Fleet roster settings round-trip roles, ACLs, session isolation, and limit
   assert.deepEqual(next.collaboration?.features, {
     dynamicRegistry: true,
     chatBotCreation: true,
+    webChatBotCreation: false,
     peerMessaging: true,
     managerAgent: true,
     savedWorkflows: true,
@@ -130,6 +132,7 @@ test('pre-Phase-2 saved Fleet settings inherit secure-off dynamic Bot features',
   assert.deepEqual(next.collaboration?.features, {
     dynamicRegistry: false,
     chatBotCreation: false,
+    webChatBotCreation: false,
     peerMessaging: false,
     managerAgent: false,
     savedWorkflows: false,

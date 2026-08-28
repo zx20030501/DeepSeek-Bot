@@ -220,6 +220,8 @@ export interface BotCollaborationConfig {
 export interface BotFleetFeatureFlags {
   readonly dynamicRegistry?: boolean
   readonly chatBotCreation?: boolean
+  /** Allow bot creation from DSH web chat without requiring dynamicRegistry. */
+  readonly webChatBotCreation?: boolean
   readonly peerMessaging?: boolean
   readonly managerAgent?: boolean
   readonly savedWorkflows?: boolean

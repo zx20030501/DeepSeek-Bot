@@ -96,7 +96,10 @@ export function agentOptions(ctx: Context, profile: BotProfile, modelOverride?: 
 /** The only module that knows how Bot messages enter DeepSeek Harness. */
 export class HarnessBridge {
   private readonly agents: AgentRegistryLike
-  private readonly configuredAgents = new WeakSet<object>()
+  /** Bot worker / internal Fleet runs (fleet handoff, etc.). */
+  private readonly internalToolsConfigured = new WeakSet<object>()
+  /** Owner DSH web user sessions (bot_create_draft / bot_update_draft). */
+  private readonly userToolsConfigured = new WeakSet<object>()
 
   public constructor(private readonly ctx: Context) {
     const agents = service<AgentRegistryLike>(ctx, 'agents')
@@ -133,9 +136,8 @@ export class HarnessBridge {
       const resumed = await this.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: options,
-        ...(setup === undefined ? {} : { setup }),
       })
-      if (setup !== undefined) this.configuredAgents.add(resumed.agent as object)
+      await this.configureAgent(resumed.agent, setup)
       return resumed.agent
     } catch (resumeError: unknown) {
       try {
@@ -143,9 +145,8 @@ export class HarnessBridge {
           sessionId,
           agentOptions: options,
           meta: { agentPreset: profile.name, cwd: process.cwd() },
-          ...(setup === undefined ? {} : { setup }),
         })
-        if (setup !== undefined) this.configuredAgents.add(created.agent as object)
+        await this.configureAgent(created.agent, setup)
         return created.agent
       } catch (createError: unknown) {
         throw new Error(`could not resume or create DSH session: ${String(createError)} (resume: ${String(resumeError)})`)
@@ -154,11 +155,29 @@ export class HarnessBridge {
   }
 
   private async configureAgent(agent: Agent, setup?: AgentSetupLike): Promise<void> {
-    if (setup === undefined || this.configuredAgents.has(agent as object)) return
+    if (setup === undefined || this.internalToolsConfigured.has(agent as object)) return
+    if (this.userToolsConfigured.has(agent as object)) return
     const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
     if (agentContext === undefined) return
     await setup(agentContext)
-    this.configuredAgents.add(agent as object)
+    this.internalToolsConfigured.add(agent as object)
+  }
+
+  /**
+   * Install owner-only user Fleet tools on an existing native DSH web Agent.
+   * Uses a separate configured set from internal/worker tool installation so
+   * workflow agents are never blocked from receiving fleet handoff tools.
+   */
+  public async configureUserFleetTools(sessionId: SessionId, setup: AgentSetupLike): Promise<boolean> {
+    if (String(sessionId).startsWith('hermes-bot-')) return false
+    const agent = this.agents.get(sessionId)
+    if (!agent || this.userToolsConfigured.has(agent as object)) return false
+    if (this.internalToolsConfigured.has(agent as object)) return false
+    const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
+    if (agentContext === undefined) return false
+    await setup(agentContext)
+    this.userToolsConfigured.add(agent as object)
+    return true
   }
 
   public async followup(agent: Agent, text: string): Promise<void> {
