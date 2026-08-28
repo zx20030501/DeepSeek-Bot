@@ -488,6 +488,8 @@ export class BotGateway {
   private readonly sessionTargets = new Map<string, BotTarget>()
   /** DSH web owner sessions positively registered for in-chat bot creation tools. */
   private readonly localWebOwnerSessions = new Set<string>()
+  /** Sessions already evaluated for owner-web registration (turn/start only). */
+  private readonly ownerWebRegistrationChecked = new Set<string>()
   private readonly internalRuns = new Map<string, InternalRun>()
   private readonly internalRunBySession = new Map<string, string>()
   private readonly activeBotRuns = new Map<string, string>()
@@ -2447,9 +2449,53 @@ export class BotGateway {
   private isLocalWebOwnerSession(sessionId: string): boolean {
     const id = sessionKey(sessionId)
     if (this.internalRunBySession.has(id)) return false
+    if (this.isHermesBotWorkerSession(id)) return false
     if (this.localWebOwnerSessions.has(id)) return true
     const target = this.sessionTargets.get(id) ?? this.state.snapshot().sessions[id]
+    if (target?.platform === 'feishu' || target?.platform === 'telegram') return false
     return target?.platform === 'local'
+  }
+
+  private isHermesBotWorkerSession(sessionId: string): boolean {
+    return sessionId.startsWith('hermes-bot-')
+  }
+
+  private sessionAgentPreset(sessionId: string): string | undefined {
+    const agent = this.bridge?.getAgent(sessionId as SessionId)
+    if (!agent) return undefined
+    const header = (agent.session as unknown as { readonly header?: { readonly agentPreset?: unknown } }).header
+    const preset = header?.agentPreset
+    return typeof preset === 'string' && preset.length > 0 ? preset : undefined
+  }
+
+  private shouldRegisterOwnerWebSession(sessionId: string): boolean {
+    if (!this.webDynamicBotCreationEnabled()) return false
+    if (this.internalRunBySession.has(sessionId)) return false
+    if (this.isHermesBotWorkerSession(sessionId)) return false
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    if (target?.platform === 'feishu' || target?.platform === 'telegram') return false
+    if (target?.platform === 'local') return true
+    const preset = this.sessionAgentPreset(sessionId)
+    if (preset !== undefined) return false
+    // Positive: native DSH owner programming session (Harness agentPreset absent).
+    return true
+  }
+
+  /**
+   * Observe a Harness session/event and register owner DSH web sessions once.
+   * Called from plugin index.ts — never infers identity from a missing target alone.
+   */
+  public tryRegisterOwnerWebSession(session: SessionLike, event: unknown): void {
+    if (!this.webDynamicBotCreationEnabled()) return
+    const record = asRecord(event)
+    if (record.type !== 'turn/start') return
+    const id = sessionKey(session.id)
+    if (this.ownerWebRegistrationChecked.has(id)) return
+    this.ownerWebRegistrationChecked.add(id)
+    if (!this.shouldRegisterOwnerWebSession(id)) return
+    void this.registerLocalWebOwnerSession(id).catch(error => {
+      this.log('warn', `owner web session tool registration failed: ${String(error)}`)
+    })
   }
 
   /**
@@ -2457,8 +2503,9 @@ export class BotGateway {
    * Called from local inbound (platform local) or DSH web session start hooks.
    */
   public async registerLocalWebOwnerSession(sessionId: string): Promise<void> {
+    if (!this.webDynamicBotCreationEnabled()) return
     const id = sessionKey(sessionId)
-    if (this.internalRunBySession.has(id)) return
+    if (!this.shouldRegisterOwnerWebSession(id)) return
     this.localWebOwnerSessions.add(id)
     await this.ensureLocalWebOwnerTools(id)
   }
@@ -3303,8 +3350,8 @@ export class BotGateway {
       binding = await this.rotateBinding(message.target, binding, fallback, null)
     }
     await this.rememberSessionTarget(binding.sessionId, message.target)
-    if (message.target.platform === 'local') {
-      await this.registerLocalWebOwnerSession(binding.sessionId)
+    if (message.target.platform === 'local' && this.webDynamicBotCreationEnabled()) {
+      void this.registerLocalWebOwnerSession(binding.sessionId)
     }
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)

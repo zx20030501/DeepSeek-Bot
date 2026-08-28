@@ -2456,9 +2456,8 @@ test('createBotDraftFromSession rejects Feishu-bound session even when webChatBo
   }
 })
 
-test('native DSH web user agent receives bot_create_draft tools when registered as owner session', async () => {
-  // CRO requirement: DSH web programming chat sessions receive bot creation tools
-  // only after positive owner registration — never inferred from missing transport target.
+test('native DSH web user agent receives bot_create_draft tools via owner session registration hook', async () => {
+  // Production path: index.ts calls tryRegisterOwnerWebSession on turn/start.
   const root = await mkdtemp(join(tmpdir(), 'deepseek-native-web-tools-'))
   let gateway
   try {
@@ -2494,7 +2493,9 @@ test('native DSH web user agent receives bot_create_draft tools when registered 
     })
     await gateway.start()
     const sessionId = 'native-web-session-12345'
-    await gateway.registerLocalWebOwnerSession(sessionId)
+    const session = { id: sessionId, events: [], seq: 0 }
+    gateway.tryRegisterOwnerWebSession(session, { type: 'turn/start', data: { turn: 1 } })
+    await new Promise(resolve => setTimeout(resolve, 50))
     assert.ok(registeredTools.has('bot_create_draft'), 'Native DSH web session should receive bot_create_draft tool')
     assert.ok(registeredTools.has('bot_update_draft'), 'Native DSH web session should receive bot_update_draft tool')
   } finally {
