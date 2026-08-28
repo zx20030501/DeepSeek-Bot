@@ -1,6 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { JsonlJournal } from './jsonl.js'
-import { validatePeerPayload } from './peer-messaging.js'
+import { validatePeerEnvelope } from './peer-messaging.js'
 import type { BotMessageEnvelope } from './types.js'
 
 export const REMOTE_TRANSPORT_SCHEMA_VERSION = 1 as const
@@ -109,44 +109,13 @@ function integer(value: unknown, field: string, minimum: number, maximum = Numbe
 }
 
 function envelopeFrom(value: unknown, policy: RemoteTransportPolicy): BotMessageEnvelope {
-  const input = record(value)
-  if (!input) throw new RemoteTransportValidationError('invalid-envelope', 'envelope must be an object')
-  const kind = input.kind
-  if (!['request', 'reply', 'report', 'event', 'cancel', 'response', 'handoff'].includes(String(kind))) {
-    throw new RemoteTransportValidationError('invalid-envelope-kind', 'envelope.kind is not supported')
-  }
-  const from = requiredString(input.from, 'envelope.from')
-  const to = requiredString(input.to, 'envelope.to')
-  const taskId = requiredString(input.taskId, 'envelope.taskId')
-  const runId = requiredString(input.runId, 'envelope.runId')
-  const attemptId = requiredString(input.attemptId, 'envelope.attemptId')
-  const correlationId = requiredString(input.correlationId, 'envelope.correlationId')
-  const payload = record(input.payload)
-  if (!payload) throw new RemoteTransportValidationError('invalid-envelope-payload', 'envelope.payload must be an object')
   try {
-    validatePeerPayload(payload, policy.maxPayloadBytes)
+    return validatePeerEnvelope(value, { peerMaxPayloadBytes: policy.maxPayloadBytes })
   } catch (error: unknown) {
     throw new RemoteTransportValidationError(
-      'invalid-envelope-payload',
+      'invalid-envelope',
       error instanceof Error ? error.message : 'envelope.payload failed Peer Message validation',
     )
-  }
-  if (input.createdAt !== undefined) integer(input.createdAt, 'envelope.createdAt', 0)
-  if (input.expiresAt !== undefined) integer(input.expiresAt, 'envelope.expiresAt', 1)
-  if (typeof input.expiresAt === 'number' && typeof input.createdAt === 'number' && input.expiresAt <= input.createdAt) {
-    throw new RemoteTransportValidationError('invalid-envelope-time', 'envelope.expiresAt must be after envelope.createdAt')
-  }
-  const cloned = JSON.parse(JSON.stringify(input)) as BotMessageEnvelope
-  return {
-    ...cloned,
-    kind: kind as BotMessageEnvelope['kind'],
-    from,
-    to,
-    taskId,
-    runId,
-    attemptId,
-    correlationId,
-    payload: JSON.parse(JSON.stringify(payload)) as Record<string, unknown>,
   }
 }
 
@@ -237,6 +206,9 @@ export function validateRemoteTransportMessage(
   const envelope = envelopeFrom(input.envelope, policy)
   if (envelope.correlationId !== correlationId) {
     throw new RemoteTransportValidationError('correlation-mismatch', 'remote correlationId must match envelope.correlationId')
+  }
+  if (envelope.expiresAt !== undefined && expiresAt > envelope.expiresAt) {
+    throw new RemoteTransportValidationError('envelope-expiry-mismatch', 'remote delivery cannot outlive its Peer Message envelope')
   }
   const message: RemoteBotTransportMessage = {
     schemaVersion: REMOTE_TRANSPORT_SCHEMA_VERSION,
@@ -368,7 +340,7 @@ export class RemoteDeliveryLedger {
       if (current !== undefined) {
         if (current.fencingToken > message.fencingToken) return { decision: 'stale', entry: cloneLedgerEntry(current) }
         if (current.fencingToken === message.fencingToken) {
-          if (current.leaseId !== message.leaseId) {
+          if (current.leaseId !== message.leaseId || current.deliveryId !== message.deliveryId) {
             return { decision: 'stale', entry: cloneLedgerEntry(current) }
           }
           if (current.state === 'accepted') return { decision: 'duplicate', entry: cloneLedgerEntry(current) }
@@ -385,8 +357,8 @@ export class RemoteDeliveryLedger {
         direction: 'inbound',
         updatedAt: Date.now(),
       }
-      this.entries.set(key, entry)
       await this.journal.append({ kind: 'reserved', entry })
+      this.entries.set(key, entry)
       return { decision: 'accepted', entry: cloneLedgerEntry(entry) }
     })
   }
@@ -400,6 +372,7 @@ export class RemoteDeliveryLedger {
         current === undefined
         || current.fencingToken !== message.fencingToken
         || current.leaseId !== message.leaseId
+        || current.deliveryId !== message.deliveryId
       ) return
       const entry: RemoteLedgerEntry = {
         ...current,
@@ -407,8 +380,8 @@ export class RemoteDeliveryLedger {
         state: 'accepted',
         updatedAt: at,
       }
-      this.entries.set(key, entry)
       await this.journal.append({ kind: 'accepted', entry })
+      this.entries.set(key, entry)
     })
   }
 
@@ -417,10 +390,18 @@ export class RemoteDeliveryLedger {
     sourceNodeId: string,
     idempotencyKey: string,
   ): Promise<RemoteBotTransportMessage | undefined> {
+    await this.tail
     await this.load()
     const entry = this.entries.get(outboundLedgerKey(sourceNodeId, idempotencyKey))
     if (entry?.direction !== 'outbound' || entry.message === undefined) return undefined
     return structuredClone(entry.message)
+  }
+
+  public async isOutboundAccepted(sourceNodeId: string, idempotencyKey: string): Promise<boolean> {
+    await this.tail
+    await this.load()
+    const entry = this.entries.get(outboundLedgerKey(sourceNodeId, idempotencyKey))
+    return entry?.direction === 'outbound' && entry.state === 'accepted'
   }
 
   /** Reserve an outbound message before the network call. */
@@ -444,9 +425,74 @@ export class RemoteDeliveryLedger {
         message: structuredClone(message),
         updatedAt: Date.now(),
       }
-      this.entries.set(key, entry)
       await this.journal.append({ kind: 'reserved', entry })
+      this.entries.set(key, entry)
       return structuredClone(message)
+    })
+  }
+
+  /**
+   * Renew a reserved outbound delivery after its transport lease expires.
+   * The logical envelope/idempotency key stays stable, while the delivery ID,
+   * lease ID, and fencing token advance so a receiver can reject the stale
+   * attempt without rejecting the retry itself.
+   */
+  public async renewOutbound(
+    message: RemoteBotTransportMessage,
+    at = Date.now(),
+    rawPolicy: RemoteTransportPolicyInput = {},
+  ): Promise<RemoteBotTransportMessage> {
+    return this.serialize(async () => {
+      await this.load()
+      const key = ledgerKey(message, 'outbound')
+      const current = this.entries.get(key)
+      if (current?.direction === 'outbound' && current.message !== undefined) {
+        if (current.state === 'accepted') return structuredClone(current.message)
+        const baseline = current.message
+        const renewed = createRemoteTransportMessage({
+          envelope: baseline.envelope,
+          sourceNodeId: baseline.sourceNodeId,
+          targetNodeId: baseline.targetNodeId,
+          fencingToken: Math.max(current.fencingToken, baseline.fencingToken, message.fencingToken) + 1,
+          issuedAt: at,
+          leaseMs: normalizeRemoteTransportPolicy(rawPolicy).defaultLeaseMs,
+        }, rawPolicy)
+        const entry: RemoteLedgerEntry = {
+          ...current,
+          fencingToken: renewed.fencingToken,
+          leaseId: renewed.leaseId,
+          deliveryId: renewed.deliveryId,
+          state: 'reserved',
+          message: structuredClone(renewed),
+          updatedAt: at,
+        }
+        await this.journal.append({ kind: 'reserved', entry })
+        this.entries.set(key, entry)
+        return structuredClone(renewed)
+      }
+      const renewed = createRemoteTransportMessage({
+        envelope: message.envelope,
+        sourceNodeId: message.sourceNodeId,
+        targetNodeId: message.targetNodeId,
+        fencingToken: message.fencingToken + 1,
+        issuedAt: at,
+        leaseMs: normalizeRemoteTransportPolicy(rawPolicy).defaultLeaseMs,
+      }, rawPolicy)
+      const entry: RemoteLedgerEntry = {
+        key,
+        sourceNodeId: renewed.sourceNodeId,
+        idempotencyKey: renewed.envelope.idempotencyKey ?? renewed.envelope.id,
+        fencingToken: renewed.fencingToken,
+        leaseId: renewed.leaseId,
+        deliveryId: renewed.deliveryId,
+        state: 'reserved',
+        direction: 'outbound',
+        message: structuredClone(renewed),
+        updatedAt: at,
+      }
+      await this.journal.append({ kind: 'reserved', entry })
+      this.entries.set(key, entry)
+      return structuredClone(renewed)
     })
   }
 
@@ -455,14 +501,21 @@ export class RemoteDeliveryLedger {
       await this.load()
       const key = ledgerKey(message, 'outbound')
       const current = this.entries.get(key)
-      if (current?.direction !== 'outbound' || current.message === undefined) return
+      if (
+        current?.direction !== 'outbound'
+        || current.message === undefined
+        || current.fencingToken !== message.fencingToken
+        || current.leaseId !== message.leaseId
+        || current.deliveryId !== message.deliveryId
+      ) return
       const entry: RemoteLedgerEntry = { ...current, state: 'accepted', updatedAt: at }
-      this.entries.set(key, entry)
       await this.journal.append({ kind: 'accepted', entry })
+      this.entries.set(key, entry)
     })
   }
 
   public async snapshot(): Promise<readonly RemoteFenceDecision[]> {
+    await this.tail
     await this.load()
     return [...this.entries.values()].map(entry => ({
       decision: entry.state === 'accepted' ? 'duplicate' : 'accepted',
@@ -612,8 +665,29 @@ export function createRemoteTransportHandler(
     if (claimedSourceNode !== null && claimedSourceNode !== message.sourceNodeId) {
       return responseJson(400, { accepted: false, errorCode: 'source-node-mismatch' })
     }
-    if (message.expiresAt + policy.clockSkewMs <= now()) {
+    const claimedDeliveryId = request.headers.get('x-dsh-delivery-id')
+    if (claimedDeliveryId !== null && claimedDeliveryId !== message.deliveryId) {
+      return responseJson(400, { accepted: false, errorCode: 'delivery-id-mismatch' })
+    }
+    const claimedFencingToken = request.headers.get('x-dsh-fencing-token')
+    if (claimedFencingToken !== null) {
+      const parsedFencingToken = Number(claimedFencingToken)
+      if (!/^\d+$/u.test(claimedFencingToken) || !Number.isSafeInteger(parsedFencingToken) || parsedFencingToken !== message.fencingToken) {
+        return responseJson(400, { accepted: false, errorCode: 'fencing-token-mismatch' })
+      }
+    }
+    const currentTime = now()
+    if (message.issuedAt > currentTime + policy.clockSkewMs) {
+      return responseJson(400, { accepted: false, errorCode: 'issued-in-future' })
+    }
+    if (message.envelope.createdAt > currentTime + policy.clockSkewMs) {
+      return responseJson(400, { accepted: false, errorCode: 'envelope-issued-in-future' })
+    }
+    if (message.expiresAt + policy.clockSkewMs <= currentTime) {
       return responseJson(410, { accepted: false, errorCode: 'message-expired' })
+    }
+    if (message.envelope.expiresAt !== undefined && message.envelope.expiresAt + policy.clockSkewMs <= currentTime) {
+      return responseJson(410, { accepted: false, errorCode: 'envelope-expired' })
     }
     const ledger = options.ledger
     if (ledger !== undefined) {
@@ -663,7 +737,16 @@ export class LoopbackRemoteTransport {
     const existing = this.delivered.get(key)
     if (existing !== undefined) return { ...existing, duplicate: true }
     const now = this.now()
-    if (checked.expiresAt <= now) throw new RemoteTransportError('message-expired', 'remote delivery has expired')
+    if (checked.issuedAt > now + this.policy.clockSkewMs) {
+      throw new RemoteTransportError('issued-in-future', 'remote delivery was issued too far in the future')
+    }
+    if (checked.envelope.createdAt > now + this.policy.clockSkewMs) {
+      throw new RemoteTransportError('envelope-issued-in-future', 'remote Peer Message was issued too far in the future')
+    }
+    if (checked.expiresAt + this.policy.clockSkewMs <= now) throw new RemoteTransportError('message-expired', 'remote delivery has expired')
+    if (checked.envelope.expiresAt !== undefined && checked.envelope.expiresAt + this.policy.clockSkewMs <= now) {
+      throw new RemoteTransportError('envelope-expired', 'remote Peer Message has expired')
+    }
     const receipt = await this.receiver(checked)
     if (receipt.accepted !== false) this.delivered.set(key, receipt)
     return receipt
@@ -673,4 +756,3 @@ export class LoopbackRemoteTransport {
     this.closed = true
   }
 }
-

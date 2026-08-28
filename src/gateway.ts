@@ -162,6 +162,25 @@ interface CompiledWorkflowNodeRequest {
   readonly compensationTrigger?: 'failure' | 'cancel' | 'timeout'
 }
 
+function workflowLogicalNodeIdForTask(
+  task: Pick<TaskRecord, 'workflowLogicalNodeId' | 'workflowNodeId'>,
+  definition: WorkflowDefinition,
+): string | undefined {
+  if (task.workflowLogicalNodeId !== undefined && definition.nodes.some(node => node.id === task.workflowLogicalNodeId)) {
+    return task.workflowLogicalNodeId
+  }
+  if (task.workflowNodeId !== undefined && definition.nodes.some(node => node.id === task.workflowNodeId)) {
+    return task.workflowNodeId
+  }
+  const storageNodeId = task.workflowNodeId
+  if (storageNodeId === undefined) return undefined
+  const mapMatch = /^map:[^:]+:\d+:(.+)$/u.exec(storageNodeId)
+  if (mapMatch?.[1] !== undefined && definition.nodes.some(node => node.id === mapMatch[1])) return mapMatch[1]
+  const compensationMatch = /^compensation:[^:]+:(.+)$/u.exec(storageNodeId)
+  if (compensationMatch?.[1] !== undefined && definition.nodes.some(node => node.id === compensationMatch[1])) return compensationMatch[1]
+  return undefined
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
 }
@@ -255,6 +274,8 @@ function validateWorkflowLaunchInputs(
 export interface WorkflowLaunchOptions {
   /** Caller-provided idempotency key. Omit to create a new run every time. */
   readonly launchId?: string
+  /** Internal retry/recovery pin for a previously admitted immutable revision. */
+  readonly revision?: number
   /** JSON-safe values used by input references in the Workflow graph. */
   readonly inputs?: Readonly<Record<string, unknown>>
 }
@@ -503,6 +524,8 @@ export class BotGateway {
   private readonly workflowLanes = new Map<string, Promise<void>>()
   /** Serializes concurrent launches that share the same caller-provided launch ID. */
   private readonly workflowLaunchLanes = new Map<string, Promise<void>>()
+  /** Serializes duplicate public peer sends before Task/Run creation. */
+  private readonly messageIdempotencyLanes = new Map<string, Promise<void>>()
   private readonly runLanes = new Map<string, Promise<void>>()
   private readonly taskLanes = new Map<string, Promise<void>>()
   /** Serializes dynamic lifecycle transitions with final work-admission checks. */
@@ -1268,6 +1291,7 @@ export class BotGateway {
   private async launchRoutine(launch: RoutineLaunch): Promise<RoutineLaunchResult> {
     try {
       const replyTarget = launch.replyTarget ?? { platform: 'internal', chatId: launch.ownerId }
+      const pinnedRevision = await this.routineWorkflowRevision(launch)
       const result = await this.launchWorkflowDefinition(
         launch.workflowId,
         launch.ownerId,
@@ -1275,6 +1299,7 @@ export class BotGateway {
         launch.ownerId,
         {
           launchId: launch.id,
+          ...(pinnedRevision === undefined ? {} : { revision: pinnedRevision }),
           inputs: launch.inputs,
         },
       )
@@ -1282,6 +1307,33 @@ export class BotGateway {
     } catch (error: unknown) {
       return { status: 'failed', error: String(error), retryable: true }
     }
+  }
+
+  /** Find a previously admitted Routine launch so retries cannot jump revisions. */
+  private async routineWorkflowRevision(launch: RoutineLaunch): Promise<number | undefined> {
+    const snapshot = await this.tasks.snapshot()
+    const prefix = 'workflow-run:' + launch.workflowId + ':'
+    const suffix = ':' + launch.id
+    const match = snapshot.tasks.find(task => {
+      if (
+        task.createdBy !== launch.ownerId
+        || task.workflowNodeId !== '__root__'
+        || task.workflowDefinitionId !== launch.workflowId
+        || task.workflowRunId === undefined
+        || !task.workflowRunId.startsWith(prefix)
+      ) return false
+      const remainder = task.workflowRunId.slice(prefix.length)
+      if (!remainder.endsWith(suffix)) return false
+      const revisionText = remainder.slice(0, remainder.length - suffix.length)
+      if (!/^\d+$/u.test(revisionText)) return false
+      const revision = task.workflowRevision ?? Number(revisionText)
+      return Number.isSafeInteger(revision) && revision > 0
+    })
+    if (match === undefined || match.workflowRunId === undefined) return undefined
+    const remainder = match.workflowRunId.slice(prefix.length)
+    const revisionText = remainder.slice(0, remainder.length - suffix.length)
+    const revision = match.workflowRevision ?? Number(revisionText)
+    return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined
   }
 
   public async createWorkflowDefinition(input: WorkflowDraft, actor = input.ownerId): Promise<WorkflowDefinition> {
@@ -1328,9 +1380,9 @@ export class BotGateway {
   }
 
   /**
-   * Launches only the first task stage of a validated Workflow definition.
-   * Conditions, approvals, map/reduce and continuation remain explicit runtime
-   * work; no declarative node is treated as executable code here.
+   * Launches the first task stage of a validated Workflow definition. Durable
+   * continuation evaluates the supported condition/map/reduce controls and
+   * bounded compensation paths; unsupported controls remain explicit errors.
    */
   public async launchWorkflowDefinition(
     workflowId: string,
@@ -1362,10 +1414,19 @@ export class BotGateway {
     options: WorkflowLaunchOptions,
   ): Promise<WorkflowLaunchResult> {
     this.assertSavedWorkflowsEnabled()
-    const definition = await this.getWorkflowDefinition(workflowId, actor)
-    if (!definition) throw new Error('Workflow is not found or not visible: ' + workflowId)
+    // A routine retry may intentionally target an older immutable revision.
+    // Resolve that revision directly so a newer update or a soft-delete of the
+    // current definition cannot make an already-admitted launch jump versions
+    // or fail merely because the latest revision is no longer visible.
+    const definition = options.revision === undefined
+      ? await this.getWorkflowDefinition(workflowId, actor)
+      : await this.workflows.getRevision(workflowId, options.revision, { actorId: actor })
+    if (!definition) {
+      throw new Error(options.revision === undefined
+        ? 'Workflow is not found or not visible: ' + workflowId
+        : 'Workflow revision is not found or not visible: ' + workflowId + '@' + options.revision)
+    }
     const plan = await this.compileWorkflowDefinitionUnlocked(definition, actor)
-    if (plan.entryTaskIds.length === 0) throw new Error('Workflow entry requires a condition or approval runtime adapter')
     if (plan.entryTaskIds.length > plan.budget.maxFanOut) throw new Error('Workflow entry fan-out exceeds the policy budget')
     if (options.inputs !== undefined && (options.inputs === null || typeof options.inputs !== 'object' || Array.isArray(options.inputs))) {
       throw new Error('Workflow launch inputs must be a JSON object')
@@ -1400,16 +1461,38 @@ export class BotGateway {
     } else if (rootTask.workflowRevision !== undefined && rootTask.workflowRevision !== definition.revision) {
       throw new Error('Workflow launch idempotency key belongs to a different revision')
     }
-    const dispatched = await this.queueCompiledWorkflowNodes(
-      definition,
-      plan,
-      workflowRunId,
-      rootTask,
-      plan.entryTaskIds.slice(0, plan.budget.maxParallel),
-      requester,
-      replyTarget,
-      correlationId,
-    )
+    let dispatched = plan.entryTaskIds.length === 0
+      ? []
+      : await this.queueCompiledWorkflowNodes(
+        definition,
+        plan,
+        workflowRunId,
+        rootTask,
+        plan.entryTaskIds.slice(0, plan.budget.maxParallel),
+        requester,
+        replyTarget,
+        correlationId,
+      )
+    if (plan.entryTaskIds.length === 0) {
+      // A control node can be the graph entry. Let the same durable state
+      // machine used after every model result evaluate it instead of treating
+      // an empty task entry list as an invalid workflow.
+      await this.advanceCompiledWorkflowState({
+        definition,
+        workflowRunId,
+        rootTaskId: rootTask.id,
+        requester,
+        replyTarget,
+        correlationId,
+        latestOutput: '',
+      })
+      const activeEntries = (await this.mailbox.snapshot()).filter(item => (
+        isActiveMailboxState(item.state)
+        && item.envelope.payload.workflowDefinitionId === definition.id
+        && item.envelope.payload.workflowRunId === workflowRunId
+      ))
+      dispatched = activeEntries.map(item => item.envelope)
+    }
     if (dispatched.length > 0) {
       void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
     }
@@ -1457,7 +1540,8 @@ export class BotGateway {
     let tokenReservations = 0
     let costReservations = 0
     for (const task of knownTasks.values()) {
-      const node = definition.nodes.find(candidate => candidate.id === task.workflowNodeId)
+      const logicalNodeId = workflowLogicalNodeIdForTask(task, definition)
+      const node = logicalNodeId === undefined ? undefined : definition.nodes.find(candidate => candidate.id === logicalNodeId)
       const runCount = snapshot.runs.filter(run => run.taskId === task.id).length
       tokenReservations += (node?.tokenBudget ?? 0) * runCount
       costReservations += (node?.costUnits ?? 0) * runCount
@@ -1521,6 +1605,7 @@ export class BotGateway {
           workflowRevision: definition.revision,
           workflowRunId,
           workflowNodeId: storageNodeId,
+          workflowLogicalNodeId: nodeId,
           workflowReplyTarget: replyTarget,
           workflowTraceId: correlationId,
           ...(rootTask.workflowInputs === undefined ? {} : { workflowInputs: rootTask.workflowInputs }),
@@ -1657,7 +1742,16 @@ export class BotGateway {
 
   /** Public typed Bot-to-Bot seam backed by Task/Run and the durable Mailbox. */
   public async sendBotMessage(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
-    return this.withDurableMutation(() => this.sendBotMessageUnlocked(input))
+    const normalizedInput = input.idempotencyKey === undefined
+      ? input
+      : { ...input, idempotencyKey: input.idempotencyKey.trim() }
+    const idempotencyKey = normalizedInput.idempotencyKey
+    return this.withDurableMutation(() => idempotencyKey === undefined
+      ? this.sendBotMessageUnlocked(normalizedInput)
+      : this.withMessageIdempotencyLane(
+        normalizedInput.from.trim() + ':' + idempotencyKey,
+        () => this.sendBotMessageUnlocked(normalizedInput),
+      ))
   }
 
   private async sendBotMessageUnlocked(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
@@ -1678,6 +1772,9 @@ export class BotGateway {
     if (input.idempotencyKey !== undefined && remoteRoute !== undefined) {
       const existingRemote = await this.remoteDeliveryLedger.getOutbound(this.remoteNodeIdOrThrow(), input.idempotencyKey)
       if (existingRemote !== undefined) {
+        if (await this.remoteDeliveryLedger.isOutboundAccepted(this.remoteNodeIdOrThrow(), input.idempotencyKey)) {
+          return existingRemote.envelope
+        }
         await this.dispatchRemoteEnvelope(existingRemote.envelope, remoteRoute, existingRemote)
         return existingRemote.envelope
       }
@@ -1692,6 +1789,15 @@ export class BotGateway {
       throw new Error('Peer Messaging is disabled; enable collaboration.features.peerMessaging first')
     }
     const targetBotId = bot?.id ?? requestedBotId
+    if (input.idempotencyKey !== undefined && remoteRoute === undefined) {
+      const existingLocal = await this.mailbox.getByIdempotencyKey(input.idempotencyKey)
+      if (existingLocal !== undefined) {
+        if (existingLocal.envelope.to !== targetBotId || existingLocal.envelope.from !== input.from) {
+          throw new Error('Bot message idempotencyKey is already bound to a different delivery')
+        }
+        return existingLocal.envelope
+      }
+    }
     const toAddress: BotAddress = input.toAddress ?? {
       id: targetBotId,
       type: 'bot',
@@ -1967,6 +2073,13 @@ export class BotGateway {
     }
     if (message.envelope.idempotencyKey !== undefined) {
       message = await this.remoteDeliveryLedger.reserveOutbound(message)
+      if (message.expiresAt <= Date.now()) {
+        message = await this.remoteDeliveryLedger.renewOutbound(
+          message,
+          Date.now(),
+          this.config.remoteTransport ?? {},
+        )
+      }
     }
     const transport = new HttpRemoteBotTransport({
       endpoint: route.endpoint,
@@ -2693,6 +2806,16 @@ export class BotGateway {
         await this.tasks.transitionWorkflow(workflow.id, 'cancelled', actor)
         await this.approvals.rejectEntity(workflow.id, actor)
       }
+      const isCompiledWorkflowRoot = task.workflowNodeId === '__root__'
+        && task.workflowDefinitionId !== undefined
+        && task.workflowRunId !== undefined
+      if (isCompiledWorkflowRoot) {
+        await this.cancelCompiledWorkflowChildren(
+          task.workflowDefinitionId,
+          task.workflowRunId,
+          `task cancelled by ${actor}`,
+        )
+      }
       if (task.roomId !== undefined) await this.rooms.close(task.roomId)
       const cancelledTask = await this.tasks.cancelTask(task.id, actor)
       for (const handoff of snapshot.handoffs.filter(item => item.taskId === task.id)) {
@@ -2703,11 +2826,7 @@ export class BotGateway {
         await this.withRunLock(run.id, async () => {
           await this.mailbox.cancelRun(run.id, `task cancelled by ${actor}`)
           const internal = this.internalRuns.get(run.id)
-          if (internal) {
-            const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
-            if (agent) this.bridge?.stop(agent)
-            this.cleanupInternalRun(internal)
-          }
+          if (internal) await this.stopInternalExecution(internal, `task cancelled by ${actor}`)
           await this.tasks.cancelRun(run.id, `task cancelled by ${actor}`, actor)
         })
       }
@@ -2960,8 +3079,15 @@ export class BotGateway {
     const features = this.config.collaboration?.features
     await this.registry.load()
     await this.assertStaticProfileNamespace(this.config)
-    if (features && Object.values(features).some(Boolean)) await this.teams.load()
+    // Team status is a durable projection, not a feature-gated cache. Load it
+    // on every boot so the dashboard does not briefly report zero teams when
+    // Fleet switches are currently disabled.
+    await this.teams.load()
     await this.refreshBotDirectory()
+    // Dynamic profiles are merged by refreshBotDirectory. Runtime adapters
+    // must be synchronized after that merge, otherwise a newly activated Grok
+    // profile is visible in the roster but has no executable adapter.
+    this.syncConfiguredRuntimeAdapters()
     if (features?.dynamicRegistry === true || features?.webChatBotCreation === true) {
       await this.reconcileBotActivationApprovals()
     }
@@ -3014,6 +3140,7 @@ export class BotGateway {
     this.profiles.clear()
     for (const [name, profile] of combined) this.profiles.set(name, profile)
     this.directory.replace(this.profiles.values())
+    this.syncConfiguredRuntimeAdapters()
   }
 
   /** Agent lifecycle visibility is required even when every chat transport is disabled. */
@@ -3197,7 +3324,7 @@ export class BotGateway {
     for (const decision of entries) {
       const entry = decision.entry
       if (entry.direction !== 'outbound' || entry.state !== 'reserved' || entry.message === undefined) continue
-      const route = this.remoteRouteForBot(entry.message.envelope.to)
+      const route = this.remoteRouteForNode(entry.message.targetNodeId)
       if (!route || route.nodeId !== entry.message.targetNodeId) {
         await this.tasks.audit('message', entry.message.envelope.id, 'botfleet-recovery', 'message.remote_outbox_route_missing', {
           targetNodeId: entry.message.targetNodeId,
@@ -3206,7 +3333,15 @@ export class BotGateway {
         continue
       }
       try {
-        await this.dispatchRemoteEnvelope(entry.message.envelope, route, entry.message)
+        let message = entry.message
+        if (message.expiresAt <= Date.now()) {
+          message = await this.remoteDeliveryLedger.renewOutbound(
+            message,
+            Date.now(),
+            this.config.remoteTransport ?? {},
+          )
+        }
+        await this.dispatchRemoteEnvelope(message.envelope, route, message)
         await this.tasks.audit('message', entry.message.envelope.id, 'botfleet-recovery', 'message.remote_outbox_retried', {
           targetNodeId: route.nodeId,
           botId: entry.message.envelope.to,
@@ -4283,11 +4418,7 @@ export class BotGateway {
     if (sourceRun.status === 'queued' || sourceRun.status === 'running') {
       await this.mailbox.cancelRun(sourceRun.id, `handed off to @${handoff.toBot}`)
       const internal = this.internalRuns.get(sourceRun.id)
-      if (internal) {
-        const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
-        if (agent) this.bridge?.stop(agent)
-        this.cleanupInternalRun(internal)
-      }
+      if (internal) await this.stopInternalExecution(internal, `handed off to @${handoff.toBot}`)
       await this.tasks.cancelRun(sourceRun.id, `handed off to @${handoff.toBot}`, handoff.fromBot)
     }
     if (run === undefined) {
@@ -4552,13 +4683,11 @@ export class BotGateway {
         await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.lease_lost', {
           runId: internal.runId,
         }, internal.envelope.correlationId)
-        const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
-        if (agent) this.bridge?.stop(agent)
+        await this.stopInternalExecution(internal, 'mailbox lease lost')
         // Leave the Run non-terminal here. The durable mailbox recovery pass
         // either re-leases this delivery or dead-letters it after the configured
         // attempt limit; marking it failed now would make a recoverable lease
         // timeout impossible to retry.
-        this.cleanupInternalRun(internal)
         void this.drainCollaboration().catch(error => this.log('warn', `lease-loss recovery failed: ${String(error)}`))
       }).catch(error => {
         if (this.stopped) return
@@ -4567,6 +4696,21 @@ export class BotGateway {
       })
     }, delay)
     internal.leaseHeartbeat.unref?.()
+  }
+
+  /** Stop both local Harness and external runtime execution before fencing a Run. */
+  private async stopInternalExecution(internal: InternalRun, reason: string): Promise<void> {
+    if (internal.runtimeKind !== undefined) {
+      const adapter = this.runtimeAdapters.get(internal.runtimeKind)
+      try {
+        await adapter?.cancel?.(internal.runId)
+      } catch (error: unknown) {
+        this.log('warn', `External runtime cancellation failed (${reason}): ${String(error)}`)
+      }
+    }
+    const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
+    if (agent) this.bridge?.stop(agent)
+    this.cleanupInternalRun(internal)
   }
 
   private cleanupInternalRun(internal: InternalRun): void {
@@ -5279,6 +5423,11 @@ export class BotGateway {
           .filter(node => node.kind === 'map' && node.map !== undefined)
           .map(node => node.map!.templateNodeId),
       )
+      const compensationTargetIds = new Set(
+        input.definition.nodes
+          .filter(node => node.compensation !== undefined)
+          .map(node => node.compensation!.nodeId),
+      )
       const workflowDeliveries = (await this.mailbox.snapshot()).filter(item => (
         isActiveMailboxState(item.state)
         && item.envelope.payload.workflowDefinitionId === input.definition.id
@@ -5335,20 +5484,21 @@ export class BotGateway {
             if (definitionNode.condition === undefined) throw new Error('Condition node is missing its condition: ' + control.nodeId)
             const evaluation = evaluateWorkflowCondition(definitionNode.condition, root.workflowInputs ?? {}, workflowOutputs)
             const selectedNodeId = evaluation.matched ? definitionNode.condition.whenTrue : definitionNode.condition.whenFalse
-            if (selectedNodeId === undefined) {
-              throw new Error('Condition node has no branch for the evaluated result: ' + control.nodeId)
-            }
             await ensureControlTask(
               control.nodeId,
               serializeWorkflowResult({
                 matched: evaluation.matched,
-                selectedNodeId,
+                selectedNodeId: selectedNodeId ?? null,
                 value: evaluation.value,
               }),
               'Evaluate Workflow condition ' + control.nodeId,
             )
             const skippedNodeId = evaluation.matched ? definitionNode.condition.whenFalse : definitionNode.condition.whenTrue
-            if (skippedNodeId !== undefined && !taskByNode.has(skippedNodeId)) {
+            if (
+              skippedNodeId !== undefined
+              && skippedNodeId !== selectedNodeId
+              && !taskByNode.has(skippedNodeId)
+            ) {
               const skipped = await ensureControlTask(
                 skippedNodeId,
                 serializeWorkflowResult({ skipped: true, conditionNodeId: control.nodeId }),
@@ -5371,9 +5521,12 @@ export class BotGateway {
           if (control.kind === 'reduce') {
             if (definitionNode.reduce === undefined) throw new Error('Reduce node is missing its reducer: ' + control.nodeId)
             const reduced = reduceWorkflowValues(definitionNode.reduce, root.workflowInputs ?? {}, workflowOutputs)
+            const reducedOutput = definitionNode.reduce.outputName === undefined
+              ? reduced
+              : { [definitionNode.reduce.outputName]: reduced }
             await ensureControlTask(
               control.nodeId,
-              serializeWorkflowResult(reduced),
+              serializeWorkflowResult(reducedOutput),
               'Reduce Workflow values ' + control.nodeId,
             )
             await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.reduce_completed', {
@@ -5467,7 +5620,11 @@ export class BotGateway {
         }
       }
 
-      const taskNodes = plan.nodes.filter(node => node.kind === 'task' && !mapTemplateIds.has(node.nodeId))
+      const taskNodes = plan.nodes.filter(node => (
+        node.kind === 'task'
+        && !mapTemplateIds.has(node.nodeId)
+        && !compensationTargetIds.has(node.nodeId)
+      ))
       const controlNodes = plan.nodes.filter(node => (
         node.kind === 'condition' || node.kind === 'map' || node.kind === 'reduce'
       ))
@@ -5480,7 +5637,7 @@ export class BotGateway {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow node ' + failedNode.nodeId + ' failed: ' + (task?.error ?? task?.status ?? 'unknown'))
         return
       }
-      const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => isCompleted(node.nodeId))
+      const allTasksCompleted = taskNodes.every(node => isCompleted(node.nodeId))
       const allControlsCompleted = controlNodes.every(node => isCompleted(node.nodeId))
       const unsupportedNodes = plan.nodes.filter(node => (
         node.kind !== 'task'
@@ -5531,7 +5688,32 @@ export class BotGateway {
       if (capacity <= 0) return
 
       if (mapRequestByStorageId.size > 0) {
-        const requests = [...mapRequestByStorageId.values()].slice(0, capacity)
+        const mapActiveCounts = new Map<string, number>()
+        for (const [storageNodeId, task] of taskByNode) {
+          const match = /^map:([^:]+):\d+:/u.exec(storageNodeId)
+          if (
+            match?.[1] !== undefined
+            && activeTaskIds.has(task.id)
+            && (task.status === 'pending' || task.status === 'running' || task.status === 'waiting')
+          ) {
+            mapActiveCounts.set(match[1], (mapActiveCounts.get(match[1]) ?? 0) + 1)
+          }
+        }
+        const requests: CompiledWorkflowNodeRequest[] = []
+        for (const request of mapRequestByStorageId.values()) {
+          const template = definitionById.get(request.nodeId)
+          const limit = Math.min(
+            plan.budget.maxParallel,
+            template?.maxConcurrency ?? plan.budget.maxParallel,
+          )
+          const mapNodeId = request.mapNodeId ?? ''
+          const active = mapActiveCounts.get(mapNodeId) ?? 0
+          if (active >= limit) continue
+          requests.push(request)
+          mapActiveCounts.set(mapNodeId, active + 1)
+          if (requests.length >= capacity) break
+        }
+        if (requests.length === 0) return
         const dispatched = await this.queueCompiledWorkflowNodes(
           input.definition,
           plan,
@@ -5651,11 +5833,7 @@ export class BotGateway {
     for (const run of snapshot.runs.filter(candidate => childTaskIds.has(candidate.taskId))) {
       if (run.status !== 'queued' && run.status !== 'running') continue
       const internal = this.internalRuns.get(run.id)
-      if (internal) {
-        const agent = this.bridge?.getAgent(internal.sessionId as SessionId)
-        this.cleanupInternalRun(internal)
-        if (agent) this.bridge?.stop(agent)
-      }
+      if (internal) await this.stopInternalExecution(internal, reason)
       for (;;) {
         const cancelledDelivery = await this.mailbox.cancelRun(run.id, reason)
         if (!cancelledDelivery) break
@@ -5777,7 +5955,12 @@ export class BotGateway {
       && task.workflowNodeId !== '__root__'
     ))
     const taskIds = new Set(workflowTasks.map(task => task.id))
-    const nodeByTaskId = new Map(workflowTasks.map(task => [task.id, definition.nodes.find(node => node.id === task.workflowNodeId)]))
+    const nodeByTaskId = new Map(workflowTasks.map(task => [
+      task.id,
+      workflowLogicalNodeIdForTask(task, definition) === undefined
+        ? undefined
+        : definition.nodes.find(node => node.id === workflowLogicalNodeIdForTask(task, definition)),
+    ]))
     const tokenCount = snapshot.runs
       .filter(run => taskIds.has(run.taskId))
       .reduce((total, run) => total + (nodeByTaskId.get(run.taskId)?.tokenBudget ?? 0), 0)
@@ -6003,6 +6186,25 @@ export class BotGateway {
         if (this.workflowLaunchLanes.get(key) === current) this.workflowLaunchLanes.delete(key)
       })
     this.workflowLaunchLanes.set(key, current)
+    await current
+    return result
+  }
+
+  private async withMessageIdempotencyLane<T>(
+    key: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.messageIdempotencyLanes.get(key) ?? Promise.resolve()
+    let result!: T
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        result = await operation()
+      })
+      .finally(() => {
+        if (this.messageIdempotencyLanes.get(key) === current) this.messageIdempotencyLanes.delete(key)
+      })
+    this.messageIdempotencyLanes.set(key, current)
     await current
     return result
   }

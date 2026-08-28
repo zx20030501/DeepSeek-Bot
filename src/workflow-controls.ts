@@ -26,7 +26,9 @@ function stableJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
   if (Array.isArray(value)) return '[' + value.map(item => stableJson(item)).join(',') + ']'
   return '{' + Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
+    // Do not use localeCompare here. Its collation can treat canonically
+    // distinct keys as equal, making equality depend on insertion order.
+    .sort(([left], [right]) => left === right ? 0 : left < right ? -1 : 1)
     .map(([key, item]) => JSON.stringify(key) + ':' + stableJson(item))
     .join(',') + '}'
 }
@@ -45,6 +47,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function parseWorkflowResult(result: string | undefined): unknown {
   if (result === undefined) return undefined
+  if (result === UNDEFINED_RESULT_SENTINEL) return undefined
   const trimmed = result.trim()
   if (trimmed === '') return ''
   try {
@@ -169,9 +172,13 @@ export function reduceWorkflowValues(
 
 export function serializeWorkflowResult(value: unknown): string {
   if (typeof value === 'string') return value
-  if (value === undefined) return ''
+  if (value === undefined) return UNDEFINED_RESULT_SENTINEL
   return JSON.stringify(value)
 }
+
+// Empty text is a valid model result, so it cannot also represent an absent
+// result. Keep a protocol-private marker for durable control-node outputs.
+const UNDEFINED_RESULT_SENTINEL = '\u0000dsh-workflow-undefined-v1'
 
 /**
  * A compensation node is selected once for each completed node, in reverse

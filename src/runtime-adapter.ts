@@ -14,6 +14,12 @@ export interface RuntimeToolDefinition {
   readonly parameters?: Record<string, unknown>
 }
 
+export interface RuntimeToolCall {
+  readonly name: string
+  readonly arguments: unknown
+  readonly callId?: string
+}
+
 export interface RuntimeTaskRequest {
   readonly requestId: string
   readonly botId: string
@@ -45,6 +51,7 @@ export interface RuntimeTaskResult {
   readonly status: 'completed' | 'failed' | 'cancelled'
   readonly text: string
   readonly responseId?: string
+  readonly toolCalls?: readonly RuntimeToolCall[]
   readonly usage?: RuntimeUsage
   readonly raw?: unknown
 }
@@ -318,6 +325,32 @@ function xaiText(value: unknown): string {
   return uniqueText(parts)
 }
 
+function xaiToolCalls(value: unknown): readonly RuntimeToolCall[] {
+  if (!isRecord(value) || !Array.isArray(value.output)) return []
+  const calls: RuntimeToolCall[] = []
+  for (const item of value.output) {
+    if (!isRecord(item) || !['function_call', 'tool_call'].includes(String(item.type))) continue
+    const name = stringValue(item.name)
+    if (name === undefined) continue
+    const rawArguments = item.arguments
+    let argumentsValue: unknown = rawArguments
+    if (typeof rawArguments === 'string') {
+      try {
+        argumentsValue = JSON.parse(rawArguments) as unknown
+      } catch {
+        argumentsValue = rawArguments
+      }
+    }
+    const callId = stringValue(item.call_id) ?? stringValue(item.id)
+    calls.push({
+      name,
+      arguments: argumentsValue,
+      ...(callId === undefined ? {} : { callId }),
+    })
+  }
+  return calls
+}
+
 export class XaiGrokRuntimeAdapter implements RuntimeAdapter {
   public readonly kind = 'grok' as const
   private readonly active = new Map<string, AbortController>()
@@ -330,7 +363,7 @@ export class XaiGrokRuntimeAdapter implements RuntimeAdapter {
 
   public constructor(options: XaiGrokRuntimeAdapterOptions = {}) {
     const envName = options.apiKeyEnv ?? 'XAI_API_KEY'
-    const envValue = options.getEnv?.(envName) ?? process.env[envName]
+    const envValue = options.getEnv === undefined ? process.env[envName] : options.getEnv(envName)
     const apiKey = options.apiKey ?? envValue
     this.apiKey = apiKey?.trim() || undefined
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
@@ -399,9 +432,22 @@ export class XaiGrokRuntimeAdapter implements RuntimeAdapter {
         })
       }
 
-      const payload = await responsePayload(response)
+      let payload: unknown
+      try {
+        payload = await responsePayload(response)
+      } catch (error: unknown) {
+        if (linked.timedOut()) {
+          throw new RuntimeAdapterError('xAI request timed out', 'grok.timeout', {
+            retryable: true,
+            cause: error,
+          })
+        }
+        if (linked.controller.signal.aborted) return abortResult(request.requestId)
+        throw error
+      }
       const text = xaiText(payload)
-      if (text.length === 0) {
+      const toolCalls = xaiToolCalls(payload)
+      if (text.length === 0 && toolCalls.length === 0) {
         throw new RuntimeAdapterError(
           'xAI response did not contain output text',
           'grok.empty_response',
@@ -413,8 +459,9 @@ export class XaiGrokRuntimeAdapter implements RuntimeAdapter {
       return {
         requestId: request.requestId,
         status: 'completed',
-        text,
+        text: text.length > 0 ? text : JSON.stringify({ toolCalls }),
         ...(responseId === undefined ? {} : { responseId }),
+        ...(toolCalls.length === 0 ? {} : { toolCalls }),
         ...(usage === undefined ? {} : { usage }),
         raw: payload,
       }
@@ -595,6 +642,8 @@ export class HermesRuntimeAdapter implements RuntimeAdapter {
   private readonly timeoutMs: number
   private readonly sessionCreateParams: Readonly<Record<string, unknown>>
   private readonly submitMethod: string
+  private readonly sessionLanes = new Map<string, Promise<void>>()
+  private readonly pending = new Map<string, AbortController>()
 
   public constructor(private readonly options: HermesRuntimeAdapterOptions) {
     this.timeoutMs = options.timeoutMs ?? 600_000
@@ -629,7 +678,41 @@ export class HermesRuntimeAdapter implements RuntimeAdapter {
     return remoteSessionId
   }
 
-  public async run(request: RuntimeTaskRequest): Promise<RuntimeTaskResult> {
+  public run(request: RuntimeTaskRequest): Promise<RuntimeTaskResult> {
+    if (request.signal?.aborted) return Promise.resolve(abortResult(request.requestId))
+    if (this.active.has(request.requestId) || this.pending.has(request.requestId)) {
+      return Promise.reject(new RuntimeAdapterError(
+        'A runtime request with this requestId is already active',
+        'runtime.request_active',
+      ))
+    }
+    const queuedController = new AbortController()
+    this.pending.set(request.requestId, queuedController)
+    const onAbort = (): void => queuedController.abort(request.signal?.reason)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+    // A caller may abort between the initial check and listener registration
+    // (for example through a synchronously-triggered AbortSignal shim). Check
+    // again before placing the request behind an existing session turn.
+    if (request.signal?.aborted) queuedController.abort(request.signal.reason)
+    const previous = this.sessionLanes.get(request.sessionId) ?? Promise.resolve()
+    let lane: Promise<RuntimeTaskResult>
+    lane = previous
+      .catch(() => undefined)
+      .then(async () => {
+        this.pending.delete(request.requestId)
+        if (queuedController.signal.aborted) return abortResult(request.requestId)
+        return this.runUnlocked({ ...request, signal: queuedController.signal })
+      })
+      .finally(() => request.signal?.removeEventListener('abort', onAbort))
+    const tail = lane.then(() => undefined, () => undefined)
+    this.sessionLanes.set(request.sessionId, tail)
+    void tail.then(() => {
+      if (this.sessionLanes.get(request.sessionId) === tail) this.sessionLanes.delete(request.sessionId)
+    })
+    return lane
+  }
+
+  private async runUnlocked(request: RuntimeTaskRequest): Promise<RuntimeTaskResult> {
     if (request.signal?.aborted) return abortResult(request.requestId)
     if (this.active.has(request.requestId)) {
       throw new RuntimeAdapterError(
@@ -707,6 +790,8 @@ export class HermesRuntimeAdapter implements RuntimeAdapter {
   }
 
   public async cancel(requestId: string): Promise<void> {
+    const pending = this.pending.get(requestId)
+    if (pending !== undefined) pending.abort(new Error('cancelled by caller'))
     const active = this.active.get(requestId)
     if (active === undefined) return
     active.controller.abort(new Error('cancelled by caller'))
@@ -723,10 +808,13 @@ export class HermesRuntimeAdapter implements RuntimeAdapter {
   }
 
   public async close(): Promise<void> {
+    for (const controller of this.pending.values()) controller.abort(new Error('adapter closed'))
+    this.pending.clear()
     for (const active of this.active.values()) active.controller.abort(new Error('adapter closed'))
     this.active.clear()
     await this.options.transport.close?.()
     this.sessions.clear()
+    this.sessionLanes.clear()
   }
 }
 

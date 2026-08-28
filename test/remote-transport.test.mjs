@@ -11,6 +11,7 @@ import {
   createRemoteTransportHandler,
   createRemoteTransportMessage,
   signRemoteTransportBody,
+  validateRemoteTransportMessage,
 } from '../dist/remote-transport.js'
 import { createPeerEnvelope } from '../dist/peer-messaging.js'
 
@@ -96,6 +97,10 @@ test('HTTP handler authenticates, durably fences, and deduplicates deliveries', 
     assert.equal(duplicate.status, 200)
     assert.equal((await duplicate.json()).duplicate, true)
     assert.deepEqual(calls, ['delivery-a'])
+
+    const mismatchedHeader = await handler(requestFor(message, secret, { 'x-dsh-delivery-id': 'other-delivery' }))
+    assert.equal(mismatchedHeader.status, 400)
+    assert.equal((await mismatchedHeader.json()).errorCode, 'delivery-id-mismatch')
 
     const stale = createRemoteTransportMessage({
       envelope: envelope(),
@@ -188,12 +193,106 @@ test('outbound ledger reserves the exact envelope and survives a restart', async
     const ledger = new RemoteDeliveryLedger(join(root, 'remote-outbox.jsonl'))
     const reserved = await ledger.reserveOutbound(message)
     assert.equal(reserved.deliveryId, message.deliveryId)
+    assert.equal(await ledger.isOutboundAccepted('node-a', 'remote-outbox-key'), false)
     assert.equal((await ledger.getOutbound('node-a', 'remote-outbox-key'))?.envelope.id, message.envelope.id)
     await ledger.commitOutbound(message)
+    assert.equal(await ledger.isOutboundAccepted('node-a', 'remote-outbox-key'), true)
     const reloaded = new RemoteDeliveryLedger(join(root, 'remote-outbox.jsonl'))
     const entry = (await reloaded.snapshot()).find(item => item.entry.direction === 'outbound')
     assert.equal(entry?.entry.state, 'accepted')
     assert.equal(entry?.entry.message?.targetNodeId, 'node-b')
+    assert.equal(await reloaded.isOutboundAccepted('node-a', 'remote-outbox-key'), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('remote transport requires a complete Peer Message envelope and rejects future deliveries', async () => {
+  const incomplete = { ...envelope() }
+  delete incomplete.fromAddress
+  assert.throws(() => createRemoteTransportMessage({
+    envelope: incomplete,
+    sourceNodeId: 'node-a',
+    targetNodeId: 'node-b',
+  }), RemoteTransportValidationError)
+
+  const secret = 'remote-secret-for-tests'
+  const future = createRemoteTransportMessage({
+    envelope: envelope({ createdAt: 100_000, ttlMs: 20_000 }),
+    sourceNodeId: 'node-a',
+    targetNodeId: 'node-b',
+    issuedAt: 100_000,
+    leaseMs: 10_000,
+  })
+  const handler = createRemoteTransportHandler(async message => ({
+    accepted: true,
+    deliveryId: message.deliveryId,
+  }), { sharedSecret: secret, now: () => 2_000 })
+  const response = await handler(requestFor(future, secret))
+  assert.equal(response.status, 400)
+  assert.equal((await response.json()).errorCode, 'issued-in-future')
+})
+
+test('remote transport rejects an envelope that is expired or outlived by its lease', async () => {
+  const secret = 'remote-secret-for-tests'
+  const futureEnvelope = envelope({ createdAt: 10_000, ttlMs: 20_000 })
+  const futureMessage = createRemoteTransportMessage({
+    envelope: futureEnvelope,
+    sourceNodeId: 'node-a',
+    targetNodeId: 'node-b',
+    issuedAt: 2_000,
+    leaseMs: 10_000,
+  })
+  const handler = createRemoteTransportHandler(async message => ({
+    accepted: true,
+    deliveryId: message.deliveryId,
+  }), { sharedSecret: secret, now: () => 2_000, clockSkewMs: 0 })
+  const futureResponse = await handler(requestFor(futureMessage, secret))
+  assert.equal(futureResponse.status, 400)
+  assert.equal((await futureResponse.json()).errorCode, 'envelope-issued-in-future')
+
+  const expiredEnvelope = envelope({ createdAt: 1_000, ttlMs: 1_000 })
+  const expiredMessage = createRemoteTransportMessage({
+    envelope: expiredEnvelope,
+    sourceNodeId: 'node-a',
+    targetNodeId: 'node-b',
+    issuedAt: 1_500,
+    leaseMs: 10_000,
+  })
+  const expiredResponse = await createRemoteTransportHandler(async message => ({
+    accepted: true,
+    deliveryId: message.deliveryId,
+  }), { sharedSecret: secret, now: () => 5_000, clockSkewMs: 0 })(requestFor(expiredMessage, secret))
+  assert.equal(expiredResponse.status, 410)
+  assert.equal((await expiredResponse.json()).errorCode, 'message-expired')
+
+  const extended = { ...futureMessage, expiresAt: 40_000 }
+  assert.throws(() => validateRemoteTransportMessage(extended), RemoteTransportValidationError)
+})
+
+test('reserved outbound deliveries renew with a new fence and delivery identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-remote-renew-'))
+  try {
+    const message = createRemoteTransportMessage({
+      envelope: envelope({ createdAt: 1_000, ttlMs: 100_000, idempotencyKey: 'renew-key' }),
+      sourceNodeId: 'node-a',
+      targetNodeId: 'node-b',
+      fencingToken: 3,
+      issuedAt: 2_000,
+      leaseMs: 1_000,
+    })
+    const ledger = new RemoteDeliveryLedger(join(root, 'remote-renew.jsonl'))
+    await ledger.reserveOutbound(message)
+    const renewed = await ledger.renewOutbound(message, 20_000, { defaultLeaseMs: 10_000 })
+    assert.notEqual(renewed.deliveryId, message.deliveryId)
+    assert.notEqual(renewed.leaseId, message.leaseId)
+    assert.equal(renewed.fencingToken, 4)
+    assert.equal(renewed.envelope.idempotencyKey, 'renew-key')
+    assert.equal((await ledger.getOutbound('node-a', 'renew-key'))?.deliveryId, renewed.deliveryId)
+    await ledger.commitOutbound(message)
+    assert.equal((await ledger.snapshot()).find(item => item.entry.direction === 'outbound')?.entry.state, 'reserved')
+    await ledger.commitOutbound(renewed)
+    assert.equal((await ledger.snapshot()).find(item => item.entry.direction === 'outbound')?.entry.state, 'accepted')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

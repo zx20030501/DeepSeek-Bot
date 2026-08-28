@@ -682,6 +682,7 @@ export interface CreateTaskInput {
   readonly workflowRevision?: number
   readonly workflowRunId?: string
   readonly workflowNodeId?: string
+  readonly workflowLogicalNodeId?: string
   readonly workflowReplyTarget?: BotTarget
   readonly workflowTraceId?: string
   readonly workflowInputs?: Record<string, unknown>
@@ -730,6 +731,7 @@ export class TaskRunStore {
       ...(input.workflowRevision === undefined ? {} : { workflowRevision: input.workflowRevision }),
       ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
       ...(input.workflowNodeId === undefined ? {} : { workflowNodeId: input.workflowNodeId }),
+      ...(input.workflowLogicalNodeId === undefined ? {} : { workflowLogicalNodeId: input.workflowLogicalNodeId }),
       ...(input.workflowReplyTarget === undefined ? {} : { workflowReplyTarget: { ...input.workflowReplyTarget } }),
       ...(input.workflowTraceId === undefined ? {} : { workflowTraceId: input.workflowTraceId }),
       ...(input.workflowInputs === undefined ? {} : { workflowInputs: structuredClone(input.workflowInputs) }),

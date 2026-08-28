@@ -131,19 +131,10 @@ const weekdayNumbers: Readonly<Record<string, number>> = {
   Sat: 6,
 }
 
-function calendarParts(date: Date, timezone: string): CalendarParts {
-  if (timezone === 'UTC') {
-    return {
-      minute: date.getUTCMinutes(),
-      hour: date.getUTCHours(),
-      dayOfMonth: date.getUTCDate(),
-      month: date.getUTCMonth() + 1,
-      dayOfWeek: date.getUTCDay(),
-    }
-  }
-  let formatter: Intl.DateTimeFormat
+function timezoneFormatter(timezone: string): Intl.DateTimeFormat | undefined {
+  if (timezone === 'UTC') return undefined
   try {
-    formatter = new Intl.DateTimeFormat('en-US', {
+    return new Intl.DateTimeFormat('en-US', {
       timeZone: timezone,
       year: 'numeric',
       month: 'numeric',
@@ -156,8 +147,22 @@ function calendarParts(date: Date, timezone: string): CalendarParts {
   } catch (error: unknown) {
     throw new CronExpressionError('Invalid IANA timezone: ' + timezone + ' (' + String(error) + ')')
   }
+}
+
+function calendarParts(date: Date, timezone: string, formatter?: Intl.DateTimeFormat): CalendarParts {
+  if (timezone === 'UTC') {
+    return {
+      minute: date.getUTCMinutes(),
+      hour: date.getUTCHours(),
+      dayOfMonth: date.getUTCDate(),
+      month: date.getUTCMonth() + 1,
+      dayOfWeek: date.getUTCDay(),
+    }
+  }
+  const resolvedFormatter = formatter ?? timezoneFormatter(timezone)
+  if (resolvedFormatter === undefined) throw new CronExpressionError('Invalid IANA timezone: ' + timezone)
   const values: Record<string, string> = {}
-  for (const part of formatter.formatToParts(date)) values[part.type] = part.value
+  for (const part of resolvedFormatter.formatToParts(date)) values[part.type] = part.value
   const weekdayName = values.weekday
   if (weekdayName === undefined) throw new CronExpressionError('Could not resolve weekday for timezone: ' + timezone)
   const weekday = weekdayNumbers[weekdayName]
@@ -175,11 +180,12 @@ export function cronMatches(
   expression: string | ParsedCronExpression,
   at: Date | number,
   timezone = 'UTC',
+  formatter?: Intl.DateTimeFormat,
 ): boolean {
   const parsed = typeof expression === 'string' ? parseCronExpression(expression) : expression
   const date = at instanceof Date ? at : new Date(at)
   if (Number.isNaN(date.getTime())) throw new CronExpressionError('Invalid date for cron matching')
-  const parts = calendarParts(date, timezone)
+  const parts = calendarParts(date, timezone, formatter)
   if (!parsed.minute.values.has(parts.minute) || !parsed.hour.values.has(parts.hour)) return false
   if (!parsed.month.values.has(parts.month)) return false
   const dayOfMonthMatches = parsed.dayOfMonth.values.has(parts.dayOfMonth)
@@ -200,11 +206,12 @@ export function nextCronOccurrence(
 ): number {
   const parsed = typeof expression === 'string' ? parseCronExpression(expression) : expression
   if (!Number.isFinite(afterMs)) throw new CronExpressionError('Cron search start must be finite')
+  const formatter = timezoneFormatter(timezone)
   // Occurrences are strictly after the supplied point. This keeps a
   // scheduler restart from running the same minute twice.
   let cursor = Math.floor(afterMs / 60_000) * 60_000 + 60_000
   for (let index = 0; index < MAX_CRON_SEARCH_MINUTES; index += 1) {
-    if (cronMatches(parsed, cursor, timezone)) return cursor
+    if (cronMatches(parsed, cursor, timezone, formatter)) return cursor
     cursor += 60_000
   }
   throw new CronExpressionError('No cron occurrence found within the five-year search horizon')
@@ -229,6 +236,10 @@ interface PendingRoutineLaunch {
   readonly scheduledAt: number
   readonly attempts: number
   readonly nextAttemptAt: number
+  /** Snapshot the launch payload so edits affect future cron ticks only. */
+  readonly workflowId?: string
+  readonly inputs?: Readonly<Record<string, unknown>>
+  readonly replyTarget?: BotTarget
   /** A short durable lease prevents duplicate dispatch while a launch is in flight. */
   readonly leaseUntil?: number
 }
@@ -307,7 +318,49 @@ function clone<T>(value: T): T {
   return structuredClone(value)
 }
 
+function assertJsonSafe(value: unknown, path: string, seen: Set<object>): void {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', path + ' must contain finite numbers')
+    return
+  }
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') {
+    throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', path + ' must be JSON-safe')
+  }
+  if (typeof value !== 'object') throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', path + ' must be JSON-safe')
+  if (seen.has(value)) throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', path + ' contains a cycle')
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null && !Array.isArray(value)) {
+    throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', path + ' must contain plain JSON objects')
+  }
+  seen.add(value)
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertJsonSafe(item, path + '[' + index + ']', seen))
+  } else {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      assertJsonSafe(item, path + '.' + key, seen)
+    }
+  }
+  seen.delete(value)
+}
+
+function cloneRoutineInputs(input: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', 'Routine inputs must be a JSON object')
+  }
+  assertJsonSafe(input, '$', new Set())
+  try {
+    const serialized = JSON.stringify(input)
+    if (serialized === undefined) throw new Error('inputs could not be serialized')
+    return JSON.parse(serialized) as Readonly<Record<string, unknown>>
+  } catch (error: unknown) {
+    if (error instanceof RoutineStoreError) throw error
+    throw new RoutineStoreError('ROUTINE_INVALID_INPUTS', 'Routine inputs must be JSON-safe: ' + String(error))
+  }
+}
+
 function assertRoutineInput(input: Readonly<Record<string, unknown>>): void {
+  cloneRoutineInputs(input)
   try {
     assertNoCredentialMaterial(input, 'Routine inputs must not contain credential material')
   } catch (error: unknown) {
@@ -342,15 +395,16 @@ function validRoutineEvent(value: unknown): value is RoutineEvent {
 function toLaunch(record: RoutineRecord): RoutineLaunch | undefined {
   const pending = record.pendingLaunch
   if (pending === undefined) return undefined
+  const replyTarget = pending.replyTarget ?? record.replyTarget
   return {
     id: pending.id,
     routineId: record.id,
     ownerId: record.ownerId,
-    workflowId: record.workflowId,
+    workflowId: pending.workflowId ?? record.workflowId,
     scheduledAt: pending.scheduledAt,
     attempt: pending.attempts,
-    inputs: clone(record.inputs),
-    ...(record.replyTarget === undefined ? {} : { replyTarget: clone(record.replyTarget) }),
+    inputs: clone(pending.inputs ?? record.inputs),
+    ...(replyTarget === undefined ? {} : { replyTarget: clone(replyTarget) }),
   }
 }
 
@@ -393,11 +447,11 @@ export class RoutineStore {
       const workflowId = validateRoutineText(input.workflowId, 'workflowId')
       const cron = parseCronExpression(input.cron).expression
       const timezone = validateRoutineText(input.timezone ?? 'UTC', 'timezone')
+      if (!Number.isFinite(at)) throw new RoutineStoreError('ROUTINE_INVALID_TIME', 'Routine timestamp must be finite')
       // Validate the timezone before writing a durable record.
       calendarParts(new Date(at), timezone)
-      const inputs = input.inputs ?? {}
+      const inputs = cloneRoutineInputs(input.inputs ?? {})
       assertRoutineInput(inputs)
-      if (!Number.isFinite(at)) throw new RoutineStoreError('ROUTINE_INVALID_TIME', 'Routine timestamp must be finite')
       const enabled = input.enabled !== false
       const nextRunAt = nextCronOccurrence(cron, input.startAt ?? at, timezone)
       const record: RoutineRecord = {
@@ -444,8 +498,9 @@ export class RoutineStore {
       const workflowId = patch.workflowId === undefined ? current.workflowId : validateRoutineText(patch.workflowId, 'workflowId')
       const cron = patch.cron === undefined ? current.cron : parseCronExpression(patch.cron).expression
       const timezone = patch.timezone === undefined ? current.timezone : validateRoutineText(patch.timezone, 'timezone')
+      if (!Number.isFinite(at)) throw new RoutineStoreError('ROUTINE_INVALID_TIME', 'Routine timestamp must be finite')
       calendarParts(new Date(at), timezone)
-      const inputs = patch.inputs === undefined ? current.inputs : patch.inputs
+      const inputs = patch.inputs === undefined ? current.inputs : cloneRoutineInputs(patch.inputs)
       assertRoutineInput(inputs)
       const cronChanged = cron !== current.cron || timezone !== current.timezone
       const enabled = patch.enabled ?? current.status === 'enabled'
@@ -479,7 +534,6 @@ export class RoutineStore {
       await this.load()
       const current = this.routines.get(id)
       if (current === undefined) return
-      this.routines.delete(id)
       await this.journal.append({
         schemaVersion: ROUTINE_SCHEMA_VERSION,
         eventId: randomUUID(),
@@ -487,6 +541,7 @@ export class RoutineStore {
         at,
         routineId: id,
       })
+      this.routines.delete(id)
     })
   }
 
@@ -495,11 +550,16 @@ export class RoutineStore {
    * is durable, so a crash after this method returns is recovered as the same
    * launch ID instead of silently losing a scheduled run.
    */
-  public async claimDue(now = Date.now(), limit = 32): Promise<RoutineLaunch[]> {
+  public async claimDue(
+    now = Date.now(),
+    limit = 32,
+    excludeLaunchIds: ReadonlySet<string> = new Set(),
+  ): Promise<RoutineLaunch[]> {
     return this.mutate(async () => {
       await this.load()
       const candidates = [...this.routines.values()]
         .filter(record => record.status === 'enabled')
+        .filter(record => record.pendingLaunch === undefined || !excludeLaunchIds.has(record.pendingLaunch.id))
         .filter(record => (
           record.pendingLaunch !== undefined
             ? record.pendingLaunch.nextAttemptAt <= now
@@ -515,9 +575,17 @@ export class RoutineStore {
           attempts: 1,
           nextAttemptAt: now,
           leaseUntil: now + this.launchLeaseMs,
+          workflowId: current.workflowId,
+          inputs: clone(current.inputs),
+          ...(current.replyTarget === undefined ? {} : { replyTarget: clone(current.replyTarget) }),
         }
         const renewedPending: PendingRoutineLaunch = {
           ...pending,
+          ...(pending.workflowId === undefined ? { workflowId: current.workflowId } : {}),
+          ...(pending.inputs === undefined ? { inputs: clone(current.inputs) } : {}),
+          ...(pending.replyTarget === undefined && current.replyTarget !== undefined
+            ? { replyTarget: clone(current.replyTarget) }
+            : {}),
           leaseUntil: now + this.launchLeaseMs,
         }
         const updated: RoutineRecord = {
@@ -585,7 +653,6 @@ export class RoutineStore {
   }
 
   private async append(input: { kind: 'snapshot'; routine: RoutineRecord; at: number }): Promise<void> {
-    this.routines.set(input.routine.id, clone(input.routine))
     await this.journal.append({
       schemaVersion: ROUTINE_SCHEMA_VERSION,
       eventId: randomUUID(),
@@ -593,6 +660,7 @@ export class RoutineStore {
       at: input.at,
       routine: input.routine,
     })
+    this.routines.set(input.routine.id, clone(input.routine))
   }
 
   private async mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -623,9 +691,10 @@ export class RoutineScheduler {
   private readonly now: () => number
   private readonly onError: ((error: unknown) => void) | undefined
   private readonly active = new Set<Promise<void>>()
+  private readonly activeLaunchIds = new Set<string>()
   private timer: ReturnType<typeof setTimeout> | undefined
+  private tickTask: Promise<void> | undefined
   private running = false
-  private tickInFlight: Promise<void> | undefined
 
   public constructor(private readonly options: RoutineSchedulerOptions) {
     this.pollMs = Math.max(250, options.pollMs ?? 15_000)
@@ -637,41 +706,55 @@ export class RoutineScheduler {
   public start(): void {
     if (this.running) return
     this.running = true
-    void this.tick()
+    this.scheduleTick()
   }
 
   public async stop(): Promise<void> {
     this.running = false
     if (this.timer !== undefined) clearTimeout(this.timer)
     this.timer = undefined
-    const tick = this.tickInFlight
-    if (tick !== undefined) await tick
-    await Promise.allSettled([...this.active])
+    const tick = this.tickTask
+    if (tick !== undefined) await Promise.allSettled([tick])
+    while (this.active.size > 0) await Promise.allSettled([...this.active])
+  }
+
+  private scheduleTick(): void {
+    if (!this.running) return
+    const task = this.tick()
+    this.tickTask = task
+    void task.then(
+      () => { if (this.tickTask === task) this.tickTask = undefined },
+      () => { if (this.tickTask === task) this.tickTask = undefined },
+    )
   }
 
   private async tick(): Promise<void> {
     if (!this.running) return
-    const body = this.runTick()
-    this.tickInFlight = body
     try {
-      await body
-    } finally {
-      if (this.tickInFlight === body) this.tickInFlight = undefined
-    }
-  }
-
-  private async runTick(): Promise<void> {
-    try {
-      const launches = await this.options.store.claimDue(this.now(), this.maxDuePerTick)
+      const launches = await this.options.store.claimDue(this.now(), this.maxDuePerTick, this.activeLaunchIds)
+      if (!this.running) return
       for (const launch of launches) {
-        const task = this.dispatch(launch)
+        if (!this.running) break
+        this.activeLaunchIds.add(launch.id)
+        // Keep synchronous dispatch failures inside the tracked Promise so a
+        // stopped scheduler can always release this launch's active marker.
+        const task = Promise.resolve().then(() => this.dispatch(launch))
         this.active.add(task)
-        void task.finally(() => this.active.delete(task))
+        void task.then(
+          () => {
+            this.active.delete(task)
+            this.activeLaunchIds.delete(launch.id)
+          },
+          () => {
+            this.active.delete(task)
+            this.activeLaunchIds.delete(launch.id)
+          },
+        )
       }
     } catch (error: unknown) {
       this.onError?.(error)
     } finally {
-      if (this.running) this.timer = setTimeout(() => { void this.tick() }, this.pollMs)
+      if (this.running) this.timer = setTimeout(() => this.scheduleTick(), this.pollMs)
     }
   }
 

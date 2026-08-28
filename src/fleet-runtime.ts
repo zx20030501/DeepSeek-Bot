@@ -14,6 +14,7 @@ import type {
   WorkflowDefinition,
   WorkflowNode,
   WorkflowNodeKind,
+  WorkflowReference,
 } from './fleet-v2-types.js'
 
 export interface ManagerGatewayRequest {
@@ -166,6 +167,24 @@ export function compileManagerDispatches(
 function dependencyMap(definition: WorkflowDefinition): Map<string, Set<string>> {
   const dependencies = new Map(definition.nodes.map(node => [node.id, new Set(node.dependsOn ?? [])]))
   for (const edge of definition.edges) dependencies.get(edge.to)?.add(edge.from)
+  const addReferenceDependency = (consumerId: string, reference: WorkflowReference): void => {
+    if (reference.kind !== 'node-output' || reference.nodeId === consumerId) return
+    dependencies.get(consumerId)?.add(reference.nodeId)
+  }
+  for (const node of definition.nodes) {
+    for (const binding of node.inputs ?? []) addReferenceDependency(node.id, binding.source)
+    if (node.condition !== undefined) addReferenceDependency(node.id, node.condition.source)
+    if (node.map !== undefined) addReferenceDependency(node.id, node.map.source)
+    if (node.reduce !== undefined) addReferenceDependency(node.id, node.reduce.source)
+    // A control node must settle before either of its selected/ skipped
+    // branches can become runnable. The schema also records these relations
+    // for reachability, but the executable plan needs them as dependencies.
+    if (node.condition !== undefined) {
+      dependencies.get(node.condition.whenTrue)?.add(node.id)
+      if (node.condition.whenFalse !== undefined) dependencies.get(node.condition.whenFalse)?.add(node.id)
+    }
+    if (node.map !== undefined) dependencies.get(node.map.templateNodeId)?.add(node.id)
+  }
   return dependencies
 }
 
@@ -205,7 +224,7 @@ function entryTaskNodeIds(definition: WorkflowDefinition): string[] {
       if (!compensationTargets.has(node.id)) result.push(node.id)
       return
     }
-    if (node.kind === 'condition' || node.kind === 'approval') return
+    if (node.kind === 'condition' || node.kind === 'approval' || node.kind === 'map' || node.kind === 'reduce') return
     for (const child of node.children ?? []) visit(child)
   }
   visit(definition.entryNodeId)

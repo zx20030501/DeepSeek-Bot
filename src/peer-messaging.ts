@@ -253,6 +253,101 @@ export function createPeerEnvelope(
     : base
 }
 
+/**
+ * Validate a peer envelope received from an untrusted transport boundary.
+ * `isPeerMessage` is intentionally only a cheap discriminator; remote
+ * receivers must use this stricter check so a legacy-looking object cannot
+ * bypass the protocol's address, TTL, hop, and idempotency invariants.
+ */
+export function validatePeerEnvelope(
+  value: unknown,
+  rawPolicy: Pick<BotCollaborationConfig, 'peerMessageTtlMs' | 'peerMaxHops' | 'peerMaxPayloadBytes'> = {},
+): BotMessageEnvelope {
+  const policy = normalizePeerPolicy(rawPolicy)
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new PeerMessageValidationError('invalid-envelope', 'peer envelope must be an object')
+  }
+  const input = value as Record<string, unknown>
+  if (input.schemaVersion !== PEER_MESSAGE_SCHEMA_VERSION) {
+    throw new PeerMessageValidationError('unsupported-schema', 'peer envelope schemaVersion is unsupported')
+  }
+  const id = reference(input.id, 'id')
+  const kind = input.kind
+  if (!['request', 'reply', 'report', 'event', 'cancel', 'response', 'handoff'].includes(String(kind))) {
+    throw new PeerMessageValidationError('invalid-kind', 'kind is not supported')
+  }
+  const from = reference(input.from, 'from')
+  const to = reference(input.to, 'to')
+  const fromAddress = normalizeAddress(input.fromAddress as BotAddress, 'fromAddress')
+  const toAddress = normalizeAddress(input.toAddress as BotAddress, 'toAddress')
+  if (fromAddress.id !== from || toAddress.id !== to) {
+    throw new PeerMessageValidationError('address-mismatch', 'legacy from/to fields must match their addresses')
+  }
+  const taskId = reference(input.taskId, 'taskId')
+  const runId = reference(input.runId, 'runId')
+  const attemptId = reference(input.attemptId, 'attemptId')
+  const correlationId = reference(input.correlationId, 'correlationId')
+  const conversationId = reference(input.conversationId, 'conversationId')
+  const traceId = reference(input.traceId, 'traceId')
+  const replyTo = input.replyTo === undefined ? undefined : reference(input.replyTo, 'replyTo')
+  const roomId = input.roomId === undefined ? undefined : reference(input.roomId, 'roomId')
+  const idempotencyKey = reference(input.idempotencyKey, 'idempotencyKey')
+  const createdAt = input.createdAt
+  const expiresAt = input.expiresAt
+  if (!Number.isSafeInteger(createdAt) || (createdAt as number) < 0) {
+    throw new PeerMessageValidationError('invalid-time', 'createdAt must be a non-negative integer')
+  }
+  if (!Number.isSafeInteger(expiresAt) || (expiresAt as number) <= (createdAt as number)) {
+    throw new PeerMessageValidationError('invalid-time', 'expiresAt must be after createdAt')
+  }
+  if ((expiresAt as number) - (createdAt as number) > policy.maxTtlMs) {
+    throw new PeerMessageValidationError('ttl-exceeded', 'message TTL exceeds the protocol maximum')
+  }
+  const epoch = input.epoch
+  if (epoch !== undefined && (!Number.isSafeInteger(epoch) || (epoch as number) < 0)) {
+    throw new PeerMessageValidationError('invalid-epoch', 'epoch must be a non-negative integer')
+  }
+  const maxHops = input.maxHops
+  const hop = input.hop
+  if (!Number.isSafeInteger(maxHops) || (maxHops as number) < 0 || (maxHops as number) > policy.maxHops) {
+    throw new PeerMessageValidationError('hop-limit-exceeded', 'maxHops exceeds the configured protocol limit')
+  }
+  if (!Number.isSafeInteger(hop) || (hop as number) < 0 || (hop as number) > (maxHops as number)) {
+    throw new PeerMessageValidationError('hop-limit-exceeded', 'hop must be between zero and maxHops')
+  }
+  const payload = input.payload
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new PeerMessageValidationError('invalid-payload', 'payload must be a plain JSON object')
+  }
+  const clonedPayload = clonePayload(payload as Record<string, unknown>, policy.maxPayloadBytes)
+  const cloned = JSON.parse(JSON.stringify(input)) as Record<string, unknown>
+  return {
+    ...cloned,
+    id,
+    kind: kind as BotMessageKind,
+    from,
+    to,
+    taskId,
+    runId,
+    attemptId,
+    correlationId,
+    schemaVersion: PEER_MESSAGE_SCHEMA_VERSION,
+    fromAddress,
+    toAddress,
+    conversationId,
+    ...(replyTo === undefined ? {} : { replyTo }),
+    traceId,
+    hop: hop as number,
+    maxHops: maxHops as number,
+    ...(roomId === undefined ? {} : { roomId }),
+    ...(epoch === undefined ? {} : { epoch: epoch as number }),
+    idempotencyKey,
+    payload: clonedPayload,
+    createdAt: createdAt as number,
+    expiresAt: expiresAt as number,
+  }
+}
+
 export function forwardPeerMessage(
   envelope: BotMessageEnvelope,
   from: BotAddress,

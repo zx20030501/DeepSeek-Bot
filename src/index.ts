@@ -212,6 +212,7 @@ export {
   isPeerMessage,
   normalizePeerPolicy,
   peerMessageIdempotencyKey,
+  validatePeerEnvelope,
   validatePeerPayload,
 } from './peer-messaging.js'
 export type { PeerMessageInput, PeerMessagePolicy } from './peer-messaging.js'
@@ -290,6 +291,7 @@ export type {
   RuntimeMessageRole,
   RuntimeTaskRequest,
   RuntimeTaskResult,
+  RuntimeToolCall,
   RuntimeToolDefinition,
   RuntimeUsage,
   XaiGrokRuntimeAdapterOptions,
