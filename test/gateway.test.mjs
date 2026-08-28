@@ -2495,3 +2495,325 @@ test('native DSH web user agent receives bot_create_draft tools via explicit own
     await rm(root, { recursive: true, force: true })
   }
 })
+
+function ownerWebAgent(sessionId) {
+  const events = []
+  const session = {
+    get events() { return events },
+    get seq() { return events.length },
+    append(type, data) {
+      const event = { type, seq: events.length, time: Date.now(), data }
+      events.push(event)
+      return event
+    },
+  }
+  const followupCalls = []
+  const agent = {
+    id: sessionId,
+    status: 'idle',
+    options: {},
+    session,
+    followupCalls,
+    cancel() { agent.status = 'idle' },
+    followup(...args) { followupCalls.push(args) },
+  }
+  return agent
+}
+
+function emitOwnerWebUserMessage(gateway, sessionId, text, seq = 1) {
+  gateway.onSessionEvent({ id: sessionId }, {
+    type: 'user/message',
+    seq,
+    data: {
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    },
+  })
+}
+
+function ownerWebNoticeTexts(agent) {
+  return agent.session.events
+    .filter(event => event.type === 'user/message')
+    .map(event => {
+      const data = event.data ?? {}
+      const content = data.content ?? data.message?.content
+      if (!Array.isArray(content)) return typeof data.text === 'string' ? data.text : JSON.stringify(data)
+      return content.map(block => block.text ?? '').join('')
+    })
+}
+
+async function waitUntil(predicate, timeout = 2_000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (await predicate()) return true
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  return false
+}
+
+test('registered unbound DSH web owner session starts Group Room from roster @mentions without Feishu', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-group-room-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-owner-group-room'
+    const agents = new Map()
+    const registeredTools = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId: id, agentOptions, setup }) {
+        const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
+        const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
+        if (setup) await setup(agentCtx)
+        const worker = withMockSession({
+          id: String(id), status: 'idle', options: agentOptions ?? {}, cancel() {}, followup() {},
+        })
+        agents.set(String(id), worker)
+        return { agent: worker }
+      },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    emitOwnerWebUserMessage(gateway, sessionId, '@rosterbota @rosterbotb hi')
+    assert.equal(await waitUntil(async () => (await gateway.fleetStatus()).fleet.rooms.length === 1), true)
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.rooms.length, 1)
+    assert.deepEqual([...snapshot.fleet.rooms[0].participants].sort(), ['rosterbota', 'rosterbotb'])
+    assert.equal(snapshot.fleet.tasks.length, 1)
+    assert.equal(registeredTools.has('bot_create_draft'), false)
+    assert.equal(agent.followupCalls.length, 0, 'owner conversation must not be stolen by followup')
+    assert.equal(await waitUntil(() => ownerWebNoticeTexts(agent).some(text => /协作房间/u.test(text))), true)
+    assert.ok(ownerWebNoticeTexts(agent).some(text => /@rosterbota/u.test(text) && /@rosterbotb/u.test(text)))
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('registered unbound DSH web owner session /fleet hits planner without dynamicRegistry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-fleet-plan-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-owner-fleet'
+    const agents = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('planner path should not create worker agents before approval') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { fleetRole: 'worker', capabilities: ['research'] },
+        rosterbotb: { fleetRole: 'synthesizer', capabilities: ['summary'] },
+      },
+      collaboration: {
+        enabled: true,
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    emitOwnerWebUserMessage(gateway, sessionId, '/fleet research this issue')
+    assert.equal(await waitUntil(async () => (await gateway.fleetStatus()).fleet.workflows.length === 1), true)
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.workflows[0].status, 'pending-approval')
+    assert.ok(snapshot.fleet.workflows[0].workerBotIds.length >= 1)
+    assert.equal(snapshot.fleet.approvals.some(item => item.status === 'pending' && item.kind === 'workflow'), true)
+    assert.equal(await waitUntil(() => ownerWebNoticeTexts(agent).some(text => /Fleet 已生成执行计划/u.test(text))), true)
+    assert.equal(agent.followupCalls.length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('unregistered DSH web session cannot start Group Room from roster @mentions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-unregistered-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-unregistered'
+    const agents = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('unregistered web session must not start collaboration') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false },
+      },
+    })
+    await gateway.start()
+    emitOwnerWebUserMessage(gateway, sessionId, '@rosterbota @rosterbotb hi')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.rooms.length, 0)
+    assert.equal(snapshot.fleet.tasks.length, 0)
+    assert.equal(agent.followupCalls.length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('unknown @mention on DSH web owner session does not open a room or impersonate a bot', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-unknown-mention-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-owner-unknown'
+    const agents = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('unknown mention must not create a worker') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    emitOwnerWebUserMessage(gateway, sessionId, '@not-in-roster hi')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.rooms.length, 0)
+    assert.equal(snapshot.fleet.tasks.length, 0)
+    assert.equal(agent.followupCalls.length, 0)
+    assert.equal(ownerWebNoticeTexts(agent).length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('hermes-bot worker session is not owner-web inbound and does not receive owner tools', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-worker-isolation-'))
+  let gateway
+  try {
+    const sessionId = 'hermes-bot-workflow-worker-session'
+    const agents = new Map()
+    const registeredTools = new Map()
+    const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
+    const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
+    const agent = ownerWebAgent(sessionId)
+    agent.ctx = agentCtx
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('worker session must not create more agents from owner-web inbound') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: true },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    assert.equal(registeredTools.has('bot_create_draft'), false, 'hermes-bot worker must not receive owner tools')
+    emitOwnerWebUserMessage(gateway, sessionId, '@rosterbota @rosterbotb hi')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.rooms.length, 0, 'hermes-bot worker must not open a Group Room')
+    assert.equal(snapshot.fleet.tasks.length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Feishu inbound @mentions still open a Group Room after DSH web Fleet wiring', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-feishu-group-room-still-works-'))
+  let gateway
+  try {
+    const agents = new Map()
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, agentOptions }) {
+        const agent = withMockSession({
+          id: String(sessionId), status: 'idle', options: agentOptions ?? {}, cancel() {}, followup() {},
+        })
+        agents.set(String(sessionId), agent)
+        return { agent }
+      },
+    } : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_feishu'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: { enabled: true, approvalMode: 'never' },
+    })
+    const sent = []
+    let inbound
+    const transport = {
+      platform: 'feishu',
+      async start(handler) { inbound = handler },
+      async stop() {},
+      async send(target, text) { sent.push({ target, text }) },
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    await inbound({
+      id: 'feishu-group-room',
+      target: { platform: 'feishu', chatId: 'oc_feishu', chatType: 'dm', userId: 'ou_feishu' },
+      text: '@rosterbota @rosterbotb 请协作',
+      receivedAt: Date.now(),
+    })
+    assert.equal(await waitUntil(() => sent.some(item => /协作房间/u.test(item.text))), true)
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.rooms.length, 1)
+    assert.deepEqual([...snapshot.fleet.rooms[0].participants].sort(), ['rosterbota', 'rosterbotb'])
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
