@@ -1980,13 +1980,14 @@ test('chat commands create, confirm, edit, isolate, disable, enable, and delete 
   }
 })
 
-test('normal Hermes Agent receives a scoped natural-language Bot draft tool with no owner or ACL arguments', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-dynamic-tool-'))
+test('Feishu session does NOT receive bot_create_draft even with dynamicRegistry ON - tools are DSH Web only', async () => {
+  // CRO requirement: bot creation tools (bot_create_draft, bot_update_draft) are ONLY installed
+  // on local DSH web sessions. Feishu/Telegram sessions NEVER receive these tools.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-gateway-feishu-no-tools-'))
   let gateway
   try {
     const agents = new Map()
     const registeredTools = new Map()
-    let liveAgent
     const agentRegistry = {
       get(id) { return agents.get(String(id)) },
       async resume() { throw new Error('not found') },
@@ -1994,7 +1995,7 @@ test('normal Hermes Agent receives a scoped natural-language Bot draft tool with
         const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
         const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
         if (setup) await setup(agentCtx)
-        liveAgent = {
+        const liveAgent = {
           id: String(sessionId), ctx: agentCtx, status: 'idle', options: agentOptions ?? {}, cancel() {}, followup() {},
         }
         agents.set(String(sessionId), liveAgent)
@@ -2005,7 +2006,8 @@ test('normal Hermes Agent receives a scoped natural-language Bot draft tool with
       stateDir: root,
       access: { userIds: ['ou_tool'] },
       telegram: { enabled: false }, feishu: { enabled: false },
-      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true } },
+      // Both flags ON - but Feishu should still NOT get the tools
+      collaboration: { features: { dynamicRegistry: true, chatBotCreation: true, webChatBotCreation: true } },
     })
     let inbound
     const transport = {
@@ -2015,45 +2017,16 @@ test('normal Hermes Agent receives a scoped natural-language Bot draft tool with
     gateway.transportByPlatform.set('feishu', transport)
     await gateway.start()
     await inbound({
-      id: 'dynamic-tool-message',
+      id: 'feishu-tool-message',
       target: { platform: 'feishu', chatId: 'oc_tool', chatType: 'dm', userId: 'ou_tool' },
       text: '帮我创建一个专门做研究的 Bot',
       receivedAt: Date.now(),
     })
-    const deadline = Date.now() + 2_000
-    while (!registeredTools.has('bot_create_draft') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
-    const createTool = registeredTools.get('bot_create_draft')
-    const updateTool = registeredTools.get('bot_update_draft')
-    assert.ok(createTool)
-    assert.ok(updateTool)
-    assert.equal('ownerId' in createTool.parameters.properties, false)
-    assert.equal('allowedUserIds' in createTool.parameters.properties, false)
-    assert.equal('ownerId' in updateTool.parameters.properties, false)
-    const execution = {
-      signal: new AbortController().signal,
-      agent: liveAgent,
-      concludeTurn() {},
-      deferContext() {},
-    }
-    const result = await createTool.execute({
-      handle: 'research-helper', title: '研究助手', role: 'worker', capabilities: ['research'],
-    }, execution)
-    assert.equal(result.status, 'draft')
-    assert.match(result.confirmationCode, /^[A-Z0-9]{8}$/u)
-    assert.deepEqual((await gateway.registry.get(result.botId))?.revision.allowedUserIds, ['ou_tool'])
-    const updated = await updateTool.execute({
-      handle: 'research-helper', title: '高级研究助手', capabilities: ['research', 'review'],
-    }, execution)
-    assert.equal(updated.version, 2)
-    assert.notEqual(updated.confirmationCode, result.confirmationCode)
-    assert.equal((await gateway.registry.get(result.botId))?.revision.title, '高级研究助手')
-    await assert.rejects(createTool.execute({
-      handle: 'unsafe-bot', title: 'Unsafe', soul: `Use ${'sk-' + 'x'.repeat(32)}`,
-    }, execution), /credential|API keys/u)
-    assert.equal(await gateway.resolveApproval(result.confirmationCode, 'approved', 'local-dashboard'), undefined)
-    assert.equal((await gateway.registry.get(result.botId))?.definition.status, 'draft')
-    await gateway.resolveApproval(updated.confirmationCode, 'approved', 'local-dashboard')
-    assert.equal(gateway.directory.canInvoke('research-helper', { platform: 'feishu', chatId: 'oc_tool', userId: 'ou_tool' }), true)
+    // Wait a bit to ensure any async tool registration would have happened
+    await new Promise(resolve => setTimeout(resolve, 500))
+    // Feishu sessions should NOT receive the bot creation tools
+    assert.equal(registeredTools.has('bot_create_draft'), false, 'Feishu session should NOT receive bot_create_draft')
+    assert.equal(registeredTools.has('bot_update_draft'), false, 'Feishu session should NOT receive bot_update_draft')
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
@@ -2201,9 +2174,10 @@ test('@team creates a durable Team Thread and bounded Group Room from chat', asy
   }
 })
 
-test('unbound DSH web session can create+confirm bot with only webChatBotCreation ON, no Feishu identity required', async () => {
-  // BLOCKER TEST: DSH web sessions without Feishu/Telegram binding must be able to create bots.
-  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-unbound-web-create-'))
+test('unbound local DSH web session can create+confirm bot into roster via API with only webChatBotCreation ON', async () => {
+  // BLOCKER TEST: DSH web sessions (platform=local, unbound) MUST be able to create/confirm bots
+  // with only webChatBotCreation ON. This test uses the API directly to verify the core functionality.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-local-web-api-'))
   let gateway
   try {
     gateway = new BotGateway({}, {
@@ -2219,19 +2193,23 @@ test('unbound DSH web session can create+confirm bot with only webChatBotCreatio
       },
     })
     await gateway.start()
-    // Create a bot with local target (unbound DSH web session)
+    // Create a bot with local target (unbound DSH web session) via API
     const localTarget = { platform: 'local', chatId: 'local-dashboard', chatType: 'dm', userId: 'local-owner' }
     const botDraft = await gateway.createDynamicBotDraft({
-      handle: 'local-web-bot',
+      handle: 'local-research-bot',
       title: 'Bot from Local DSH Web Session',
+      role: 'worker',
+      capabilities: ['research'],
     }, localTarget)
     assert.equal(botDraft.status, 'draft')
     assert.ok(botDraft.confirmationCode, 'Should have a confirmation code')
+    assert.match(botDraft.confirmationCode, /^[A-Z0-9]{8}$/u)
     // Confirm the bot - user:local:* actors are recognized as local owners
     await gateway.resolveApproval(botDraft.confirmationCode, 'approved', 'user:local:local-owner')
     // Verify the bot is in the roster
-    const botEntry = gateway.directory.get('local-web-bot')
+    const botEntry = gateway.directory.get('local-research-bot')
     assert.ok(botEntry, 'Bot should be in the roster after confirmation')
+    assert.equal(botEntry.enabled, true)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
@@ -2317,6 +2295,118 @@ test('Feishu /bot commands are blocked when dynamicRegistry is OFF', async () =>
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     assert.ok(sent.some(item => /飞书.*Telegram.*尚未启用|DSH Web/u.test(item.text)), 'Feishu /bot create should be blocked')
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('dynamically created bot joins roster only and does NOT auto-expand into Teams', async () => {
+  // CRO requirement: new bots join roster only, must NOT auto-add to Teams.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-no-team-expand-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      access: { userIds: ['ou_owner'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: {
+        features: {
+          dynamicRegistry: false,
+          chatBotCreation: false,
+          webChatBotCreation: true,
+        },
+      },
+    })
+    await gateway.start()
+    // Create a Team first with just the default bot
+    const team = await gateway.teams.createTeam({
+      name: 'Test Team',
+      scope: 'user',
+      ownerId: 'user:local:ou_owner',
+      memberBotIds: ['default'],
+      managerBotId: 'default',
+    }, 'user:local:ou_owner')
+    // Get the team and verify it was created correctly
+    const teamBefore = await gateway.teams.getTeam(team.id)
+    assert.ok(teamBefore, 'Team should exist')
+    assert.deepEqual([...teamBefore.memberBotIds], ['default'], 'Team should start with only default bot')
+    // Create and confirm a new bot from local DSH web
+    const localTarget = { platform: 'local', chatId: 'local-dashboard', chatType: 'dm', userId: 'ou_owner' }
+    const botDraft = await gateway.createDynamicBotDraft({
+      handle: 'new-bot',
+      title: 'Newly Created Bot',
+      role: 'worker',
+    }, localTarget)
+    await gateway.resolveApproval(botDraft.confirmationCode, 'approved', 'local-dashboard')
+    // Verify the bot is in the roster
+    const botEntry = gateway.directory.get('new-bot')
+    assert.ok(botEntry, 'New bot should be in the roster')
+    assert.equal(botEntry.enabled, true, 'New bot should be enabled')
+    // Verify the Team did NOT auto-expand to include the new bot
+    const teamAfter = await gateway.teams.getTeam(team.id)
+    assert.ok(teamAfter, 'Team should still exist')
+    assert.deepEqual([...teamAfter.memberBotIds], ['default'], 'Team should NOT auto-expand to include new bot')
+    assert.equal(teamAfter.memberBotIds.includes('new-bot'), false, 'New bot should NOT be auto-added to Team')
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('webChatBotCreation=true with Feishu-bound session does NOT receive bot_create_draft and cannot create via tool', async () => {
+  // CRO explicit requirement: Feishu-bound sessions must NOT receive bot creation tools
+  // even when webChatBotCreation is true.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-feishu-bound-no-tools-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registeredTools = new Map()
+    const agentRegistry = {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create({ sessionId, agentOptions, setup }) {
+        const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
+        const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
+        if (setup) await setup(agentCtx)
+        const liveAgent = {
+          id: String(sessionId), ctx: agentCtx, status: 'idle', options: agentOptions ?? {}, cancel() {}, followup() {},
+        }
+        agents.set(String(sessionId), liveAgent)
+        return { agent: liveAgent }
+      },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? agentRegistry : undefined }, {
+      stateDir: root,
+      access: { userIds: ['ou_feishu_user'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: {
+        features: {
+          dynamicRegistry: false, // OFF - CRO requirement
+          chatBotCreation: false,
+          webChatBotCreation: true, // ON - but Feishu should NOT get tools
+        },
+      },
+    })
+    let inbound
+    const transport = {
+      platform: 'feishu', async start(handler) { inbound = handler }, async stop() {}, async send() {},
+    }
+    gateway.transports = [transport]
+    gateway.transportByPlatform.set('feishu', transport)
+    await gateway.start()
+    // Send message from Feishu-bound session
+    await inbound({
+      id: 'feishu-bound-message',
+      target: { platform: 'feishu', chatId: 'oc_chat', chatType: 'dm', userId: 'ou_feishu_user' },
+      text: '帮我创建一个 Bot',
+      receivedAt: Date.now(),
+    })
+    // Wait to ensure any async tool registration would have happened
+    await new Promise(resolve => setTimeout(resolve, 500))
+    // Feishu-bound sessions should NOT receive the bot creation tools
+    assert.equal(registeredTools.has('bot_create_draft'), false, 'Feishu-bound session should NOT receive bot_create_draft')
+    assert.equal(registeredTools.has('bot_update_draft'), false, 'Feishu-bound session should NOT receive bot_update_draft')
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })

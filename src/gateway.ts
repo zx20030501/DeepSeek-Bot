@@ -3310,11 +3310,19 @@ export class BotGateway {
       const registryEntry = await this.registry.getByHandle(profile.name)
       const dynamicProfile = registryEntry !== undefined && registryEntry.definition.source !== 'config'
       const invokeProfile = async (): Promise<boolean> => {
+        // Bot creation tools (bot_create_draft, bot_update_draft) are ONLY installed on
+        // local DSH web sessions. Feishu/Telegram sessions never receive these tools,
+        // even if webChatBotCreation or dynamicRegistry is enabled. Feishu/Telegram users
+        // must use /bot commands (which require dynamicRegistry + chatBotCreation).
+        const isLocalWebSession = message.target.platform === 'local' || (
+          message.target.platform !== 'feishu' && message.target.platform !== 'telegram'
+        )
+        const shouldInstallBotTools = this.anyBotCreationEnabled() && isLocalWebSession
         const agent = await this.bridge!.resumeOrCreate(
           binding.sessionId as SessionId,
           profile,
           binding.modelOverride,
-          this.anyBotCreationEnabled() ? agentCtx => this.installUserFleetTools(agentCtx) : undefined,
+          shouldInstallBotTools ? agentCtx => this.installUserFleetTools(agentCtx) : undefined,
         )
         if (dynamicProfile) await this.rememberDirectProfileSession(profile.name, binding.sessionId)
         // Hermes routes known DSH commands natively; an unknown /xxx is still a
