@@ -2456,10 +2456,9 @@ test('createBotDraftFromSession rejects Feishu-bound session even when webChatBo
   }
 })
 
-test('native DSH web user agent receives bot_create_draft tools via session event', async () => {
-  // CRO requirement: DSH web programming chat sessions should receive bot creation tools.
-  // These sessions don't go through processInbound; they're created by DSH core and
-  // the plugin receives their events via onSessionEvent.
+test('native DSH web user agent receives bot_create_draft tools when registered as owner session', async () => {
+  // CRO requirement: DSH web programming chat sessions receive bot creation tools
+  // only after positive owner registration — never inferred from missing transport target.
   const root = await mkdtemp(join(tmpdir(), 'deepseek-native-web-tools-'))
   let gateway
   try {
@@ -2470,7 +2469,6 @@ test('native DSH web user agent receives bot_create_draft tools via session even
         const sessionKey = String(id)
         const existing = agents.get(sessionKey)
         if (existing) return existing
-        // Simulate a native DSH web session that exists (created by DSH core)
         const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
         const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
         const nativeAgent = {
@@ -2495,12 +2493,8 @@ test('native DSH web user agent receives bot_create_draft tools via session even
       },
     })
     await gateway.start()
-    const session = { id: 'native-web-session-12345', events: [], seq: 0 }
-    // Simulate a session event from a native DSH web session (no transport target)
-    await gateway.onSessionEvent(session, { type: 'turn/start', data: {} })
-    // Wait for async tool installation
-    await new Promise(resolve => setTimeout(resolve, 200))
-    // Verify tools were installed
+    const sessionId = 'native-web-session-12345'
+    await gateway.registerLocalWebOwnerSession(sessionId)
     assert.ok(registeredTools.has('bot_create_draft'), 'Native DSH web session should receive bot_create_draft tool')
     assert.ok(registeredTools.has('bot_update_draft'), 'Native DSH web session should receive bot_update_draft tool')
   } finally {

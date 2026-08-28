@@ -486,6 +486,8 @@ export class BotGateway {
   private discovery: DiscoveryState | undefined
   /** Latest inbound target, including reply context, for each live session. */
   private readonly sessionTargets = new Map<string, BotTarget>()
+  /** DSH web owner sessions positively registered for in-chat bot creation tools. */
+  private readonly localWebOwnerSessions = new Set<string>()
   private readonly internalRuns = new Map<string, InternalRun>()
   private readonly internalRunBySession = new Map<string, string>()
   private readonly activeBotRuns = new Map<string, string>()
@@ -2414,26 +2416,60 @@ export class BotGateway {
 
   private async createBotDraftFromSession(sessionId: string, input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
     if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
-    // SECURITY: Only local DSH web sessions can create bots via tools.
-    // Feishu/Telegram sessions must NEVER use this path - they must use /bot commands.
     const boundTarget = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
     if (boundTarget?.platform === 'feishu' || boundTarget?.platform === 'telegram') {
       throw new Error('Bot 创建工具只能从本机 DSH Web 页面使用，不能通过飞书/Telegram 会话使用。')
     }
-    // Use LOCAL_WEB_TARGET for unbound sessions (DSH web programming chat)
+    if (!this.isLocalWebOwnerSession(sessionId)) {
+      throw new Error('Bot 创建工具只能从本机 DSH Web 所有者会话使用。')
+    }
     const target = boundTarget ?? LOCAL_WEB_TARGET
     return this.createDynamicBotDraft(input, target)
   }
 
   private async updateBotDraftFromSession(sessionId: string, input: BotUpdateDraftToolInput): Promise<BotUpdateDraftToolResult> {
     if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
-    // SECURITY: Only local DSH web sessions can update bots via tools.
     const boundTarget = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
     if (boundTarget?.platform === 'feishu' || boundTarget?.platform === 'telegram') {
       throw new Error('Bot 更新工具只能从本机 DSH Web 页面使用，不能通过飞书/Telegram 会话使用。')
     }
+    if (!this.isLocalWebOwnerSession(sessionId)) {
+      throw new Error('Bot 更新工具只能从本机 DSH Web 所有者会话使用。')
+    }
     const target = boundTarget ?? LOCAL_WEB_TARGET
     return this.updateDynamicBotDraft(input, target)
+  }
+
+  /**
+   * Positive identity: owner DSH web user session (platform local or explicitly registered).
+   * Never true for Feishu/Telegram, internal runs, or unregistered native sessions.
+   */
+  private isLocalWebOwnerSession(sessionId: string): boolean {
+    const id = sessionKey(sessionId)
+    if (this.internalRunBySession.has(id)) return false
+    if (this.localWebOwnerSessions.has(id)) return true
+    const target = this.sessionTargets.get(id) ?? this.state.snapshot().sessions[id]
+    return target?.platform === 'local'
+  }
+
+  /**
+   * Register a native DSH web owner session for in-chat bot creation tools.
+   * Called from local inbound (platform local) or DSH web session start hooks.
+   */
+  public async registerLocalWebOwnerSession(sessionId: string): Promise<void> {
+    const id = sessionKey(sessionId)
+    if (this.internalRunBySession.has(id)) return
+    this.localWebOwnerSessions.add(id)
+    await this.ensureLocalWebOwnerTools(id)
+  }
+
+  private async ensureLocalWebOwnerTools(sessionId: string): Promise<void> {
+    if (!this.webDynamicBotCreationEnabled() || !this.isLocalWebOwnerSession(sessionId)) return
+    if (!this.ensureHarnessBridge() || !this.bridge) return
+    await this.bridge.configureUserFleetTools(
+      sessionId as SessionId,
+      agentCtx => this.installUserFleetTools(agentCtx),
+    )
   }
 
   /**
@@ -3267,6 +3303,9 @@ export class BotGateway {
       binding = await this.rotateBinding(message.target, binding, fallback, null)
     }
     await this.rememberSessionTarget(binding.sessionId, message.target)
+    if (message.target.platform === 'local') {
+      await this.registerLocalWebOwnerSession(binding.sessionId)
+    }
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)
     if (command && await this.handleLocalCommand(message, walId, binding, command.name, command.args)) return
@@ -6758,20 +6797,6 @@ export class BotGateway {
     }
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
-    // Install bot creation tools ONLY on native DSH web USER sessions.
-    // A native web user session has:
-    // 1. No transport target (not Feishu/Telegram bound)
-    // 2. Session ID does NOT start with 'hermes-bot-' (not a bot worker session)
-    // 3. Not in internalRunBySession (checked above)
-    // This excludes workflow agents, bot workers, and scoped sessions.
-    const isBotWorkerSession = id.startsWith('hermes-bot-')
-    const isNativeWebUserSession = !target && !isBotWorkerSession
-    if (isNativeWebUserSession && this.webDynamicBotCreationEnabled() && this.bridge) {
-      await this.bridge.configureExistingAgent(
-        id as SessionId,
-        agentCtx => this.installUserFleetTools(agentCtx),
-      ).catch(error => this.log('warn', `failed to install tools on native web session: ${String(error)}`))
-    }
     if (!target) return
     if (record.type === 'assistant/message') {
       const message = asRecord(data.message)
