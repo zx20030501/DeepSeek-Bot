@@ -161,6 +161,22 @@ export class HarnessBridge {
     this.configuredAgents.add(agent as object)
   }
 
+  /**
+   * Configure an existing agent with a setup function. Used to install tools
+   * on native DSH web sessions that don't go through the inbound message path.
+   * Returns true if the agent was configured, false if it was already configured
+   * or doesn't exist.
+   */
+  public async configureExistingAgent(sessionId: SessionId, setup: AgentSetupLike): Promise<boolean> {
+    const agent = this.agents.get(sessionId)
+    if (!agent || this.configuredAgents.has(agent as object)) return false
+    const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
+    if (agentContext === undefined) return false
+    await setup(agentContext)
+    this.configuredAgents.add(agent as object)
+    return true
+  }
+
   public async followup(agent: Agent, text: string): Promise<void> {
     const message = createUserMessage({
       content: [{ type: 'text', text }],

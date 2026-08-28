@@ -2412,3 +2412,99 @@ test('webChatBotCreation=true with Feishu-bound session does NOT receive bot_cre
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('createBotDraftFromSession rejects Feishu-bound session even when webChatBotCreation is ON', async () => {
+  // CRO requirement: createBotDraftFromSession must REFUSE Feishu/Telegram targets.
+  // Even if tools are somehow installed, the session methods must throw.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-create-tool-rejects-feishu-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      access: { userIds: ['ou_feishu_user'] },
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: {
+        features: {
+          dynamicRegistry: false,
+          chatBotCreation: false,
+          webChatBotCreation: true,
+        },
+      },
+    })
+    await gateway.start()
+    // Simulate a Feishu-bound session by registering a target
+    const feishuTarget = { platform: 'feishu', chatId: 'oc_chat', chatType: 'dm', userId: 'ou_feishu_user' }
+    const sessionId = 'test-feishu-session'
+    await gateway.rememberSessionTarget(sessionId, feishuTarget)
+    // Directly call the tool handler with the Feishu-bound session
+    // This should throw because Feishu targets are not allowed
+    await assert.rejects(
+      gateway.botCreateDraftTool.execute({
+        handle: 'feishu-bot', title: 'Feishu Bot',
+      }, {
+        signal: new AbortController().signal,
+        agent: { id: sessionId, session: { id: sessionId, events: [], seq: 0 } },
+        concludeTurn() {},
+        deferContext() {},
+      }),
+      /飞书|Telegram|DSH Web/u,
+      'createBotDraftFromSession should reject Feishu-bound sessions'
+    )
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('native DSH web user agent receives bot_create_draft tools via session event', async () => {
+  // CRO requirement: DSH web programming chat sessions should receive bot creation tools.
+  // These sessions don't go through processInbound; they're created by DSH core and
+  // the plugin receives their events via onSessionEvent.
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-native-web-tools-'))
+  let gateway
+  try {
+    const agents = new Map()
+    const registeredTools = new Map()
+    const agentRegistry = {
+      get(id) {
+        const sessionKey = String(id)
+        const existing = agents.get(sessionKey)
+        if (existing) return existing
+        // Simulate a native DSH web session that exists (created by DSH core)
+        const runtime = { register(tool) { registeredTools.set(tool.name, tool); return () => {} } }
+        const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
+        const nativeAgent = {
+          id: sessionKey, ctx: agentCtx, status: 'idle', options: {}, cancel() {}, followup() {},
+          session: { id: sessionKey, events: [], seq: 0 },
+        }
+        agents.set(sessionKey, nativeAgent)
+        return nativeAgent
+      },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('native sessions should not call create') },
+    }
+    gateway = new BotGateway({ get: name => name === 'agents' ? agentRegistry : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      collaboration: {
+        features: {
+          dynamicRegistry: false,
+          chatBotCreation: false,
+          webChatBotCreation: true,
+        },
+      },
+    })
+    await gateway.start()
+    const session = { id: 'native-web-session-12345', events: [], seq: 0 }
+    // Simulate a session event from a native DSH web session (no transport target)
+    await gateway.onSessionEvent(session, { type: 'turn/start', data: {} })
+    // Wait for async tool installation
+    await new Promise(resolve => setTimeout(resolve, 200))
+    // Verify tools were installed
+    assert.ok(registeredTools.has('bot_create_draft'), 'Native DSH web session should receive bot_create_draft tool')
+    assert.ok(registeredTools.has('bot_update_draft'), 'Native DSH web session should receive bot_update_draft tool')
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})

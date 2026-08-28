@@ -2413,16 +2413,26 @@ export class BotGateway {
   }
 
   private async createBotDraftFromSession(sessionId: string, input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
-    if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
-    // Use Feishu/Telegram target if bound, otherwise fall back to local DSH web target.
-    // This allows unbound DSH web sessions to create bots with only webChatBotCreation enabled.
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
+    if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
+    // SECURITY: Only local DSH web sessions can create bots via tools.
+    // Feishu/Telegram sessions must NEVER use this path - they must use /bot commands.
+    const boundTarget = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    if (boundTarget?.platform === 'feishu' || boundTarget?.platform === 'telegram') {
+      throw new Error('Bot 创建工具只能从本机 DSH Web 页面使用，不能通过飞书/Telegram 会话使用。')
+    }
+    // Use LOCAL_WEB_TARGET for unbound sessions (DSH web programming chat)
+    const target = boundTarget ?? LOCAL_WEB_TARGET
     return this.createDynamicBotDraft(input, target)
   }
 
   private async updateBotDraftFromSession(sessionId: string, input: BotUpdateDraftToolInput): Promise<BotUpdateDraftToolResult> {
-    if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
+    if (!this.webDynamicBotCreationEnabled()) throw new Error('DSH Web 对话创建 Bot 尚未启用')
+    // SECURITY: Only local DSH web sessions can update bots via tools.
+    const boundTarget = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    if (boundTarget?.platform === 'feishu' || boundTarget?.platform === 'telegram') {
+      throw new Error('Bot 更新工具只能从本机 DSH Web 页面使用，不能通过飞书/Telegram 会话使用。')
+    }
+    const target = boundTarget ?? LOCAL_WEB_TARGET
     return this.updateDynamicBotDraft(input, target)
   }
 
@@ -3311,13 +3321,11 @@ export class BotGateway {
       const dynamicProfile = registryEntry !== undefined && registryEntry.definition.source !== 'config'
       const invokeProfile = async (): Promise<boolean> => {
         // Bot creation tools (bot_create_draft, bot_update_draft) are ONLY installed on
-        // local DSH web sessions. Feishu/Telegram sessions never receive these tools,
-        // even if webChatBotCreation or dynamicRegistry is enabled. Feishu/Telegram users
-        // must use /bot commands (which require dynamicRegistry + chatBotCreation).
-        const isLocalWebSession = message.target.platform === 'local' || (
-          message.target.platform !== 'feishu' && message.target.platform !== 'telegram'
-        )
-        const shouldInstallBotTools = this.anyBotCreationEnabled() && isLocalWebSession
+        // local DSH web sessions (platform === 'local'). All other platforms (feishu,
+        // telegram, undefined, etc.) NEVER receive these tools. This prevents workflow
+        // agents and transport agents from getting bot creation capabilities.
+        const isStrictlyLocalWebSession = message.target.platform === 'local'
+        const shouldInstallBotTools = this.webDynamicBotCreationEnabled() && isStrictlyLocalWebSession
         const agent = await this.bridge!.resumeOrCreate(
           binding.sessionId as SessionId,
           profile,
@@ -6750,6 +6758,15 @@ export class BotGateway {
     }
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
+    // For native DSH web sessions (no transport target), install bot creation tools
+    // if webChatBotCreation is enabled. This handles DSH web programming chat that
+    // doesn't go through the processInbound path.
+    if (!target && this.webDynamicBotCreationEnabled() && this.bridge) {
+      await this.bridge.configureExistingAgent(
+        id as SessionId,
+        agentCtx => this.installUserFleetTools(agentCtx),
+      ).catch(error => this.log('warn', `failed to install tools on native web session: ${String(error)}`))
+    }
     if (!target) return
     if (record.type === 'assistant/message') {
       const message = asRecord(data.message)
