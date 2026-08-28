@@ -490,6 +490,7 @@ export class BotGateway {
   private readonly localWebOwnerSessions = new Set<string>()
   /** Sessions already evaluated for owner-web registration (turn/start only). */
   private readonly ownerWebRegistrationChecked = new Set<string>()
+  private readonly ownerWebRegistrationTasks = new Set<Promise<void>>()
   private readonly internalRuns = new Map<string, InternalRun>()
   private readonly internalRunBySession = new Map<string, string>()
   private readonly activeBotRuns = new Map<string, string>()
@@ -599,6 +600,10 @@ export class BotGateway {
 
   private async finishStop(): Promise<void> {
     await this.routineScheduler.stop()
+    if (this.ownerWebRegistrationTasks.size > 0) {
+      await Promise.allSettled([...this.ownerWebRegistrationTasks])
+      this.ownerWebRegistrationTasks.clear()
+    }
     this.discovery = undefined
     for (const timer of this.inboundRetryTimers) clearTimeout(timer)
     this.inboundRetryTimers.clear()
@@ -2460,30 +2465,71 @@ export class BotGateway {
     return sessionId.startsWith('hermes-bot-')
   }
 
-  private sessionAgentPreset(sessionId: string): string | undefined {
+  private readSessionHeader(
+    sessionId: string,
+    session?: SessionLike,
+  ): { readonly agentPreset?: unknown; readonly origin?: unknown; readonly delegationDepth?: unknown } | undefined {
     const agent = this.bridge?.getAgent(sessionId as SessionId)
-    if (!agent) return undefined
-    const header = (agent.session as unknown as { readonly header?: { readonly agentPreset?: unknown } }).header
-    const preset = header?.agentPreset
-    return typeof preset === 'string' && preset.length > 0 ? preset : undefined
+    const fromAgent = agent === undefined
+      ? undefined
+      : (agent.session as unknown as { readonly header?: { readonly agentPreset?: unknown; readonly origin?: unknown; readonly delegationDepth?: unknown } }).header
+    if (fromAgent !== undefined) return fromAgent
+    const fromSession = session === undefined
+      ? undefined
+      : (session as unknown as { readonly header?: { readonly agentPreset?: unknown; readonly origin?: unknown; readonly delegationDepth?: unknown } }).header
+    return fromSession
   }
 
-  private shouldRegisterOwnerWebSession(sessionId: string): boolean {
+  /** Shared transport/worker guards — missing data never implies owner. */
+  private canRegisterOwnerWebSession(sessionId: string): boolean {
     if (!this.webDynamicBotCreationEnabled()) return false
-    if (this.internalRunBySession.has(sessionId)) return false
-    if (this.isHermesBotWorkerSession(sessionId)) return false
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    const id = sessionKey(sessionId)
+    if (this.internalRunBySession.has(id)) return false
+    if (this.isHermesBotWorkerSession(id)) return false
+    const target = this.sessionTargets.get(id) ?? this.state.snapshot().sessions[id]
     if (target?.platform === 'feishu' || target?.platform === 'telegram') return false
-    if (target?.platform === 'local') return true
-    const preset = this.sessionAgentPreset(sessionId)
-    if (preset !== undefined) return false
-    // Positive: native DSH owner programming session (Harness agentPreset absent).
     return true
+  }
+
+  private enqueueOwnerWebRegistration(sessionId: string): void {
+    const task = this.registerLocalWebOwnerSession(sessionId).catch(error => {
+      this.log('warn', `owner web session tool registration failed: ${String(error)}`)
+    }).finally(() => {
+      this.ownerWebRegistrationTasks.delete(task)
+    })
+    this.ownerWebRegistrationTasks.add(task)
+  }
+
+  /**
+   * Positive identity at turn/start: only an explicit platform=local binding.
+   * Never infer owner from missing agent, header, or transport target.
+   */
+  private shouldRegisterOwnerWebSessionAtTurnStart(sessionId: string): boolean {
+    if (!this.canRegisterOwnerWebSession(sessionId)) return false
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    return target?.platform === 'local'
+  }
+
+  /**
+   * Positive identity at agent/session-start: session header must explicitly carry
+   * a non-empty agentPreset for a top-level (non-subagent) user composition.
+   */
+  private shouldRegisterOwnerWebSessionFromAgentStart(
+    sessionId: string,
+    agent: { readonly id: unknown; readonly session?: unknown },
+  ): boolean {
+    if (!this.canRegisterOwnerWebSession(sessionId)) return false
+    const header = this.readSessionHeader(sessionId, { id: agent.id })
+    if (header === undefined) return false
+    if (header.origin === 'subagent') return false
+    if (typeof header.delegationDepth === 'number' && header.delegationDepth > 0) return false
+    const preset = header.agentPreset
+    return typeof preset === 'string' && preset.length > 0
   }
 
   /**
    * Observe a Harness session/event and register owner DSH web sessions once.
-   * Called from plugin index.ts — never infers identity from a missing target alone.
+   * Called from plugin index.ts — only platform=local is accepted at turn/start.
    */
   public tryRegisterOwnerWebSession(session: SessionLike, event: unknown): void {
     if (!this.webDynamicBotCreationEnabled()) return
@@ -2492,20 +2538,28 @@ export class BotGateway {
     const id = sessionKey(session.id)
     if (this.ownerWebRegistrationChecked.has(id)) return
     this.ownerWebRegistrationChecked.add(id)
-    if (!this.shouldRegisterOwnerWebSession(id)) return
-    void this.registerLocalWebOwnerSession(id).catch(error => {
-      this.log('warn', `owner web session tool registration failed: ${String(error)}`)
-    })
+    if (!this.shouldRegisterOwnerWebSessionAtTurnStart(id)) return
+    this.enqueueOwnerWebRegistration(id)
+  }
+
+  /**
+   * Register owner DSH web sessions from agent/session-start when the session
+   * header explicitly names a top-level user agentPreset composition.
+   */
+  public tryRegisterOwnerWebSessionFromAgentStart(agent: { readonly id: unknown; readonly session?: unknown }): void {
+    if (!this.webDynamicBotCreationEnabled()) return
+    const id = sessionKey(agent.id)
+    if (!this.shouldRegisterOwnerWebSessionFromAgentStart(id, agent)) return
+    this.enqueueOwnerWebRegistration(id)
   }
 
   /**
    * Register a native DSH web owner session for in-chat bot creation tools.
-   * Called from local inbound (platform local) or DSH web session start hooks.
+   * Explicit caller invocation is itself a positive owner mark.
    */
   public async registerLocalWebOwnerSession(sessionId: string): Promise<void> {
-    if (!this.webDynamicBotCreationEnabled()) return
+    if (!this.canRegisterOwnerWebSession(sessionId)) return
     const id = sessionKey(sessionId)
-    if (!this.shouldRegisterOwnerWebSession(id)) return
     this.localWebOwnerSessions.add(id)
     await this.ensureLocalWebOwnerTools(id)
   }
@@ -3351,7 +3405,7 @@ export class BotGateway {
     }
     await this.rememberSessionTarget(binding.sessionId, message.target)
     if (message.target.platform === 'local' && this.webDynamicBotCreationEnabled()) {
-      void this.registerLocalWebOwnerSession(binding.sessionId)
+      this.enqueueOwnerWebRegistration(binding.sessionId)
     }
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)

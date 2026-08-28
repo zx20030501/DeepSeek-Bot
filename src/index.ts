@@ -151,6 +151,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
     requestGatewayRefresh()
   })
 
+  ctx.on('agent/session-start', (payload: { readonly agent: { readonly id: unknown; readonly session?: unknown } }) => {
+    gateway.tryRegisterOwnerWebSessionFromAgentStart(payload.agent)
+  })
   ctx.on('session/event', (session, event) => {
     gateway.tryRegisterOwnerWebSession(session, event)
     gateway.onSessionEvent(session, event)
