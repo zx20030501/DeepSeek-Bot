@@ -2631,7 +2631,11 @@ test('registered unbound DSH web owner session /fleet hits planner without dynam
     await gateway.start()
     await gateway.registerLocalWebOwnerSession(sessionId)
     emitOwnerWebUserMessage(gateway, sessionId, '/fleet research this issue')
-    assert.equal(await waitUntil(async () => (await gateway.fleetStatus()).fleet.workflows.length === 1), true)
+    assert.equal(await waitUntil(async () => {
+      const status = await gateway.fleetStatus()
+      return status.fleet.workflows.length === 1
+        && status.fleet.approvals.some(item => item.status === 'pending' && item.kind === 'workflow')
+    }), true)
     const snapshot = await gateway.fleetStatus()
     assert.equal(snapshot.fleet.workflows[0].status, 'pending-approval')
     assert.ok(snapshot.fleet.workflows[0].workerBotIds.length >= 1)
