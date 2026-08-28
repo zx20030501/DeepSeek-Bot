@@ -6758,10 +6758,15 @@ export class BotGateway {
     }
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
-    // For native DSH web sessions (no transport target), install bot creation tools
-    // if webChatBotCreation is enabled. This handles DSH web programming chat that
-    // doesn't go through the processInbound path.
-    if (!target && this.webDynamicBotCreationEnabled() && this.bridge) {
+    // Install bot creation tools ONLY on native DSH web USER sessions.
+    // A native web user session has:
+    // 1. No transport target (not Feishu/Telegram bound)
+    // 2. Session ID does NOT start with 'hermes-bot-' (not a bot worker session)
+    // 3. Not in internalRunBySession (checked above)
+    // This excludes workflow agents, bot workers, and scoped sessions.
+    const isBotWorkerSession = id.startsWith('hermes-bot-')
+    const isNativeWebUserSession = !target && !isBotWorkerSession
+    if (isNativeWebUserSession && this.webDynamicBotCreationEnabled() && this.bridge) {
       await this.bridge.configureExistingAgent(
         id as SessionId,
         agentCtx => this.installUserFleetTools(agentCtx),
