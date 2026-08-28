@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm/message'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -190,7 +190,12 @@ export class HarnessBridge {
     if (!agent) return false
     const message = createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-hermes-bot', form: 'local-web' },
+      source: {
+        kind: 'plugin',
+        plugin: 'dsh-hermes-bot',
+        form: 'notice',
+        summary: boundContextSummary(text),
+      },
     })
     const session = agent.session as { append?: (type: string, data: unknown) => unknown }
     if (typeof session.append === 'function') {

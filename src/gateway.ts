@@ -6950,7 +6950,7 @@ export class BotGateway {
         knownBots: this.directory.ids(),
         knownTeams: teamHandles,
         managerIds: [this.config.collaboration?.managerBotId ?? 'manager'],
-        selfId: profile?.name,
+        ...(profile?.name === undefined ? {} : { selfId: profile.name }),
         maxTargets,
         mentionBudget: maxTargets,
       })
