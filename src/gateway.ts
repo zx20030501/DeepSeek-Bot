@@ -188,8 +188,8 @@ function actorForTarget(target: BotTarget): string {
 
 /**
  * Default target for unbound DSH web sessions (no Feishu/Telegram identity).
- * Used when webChatBotCreation is enabled and the session has no transport binding.
- * Actor becomes 'user:local:local-owner', owner is the local DSH installation.
+ * Used for webChatBotCreation drafts and in-chat Fleet / Group Room from a
+ * registered local DSH web owner conversation. Actor is 'user:local:local-owner'.
  */
 const LOCAL_WEB_TARGET: BotTarget = {
   platform: 'local',
@@ -197,6 +197,9 @@ const LOCAL_WEB_TARGET: BotTarget = {
   chatType: 'dm',
   userId: 'local-owner',
 }
+
+const LOCAL_WEB_PLUGIN = 'dsh-hermes-bot'
+const OWNER_WEB_FLEET_COMMANDS = new Set(['fleet', 'approve', 'reject'])
 
 function splitBotLabels(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；]+/u).map(item => item.trim()).filter(Boolean))]
@@ -486,8 +489,10 @@ export class BotGateway {
   private discovery: DiscoveryState | undefined
   /** Latest inbound target, including reply context, for each live session. */
   private readonly sessionTargets = new Map<string, BotTarget>()
-  /** DSH web owner sessions positively registered for in-chat bot creation tools. */
+  /** DSH web owner sessions positively registered for in-chat bot tools / Fleet. */
   private readonly localWebOwnerSessions = new Set<string>()
+  /** Owner DSH web session that should receive LOCAL_WEB_TARGET outbox replies. */
+  private readonly localWebReplySessions = new Map<string, string>()
   /** Fleet worker session ids — owner tools must never install here. */
   private readonly fleetWorkerSessions = new Set<string>()
   private readonly internalRuns = new Map<string, InternalRun>()
@@ -552,6 +557,10 @@ export class BotGateway {
     this.outbox = new Outbox(
       join(stateDir, 'outbox.jsonl'),
       async (item: OutboxItem) => {
+        if (item.target.platform === 'local') {
+          await this.deliverLocalWebText(item.target, item.text)
+          return
+        }
         const transport = this.transportByPlatform.get(item.target.platform)
         if (!transport) throw new Error(`no enabled bot transport for ${item.target.platform}`)
         await transport.send(item.target, item.text)
@@ -2464,7 +2473,6 @@ export class BotGateway {
 
   /** Shared transport/worker guards — never infer owner from missing data. */
   private canRegisterOwnerWebSession(sessionId: string): boolean {
-    if (!this.webDynamicBotCreationEnabled()) return false
     const id = sessionKey(sessionId)
     if (this.internalRunBySession.has(id)) return false
     if (this.isHermesBotWorkerSession(id)) return false
@@ -2485,12 +2493,42 @@ export class BotGateway {
   /**
    * Explicit owner DSH web programming-session registration.
    * Only call from DSH web UI/setup when the owner's chat session is known.
+   * Identity is independent of webChatBotCreation; owner tools still require that flag.
    */
   public async registerLocalWebOwnerSession(sessionId: string): Promise<void> {
     if (!this.canRegisterOwnerWebSession(sessionId)) return
     const id = sessionKey(sessionId)
     this.localWebOwnerSessions.add(id)
+    this.localWebReplySessions.set(targetKey(LOCAL_WEB_TARGET), id)
+    await this.rememberSessionTarget(id, LOCAL_WEB_TARGET)
     await this.ensureLocalWebOwnerTools(id)
+  }
+
+  private latestLocalWebOwnerSession(): string | undefined {
+    const bound = this.localWebReplySessions.get(targetKey(LOCAL_WEB_TARGET))
+    if (bound !== undefined && this.isLocalWebOwnerSession(bound)) return bound
+    let latest: string | undefined
+    for (const id of this.localWebOwnerSessions) {
+      if (this.isLocalWebOwnerSession(id)) latest = id
+    }
+    return latest
+  }
+
+  private async bindingForLocalWeb(target: BotTarget): Promise<ChatBinding | undefined> {
+    const sessionId = this.latestLocalWebOwnerSession()
+    if (sessionId === undefined) return undefined
+    const profile = this.profiles.has(this.config.defaultProfile ?? '') ? this.config.defaultProfile! : 'default'
+    const binding: ChatBinding = {
+      key: targetKey(target),
+      target,
+      profile,
+      generation: 0,
+      sessionId,
+      updatedAt: Date.now(),
+    }
+    await this.rememberSessionTarget(sessionId, target)
+    this.localWebReplySessions.set(targetKey(target), sessionId)
+    return binding
   }
 
   private async ensureLocalWebOwnerTools(sessionId: string): Promise<void> {
@@ -3325,16 +3363,25 @@ export class BotGateway {
   }
 
   private async processInbound(message: InboundMessage, walId: string): Promise<void> {
-    let binding = await this.bindingFor(message.target)
-    if (!this.profiles.has(binding.profile)) {
-      const old = this.bridge?.getAgent(binding.sessionId as SessionId)
-      if (old) this.bridge?.stop(old)
-      const fallback = this.profiles.has(this.config.defaultProfile ?? '') ? this.config.defaultProfile! : 'default'
-      binding = await this.rotateBinding(message.target, binding, fallback, null)
-    }
-    await this.rememberSessionTarget(binding.sessionId, message.target)
-    if (message.target.platform === 'local' && this.webDynamicBotCreationEnabled()) {
+    let binding: ChatBinding
+    if (message.target.platform === 'local') {
+      const ownerBinding = await this.bindingForLocalWeb(message.target)
+      if (ownerBinding === undefined) {
+        await this.wal.claim(walId, 'local-web')
+        await this.wal.complete(walId)
+        return
+      }
+      binding = ownerBinding
       await this.registerLocalWebOwnerSession(binding.sessionId)
+    } else {
+      binding = await this.bindingFor(message.target)
+      if (!this.profiles.has(binding.profile)) {
+        const old = this.bridge?.getAgent(binding.sessionId as SessionId)
+        if (old) this.bridge?.stop(old)
+        const fallback = this.profiles.has(this.config.defaultProfile ?? '') ? this.config.defaultProfile! : 'default'
+        binding = await this.rotateBinding(message.target, binding, fallback, null)
+      }
+      await this.rememberSessionTarget(binding.sessionId, message.target)
     }
     const profile = this.profiles.get(binding.profile) ?? this.profiles.get('default')!
     const command = parseBotCommand(message.text)
@@ -3376,6 +3423,13 @@ export class BotGateway {
         await this.handleCollaborationRequest(message, walId, binding, botIds, mentions.instruction)
         return
       }
+    }
+    if (message.target.platform === 'local') {
+      // Diverted owner-web turns are /fleet and roster @mentions only. Never
+      // followup() the native DSH conversation as a Feishu-style default bot.
+      await this.wal.claim(walId, binding.sessionId)
+      await this.wal.complete(walId)
+      return
     }
     if (!this.directory.canInvoke(profile.name, message.target)) {
       await this.completeWithText(message, walId, binding, `你或当前聊天没有使用 @${profile.name} 的权限；请用 /bots 查看可用 Bot。`)
@@ -6823,9 +6877,16 @@ export class BotGateway {
       await this.handleInternalSessionEvent(session, event, internalRunId)
       return
     }
+    if (record.type === 'user/message') {
+      await this.tryAcceptOwnerWebInbound(id, record, data)
+      return
+    }
     const state = this.state.snapshot()
     const target = this.sessionTargets.get(id) ?? state.sessions[id]
     if (!target) return
+    // Native DSH web already renders the conversation. Local Fleet replies are
+    // delivered through deliverLocalWebText, not by mirroring assistant/message.
+    if (target.platform === 'local') return
     if (record.type === 'assistant/message') {
       const message = asRecord(data.message)
       const text = textFromContent(message.content)
@@ -6854,8 +6915,118 @@ export class BotGateway {
     }
   }
 
+  private ownerWebEventText(data: Record<string, unknown>): string {
+    const source = asRecord(data.source)
+    const sourceKind = String(source.kind ?? '')
+    if (sourceKind === 'plugin' || sourceKind === 'inject' || sourceKind === 'system') return ''
+    const nested = asRecord(data.message)
+    const nestedSource = asRecord(nested.source)
+    if (String(nestedSource.kind ?? '') === 'plugin') return ''
+    if (source.plugin === LOCAL_WEB_PLUGIN || nestedSource.plugin === LOCAL_WEB_PLUGIN) return ''
+    return textFromContent(data.content) || textFromContent(nested.content)
+  }
+
+  private async ownerWebShouldDivert(sessionId: string, text: string): Promise<boolean> {
+    if (!this.isLocalWebOwnerSession(sessionId)) return false
+    const bound = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
+    if (bound?.platform === 'feishu' || bound?.platform === 'telegram') return false
+    const command = parseBotCommand(text)
+    if (command && OWNER_WEB_FLEET_COMMANDS.has(command.name)) return true
+    if (this.config.collaboration?.enabled === false) return false
+    try {
+      const maxTargets = this.config.collaboration?.maxGroupBots ?? 6
+      const profile = this.profiles.get(this.config.defaultProfile ?? 'default') ?? this.profiles.get('default')
+      const requester = actorForTarget(LOCAL_WEB_TARGET)
+      const visibleTeams = await this.teams.listTeams({
+        actorId: requester,
+        sessionId,
+      })
+      const teamHandles = visibleTeams.flatMap(team => [
+        team.id,
+        teamMentionHandle(team),
+      ])
+      if (visibleTeams.length === 1) teamHandles.push('team')
+      const mentions = parseFleetMentions(text, {
+        knownBots: this.directory.ids(),
+        knownTeams: teamHandles,
+        managerIds: [this.config.collaboration?.managerBotId ?? 'manager'],
+        selfId: profile?.name,
+        maxTargets,
+        mentionBudget: maxTargets,
+      })
+      return mentions.routableTargets.some(target => (
+        target.kind === 'bot' || target.kind === 'team' || target.kind === 'manager'
+      ))
+    } catch {
+      return false
+    }
+  }
+
+  private async tryAcceptOwnerWebInbound(
+    sessionId: string,
+    record: Record<string, unknown>,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    if (this.stopped || !this.running) return
+    if (!this.isLocalWebOwnerSession(sessionId)) return
+    const text = this.ownerWebEventText(data)
+    if (!text) return
+    if (!await this.ownerWebShouldDivert(sessionId, text)) return
+    this.ensureHarnessBridge()
+    const agent = this.bridge?.getAgent(sessionId as SessionId)
+    if (agent) {
+      try {
+        this.bridge?.stop(agent)
+      } catch {
+        // Divert the owner turn even if cancel is unavailable on a mock Agent.
+      }
+    }
+    const seq = typeof record.seq === 'number' && Number.isSafeInteger(record.seq) ? String(record.seq) : String(Date.now())
+    const message: InboundMessage = {
+      id: `local-web:${sessionId}:${seq}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    await this.withDurableMutation(() => this.acceptOwnerWebInbound(message, sessionId))
+  }
+
+  /**
+   * Admit a synthesized local-web inbound. Authorization is the registered
+   * owner session, not the Feishu/Telegram allowlist or pairing.
+   */
+  private async acceptOwnerWebInbound(message: InboundMessage, sessionId: string): Promise<void> {
+    if (this.stopped || !this.running) return
+    if (!this.isLocalWebOwnerSession(sessionId)) return
+    this.localWebReplySessions.set(targetKey(message.target), sessionId)
+    await this.rememberSessionTarget(sessionId, message.target)
+    this.inboundReceived += 1
+    const accepted = await this.wal.accept(message)
+    if (!accepted.inserted || accepted.item.state !== 'accepted') {
+      this.inboundDuplicate += 1
+      this.lastInboundDecision = this.makeInboundDiagnostic(message, 'duplicate', accepted.inserted ? `wal_${accepted.item.state}` : 'already_seen')
+      return
+    }
+    this.inboundAccepted += 1
+    this.lastInboundDecision = this.makeInboundDiagnostic(message, 'accepted', 'local_web_owner')
+    await this.queueInbound(message, accepted.item.id)
+  }
+
+  private async deliverLocalWebText(_target: BotTarget, text: string): Promise<void> {
+    const sessionId = this.latestLocalWebOwnerSession()
+    if (sessionId === undefined || !this.isLocalWebOwnerSession(sessionId)) {
+      throw new Error('no registered local DSH web owner session for reply')
+    }
+    if (!this.ensureHarnessBridge() || !this.bridge) {
+      throw new Error('DeepSeek Harness Agent service unavailable for local web reply')
+    }
+    const delivered = this.bridge.deliverLocalWebNotice(sessionId as SessionId, text)
+    if (!delivered) throw new Error('could not deliver local DSH web collaboration reply into the owner session')
+  }
+
   private async sendText(target: BotTarget, text: string, key: string): Promise<void> {
     await this.outbox.enqueue({ key, target, text })
+    if (target.platform === 'local') await this.outbox.flush()
   }
 
   /** Enqueue and drain the outbox lane so terminal Workflow notifications are observable before Task state flips. */

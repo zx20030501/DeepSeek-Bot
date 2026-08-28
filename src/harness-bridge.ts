@@ -180,6 +180,31 @@ export class HarnessBridge {
     return true
   }
 
+  /**
+   * Deliver a Fleet/Group Room notice into a native DSH web conversation.
+   * Does not start an Agent turn and never targets hermes-bot-* workers.
+   */
+  public deliverLocalWebNotice(sessionId: SessionId, text: string): boolean {
+    if (String(sessionId).startsWith('hermes-bot-')) return false
+    const agent = this.agents.get(sessionId)
+    if (!agent) return false
+    const message = createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'dsh-hermes-bot', form: 'local-web' },
+    })
+    const session = agent.session as { append?: (type: string, data: unknown) => unknown }
+    if (typeof session.append === 'function') {
+      session.append('user/message', message)
+      return true
+    }
+    const injectable = agent as unknown as { inject?: (value: unknown) => void }
+    if (typeof injectable.inject === 'function') {
+      injectable.inject(message)
+      return true
+    }
+    return false
+  }
+
   public async followup(agent: Agent, text: string): Promise<void> {
     const message = createUserMessage({
       content: [{ type: 'text', text }],
