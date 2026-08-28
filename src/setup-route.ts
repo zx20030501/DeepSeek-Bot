@@ -17,7 +17,9 @@ import type {
   GatewayDiscoveryStatus,
   BotRegistryEntry,
   TaskRecord,
+  TeamDefinition,
 } from './types.js'
+import type { BotCreateDraftToolInput, BotCreateDraftToolResult } from './bot-registry-tool.js'
 import { isTrustedLocalRequest } from './setup-security.js'
 
 const MAX_BODY_BYTES = 64 * 1024
@@ -47,6 +49,9 @@ export interface SetupRouteActions {
   validateStaticProfiles?: (handles: readonly string[]) => Promise<void>
   registerLocalWebOwnerSession?: (sessionId: string) => Promise<void>
   saveAndApplySettings?: (settings: HermesBotSettings, appSecret?: string) => Promise<void>
+  createWebDashboardBotDraft?: (input: BotCreateDraftToolInput) => Promise<BotCreateDraftToolResult>
+  createWebDashboardTeam?: (name: string, memberBotIds: readonly string[]) => Promise<TeamDefinition>
+  dispatchOwnerWebCommand?: (sessionId: string, text: string) => Promise<void>
 }
 
 class SetupRequestError extends Error {
@@ -93,6 +98,87 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 
 function normalizedIds(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))]
+}
+
+function mergeFleetSettings(current: HermesBotSettings, body: Record<string, unknown>): HermesBotSettings {
+  const collaborationRaw = body.collaboration
+  const profilesRaw = body.profiles
+  const collaboration = typeof collaborationRaw === 'object' && collaborationRaw !== null && !Array.isArray(collaborationRaw)
+    ? collaborationRaw as Record<string, unknown>
+    : undefined
+  const featuresRaw = collaboration?.features
+  const features = typeof featuresRaw === 'object' && featuresRaw !== null && !Array.isArray(featuresRaw)
+    ? featuresRaw as Record<string, unknown>
+    : undefined
+  const nextCollaboration = {
+    ...current.collaboration,
+    ...(collaboration?.enabled === undefined ? {} : { enabled: collaboration.enabled === true }),
+    ...(collaboration?.autoPlanner === undefined ? {} : { autoPlanner: collaboration.autoPlanner === true }),
+    ...(typeof collaboration?.approvalMode === 'string' ? { approvalMode: collaboration.approvalMode as HermesBotSettings['collaboration']['approvalMode'] } : {}),
+    ...(typeof collaboration?.defaultSessionScope === 'string'
+      ? { defaultSessionScope: collaboration.defaultSessionScope as HermesBotSettings['collaboration']['defaultSessionScope'] }
+      : {}),
+    ...(typeof collaboration?.maxGroupBots === 'number' ? { maxGroupBots: collaboration.maxGroupBots } : {}),
+    ...(typeof collaboration?.maxGroupRounds === 'number' ? { maxGroupRounds: collaboration.maxGroupRounds } : {}),
+    ...(typeof collaboration?.maxGroupMessages === 'number' ? { maxGroupMessages: collaboration.maxGroupMessages } : {}),
+    ...(typeof collaboration?.maxParallelRuns === 'number' ? { maxParallelRuns: collaboration.maxParallelRuns } : {}),
+    ...(typeof collaboration?.botRunMaxAttempts === 'number' ? { botRunMaxAttempts: collaboration.botRunMaxAttempts } : {}),
+    features: {
+      ...current.collaboration.features,
+      ...(features?.dynamicRegistry === undefined ? {} : { dynamicRegistry: features.dynamicRegistry === true }),
+      ...(features?.chatBotCreation === undefined ? {} : { chatBotCreation: features.chatBotCreation === true }),
+      ...(features?.webChatBotCreation === undefined ? {} : { webChatBotCreation: features.webChatBotCreation === true }),
+      ...(features?.peerMessaging === undefined ? {} : { peerMessaging: features.peerMessaging === true }),
+      ...(features?.managerAgent === undefined ? {} : { managerAgent: features.managerAgent === true }),
+      ...(features?.savedWorkflows === undefined ? {} : { savedWorkflows: features.savedWorkflows === true }),
+      ...(features?.externalRuntimes === undefined ? {} : { externalRuntimes: features.externalRuntimes === true }),
+      ...(features?.routines === undefined ? {} : { routines: features.routines === true }),
+    },
+  }
+  if (body.enableFleet === true) {
+    nextCollaboration.enabled = true
+    nextCollaboration.features.webChatBotCreation = true
+  }
+  let profiles = current.profiles
+  if (Array.isArray(profilesRaw)) {
+    profiles = HermesBotSettingsSchema({ ...current, profiles: profilesRaw }).profiles
+  }
+  return HermesBotSettingsSchema({
+    ...current,
+    collaboration: nextCollaboration,
+    profiles,
+  })
+}
+
+function botDraftInputFromBody(body: Record<string, unknown>): BotCreateDraftToolInput {
+  const handle = typeof body.handle === 'string' ? body.handle.trim().toLowerCase() : ''
+  const title = typeof body.title === 'string' ? body.title.trim() : ''
+  if (handle === '' || title === '') throw new SetupRequestError(400, 'Bot handle 和名称不能为空。')
+  const capabilities = typeof body.capabilities === 'string'
+    ? body.capabilities.split(/[\s,，、;；\r\n]+/u).map(item => item.trim()).filter(Boolean)
+    : Array.isArray(body.capabilities)
+      ? body.capabilities.map(item => String(item).trim()).filter(Boolean)
+      : []
+  const skills = typeof body.skills === 'string'
+    ? body.skills.split(/[\s,，、;；\r\n]+/u).map(item => item.trim()).filter(Boolean)
+    : Array.isArray(body.skills)
+      ? body.skills.map(item => String(item).trim()).filter(Boolean)
+      : []
+  const roleRaw = typeof body.fleetRole === 'string' ? body.fleetRole.trim() : 'generalist'
+  let role: 'worker' | 'verifier' | 'synthesizer' | 'generalist' = 'generalist'
+  if (roleRaw === 'worker' || roleRaw === 'verifier' || roleRaw === 'synthesizer' || roleRaw === 'generalist') {
+    role = roleRaw
+  }
+  return {
+    handle,
+    title,
+    ...(typeof body.description === 'string' && body.description.trim() !== '' ? { description: body.description.trim() } : {}),
+    ...(typeof body.model === 'string' && body.model.trim() !== '' ? { model: body.model.trim() } : {}),
+    ...(typeof body.soul === 'string' && body.soul.trim() !== '' ? { soul: body.soul.trim() } : {}),
+    capabilities,
+    skills,
+    role,
+  }
 }
 
 async function readSnapshot(
@@ -153,6 +239,10 @@ async function handleRequest(
     && action !== 'fleet_task_replay'
     && action !== 'bot_registry_status'
     && action !== 'register_owner_web_session'
+    && action !== 'save_fleet_config'
+    && action !== 'bot_create_draft'
+    && action !== 'owner_web_command'
+    && action !== 'team_create'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -263,6 +353,70 @@ async function handleRequest(
     await actions.registerLocalWebOwnerSession(sessionId)
     const snapshot = await readSnapshot(ctx, source, diagnostics)
     sendJson(res, 200, { ...snapshot, message: '已为本机 DSH Web 对话会话安装 Bot 创建工具。' })
+    return
+  }
+  if (action === 'save_fleet_config') {
+    if (actions.saveAndApplySettings === undefined) throw new SetupRequestError(503, '设置事务服务还没有准备好，请稍后再试。')
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    const merged = mergeFleetSettings(snapshot.settings, body)
+    await actions.saveAndApplySettings(merged)
+    const next = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, {
+      ...next,
+      message: 'Fleet 设置已保存并启用；右栏 BOTS 与 Web Bot 创建现已可用。',
+    })
+    return
+  }
+  if (action === 'bot_create_draft') {
+    if (actions.createWebDashboardBotDraft === undefined) {
+      throw new SetupRequestError(503, 'Web Bot 创建服务还没有准备好。')
+    }
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    if (sessionId !== '' && actions.registerLocalWebOwnerSession !== undefined) {
+      await actions.registerLocalWebOwnerSession(sessionId)
+    }
+    const draft = await actions.createWebDashboardBotDraft(botDraftInputFromBody(body))
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, draft, message: draft.message })
+    return
+  }
+  if (action === 'owner_web_command') {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    const text = typeof body.text === 'string' ? body.text.trim() : ''
+    if (sessionId === '' || text === '') throw new SetupRequestError(400, '缺少 sessionId 或命令文本。')
+    if (actions.dispatchOwnerWebCommand === undefined) {
+      throw new SetupRequestError(503, 'DSH Web 命令注入服务还没有准备好。')
+    }
+    await actions.dispatchOwnerWebCommand(sessionId, text)
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: '已向当前 DSH Web 会话注入命令。' })
+    return
+  }
+  if (action === 'team_create') {
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const members = typeof body.memberBotIds === 'string'
+      ? body.memberBotIds.split(/[\s,，、;；\r\n]+/u).map(item => item.trim().toLowerCase()).filter(Boolean)
+      : Array.isArray(body.memberBotIds)
+        ? body.memberBotIds.map(item => String(item).trim().toLowerCase()).filter(Boolean)
+        : []
+    if (name === '' || members.length === 0) throw new SetupRequestError(400, 'Team 名称和成员不能为空。')
+    if (actions.createWebDashboardTeam === undefined) throw new SetupRequestError(503, 'Team 创建服务还没有准备好。')
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    if (sessionId !== '' && actions.registerLocalWebOwnerSession !== undefined) {
+      await actions.registerLocalWebOwnerSession(sessionId)
+    }
+    const team = await actions.createWebDashboardTeam(name, members)
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, {
+      ...snapshot,
+      team: {
+        id: team.id,
+        name: team.name,
+        memberBotIds: [...team.memberBotIds],
+        status: team.status,
+      },
+      message: `Team ${team.id} 已创建，可在对话中使用 @${team.id} 或 @team 协作。`,
+    })
     return
   }
   let settings: HermesBotSettings

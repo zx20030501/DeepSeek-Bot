@@ -44,10 +44,12 @@ interface FleetSettings {
   features: {
     dynamicRegistry: boolean
     chatBotCreation: boolean
+    webChatBotCreation: boolean
     peerMessaging: boolean
     managerAgent: boolean
     savedWorkflows: boolean
     externalRuntimes: boolean
+    routines: boolean
   }
 }
 
@@ -166,8 +168,9 @@ interface Diagnostics {
     fleetRole?: string
     sessionScope?: string
     approvalRequired?: boolean
+    canonicalSessionId?: string
   }>
-  collaboration?: { enabled?: boolean; activeRuns?: number }
+  collaboration?: { enabled?: boolean; activeRuns?: number; features?: Record<string, boolean> }
   fleet?: {
     mailbox?: Record<string, number>
     tasks?: Array<{ id?: string; title?: string; status?: string; assignedTo?: string; updatedAt?: number }>
@@ -175,6 +178,9 @@ interface Diagnostics {
     approvals?: Array<{ id?: string; code?: string; kind?: string; summary?: string; status?: string; expiresAt?: number }>
     handoffs?: Array<{ id?: string; fromBot?: string; toBot?: string; status?: string; reason?: string }>
     deadLetters?: Array<{ id?: string; state?: string; lastError?: string; envelope?: { to?: string; taskId?: string } }>
+    teams?: Array<{ id?: string; name?: string; status?: string; memberBotIds?: string[]; managerBotId?: string; maxConcurrency?: number; updatedAt?: number }>
+    rooms?: Array<{ id?: string; taskId?: string; participants?: string[]; closed?: boolean; messageCount?: number; updatedAt?: number }>
+    routines?: Array<{ id?: string; name?: string; status?: string; cron?: string; timezone?: string; workflowId?: string; nextRunAt?: number; updatedAt?: number }>
     registryBots?: Array<{
       id?: string
       handle?: string
@@ -309,6 +315,8 @@ function draftOf(settings: HermesBotSettings): Draft {
       managerAgent: false,
       savedWorkflows: false,
       externalRuntimes: false,
+      webChatBotCreation: false,
+      routines: false,
     },
   }
   const collaboration = settings.collaboration === undefined
@@ -1268,10 +1276,12 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.enabled} onChange={event => { updateCollaboration('enabled', event.target.checked) }} /><span>启用 Bot Fleet</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.autoPlanner} onChange={event => { updateCollaboration('autoPlanner', event.target.checked) }} /><span>启用自动 Planner</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.dynamicRegistry} onChange={event => { updateFleetFeature('dynamicRegistry', event.target.checked); if (!event.target.checked) updateFleetFeature('chatBotCreation', false) }} /><span>启用动态 Bot 注册表</span></label>
-          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.chatBotCreation} disabled={!draft.collaboration.features.dynamicRegistry} onChange={event => { updateFleetFeature('chatBotCreation', event.target.checked) }} /><span>允许在对话中创建 Bot</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.webChatBotCreation} onChange={event => { updateFleetFeature('webChatBotCreation', event.target.checked) }} /><span>允许在 DSH Web 右栏创建 Bot（推荐）</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.chatBotCreation} disabled={!draft.collaboration.features.dynamicRegistry} onChange={event => { updateFleetFeature('chatBotCreation', event.target.checked) }} /><span>允许在飞书/Telegram 对话中创建 Bot</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.peerMessaging} onChange={event => { updateFleetFeature('peerMessaging', event.target.checked) }} /><span>允许 Bot 间受控 @协作</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.managerAgent} onChange={event => { updateFleetFeature('managerAgent', event.target.checked) }} /><span>允许 @manager 规划委派</span></label>
           <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.savedWorkflows} onChange={event => { updateFleetFeature('savedWorkflows', event.target.checked) }} /><span>启用版本化 Workflow API</span></label>
+          <label className="dsh-hermes-check"><input type="checkbox" checked={draft.collaboration.features.routines} disabled={!draft.collaboration.features.savedWorkflows} onChange={event => { updateFleetFeature('routines', event.target.checked) }} /><span>启用 Cron Workflow（右栏 CRONJOBS）</span></label>
           <Field label="审批策略"><select value={draft.collaboration.approvalMode} onChange={event => { updateCollaboration('approvalMode', event.target.value as FleetSettings['approvalMode']) }}><option value="auto-planned">自动计划需要批准（推荐）</option><option value="multi-bot">多 Bot 才需要批准</option><option value="always">所有 Fleet 操作都批准</option><option value="never">不需要批准</option></select></Field>
           <Field label="默认会话隔离"><select value={draft.collaboration.defaultSessionScope} onChange={event => { updateCollaboration('defaultSessionScope', event.target.value as FleetSettings['defaultSessionScope']) }}><option value="requester">按使用者隔离（推荐）</option><option value="chat">按聊天隔离</option><option value="task">按任务隔离</option><option value="shared">共享上下文（有串话风险）</option></select></Field>
           <Field label="协作 Bot 上限"><input type="number" min="2" max="6" value={draft.collaboration.maxGroupBots} onChange={event => { updateCollaboration('maxGroupBots', Number(event.target.value)) }} /></Field>
@@ -1322,7 +1332,533 @@ const CSS = `
  .dsh-hermes-id-editor{display:grid;gap:8px;align-content:start}.dsh-hermes-id-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.dsh-hermes-id-editor-head>div{display:grid;gap:3px}.dsh-hermes-id-editor-head span{font-size:11px;font-weight:600}.dsh-hermes-id-editor-head small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-id-count{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row{display:grid;grid-template-columns:74px minmax(0,1fr) auto;align-items:center;gap:7px}.dsh-hermes-id-index{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);white-space:nowrap}.dsh-hermes-id-row input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;padding:8px 10px}.dsh-hermes-id-remove{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;padding:6px 3px;cursor:pointer}.dsh-hermes-id-add{justify-self:start;border:1px dashed var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}.dsh-hermes-id-empty{padding:9px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-authorized-user{display:grid;gap:3px;min-width:0}.dsh-hermes-authorized-user code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-authorized-user span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
   .dsh-hermes-fleet-profiles{display:grid;gap:10px}.dsh-hermes-fleet-profile{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-profile-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.dsh-hermes-fleet-profile-head>div:first-child{display:flex;align-items:center;gap:8px}.dsh-hermes-fleet-profile-head strong{font-size:12px}.dsh-hermes-fleet-profile-head code{font-size:10px;color:#6758d4}.dsh-hermes-mini-check{display:flex;align-items:center;gap:4px;font-size:10px}.dsh-hermes-fleet-roster{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-fleet-chip{display:grid;gap:2px;padding:7px 9px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-chip strong{font-size:11px}.dsh-hermes-fleet-chip span{font-size:9px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-dynamic-bots{display:grid;gap:8px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-dynamic-bots>div:first-child{display:flex;align-items:baseline;justify-content:space-between;gap:10px}.dsh-hermes-dynamic-bots strong{font-size:11px}.dsh-hermes-fleet-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-fleet-columns>div{display:grid;align-content:start;gap:7px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-columns>div>strong{font-size:11px}.dsh-hermes-fleet-row{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-row>div:first-child{display:grid;gap:3px;min-width:0}.dsh-hermes-fleet-row code{font-size:9px;overflow-wrap:anywhere}.dsh-hermes-fleet-row span{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#77736d);overflow-wrap:anywhere}.dsh-hermes-task-detail{display:grid;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-task-detail h4{margin:0 0 3px;font-size:13px}.dsh-hermes-task-detail small{display:block;margin-bottom:5px;font-size:10px;font-weight:650;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-task-detail pre{max-height:260px;margin:0;padding:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.dsh-hermes-task-meta{display:flex;flex-wrap:wrap;gap:7px}.dsh-hermes-task-meta span{padding:4px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10px}.dsh-hermes-task-run{display:grid;gap:3px;padding:7px 0;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-task-run code,.dsh-hermes-task-run span,.dsh-hermes-task-run em{font-size:10px;overflow-wrap:anywhere}.dsh-hermes-task-run em{color:#aa3939;font-style:normal}@media(max-width:720px){.dsh-hermes-fleet-columns{grid-template-columns:1fr}.dsh-hermes-fleet-profile-head{align-items:flex-start}.dsh-hermes-dynamic-bots>div:first-child{display:grid}}
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
+.dsh-hermes-fleet-rail-host{position:fixed;inset:0;pointer-events:none;z-index:40}.dsh-hermes-fleet-rail{pointer-events:auto;position:fixed;top:0;right:0;width:320px;max-width:min(320px,calc(100vw - 48px));height:100vh;display:grid;grid-template-rows:auto 1fr;border-left:1px solid var(--dsw-alias-border-subtle,#dedbd5);background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:-8px 0 24px rgba(0,0,0,.06);color:var(--dsw-alias-fg-primary,#26231f)}.dsh-hermes-fleet-rail.collapsed{width:52px;min-width:52px}.dsh-hermes-fleet-rail-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-rail-head h3{margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#6758d4}.dsh-hermes-fleet-rail-tabs{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-rail-tab{border:0;background:transparent;color:var(--dsw-alias-fg-muted,#77736d);font:inherit;font-size:11px;font-weight:650;padding:6px 10px;border-radius:999px;cursor:pointer}.dsh-hermes-fleet-rail-tab.active{background:rgba(103,88,212,.12);color:#5149a6}.dsh-hermes-fleet-rail-body{display:grid;grid-template-rows:auto 1fr;gap:8px;padding:10px;min-height:0;overflow:hidden}.dsh-hermes-fleet-rail-search{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);color:inherit;font:inherit;font-size:12px;padding:8px 10px;height:34px}.dsh-hermes-fleet-rail-scroll{display:grid;gap:6px;align-content:start;overflow:auto;min-height:0;padding-right:2px}.dsh-hermes-fleet-bot-row{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;width:100%;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:8px 9px;text-align:left;cursor:pointer;color:inherit;font:inherit}.dsh-hermes-fleet-bot-row.active{border-color:#6758d4;box-shadow:0 0 0 1px rgba(103,88,212,.25)}.dsh-hermes-fleet-bot-row>div{display:grid;gap:2px;min-width:0}.dsh-hermes-fleet-bot-row strong{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsh-hermes-fleet-bot-row span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsh-hermes-fleet-dot{width:8px;height:8px;border-radius:999px;background:#30a064}.dsh-hermes-fleet-dot.busy{background:#e0a237}.dsh-hermes-fleet-dot.draft{background:#77736d}.dsh-hermes-fleet-dot.needs{background:#d94848;box-shadow:0 0 0 2px rgba(217,72,72,.18)}.dsh-hermes-fleet-badge{min-width:16px;height:16px;border-radius:999px;background:#d94848;color:#fff;font-size:9px;font-weight:700;display:grid;place-items:center;padding:0 4px}.dsh-hermes-fleet-rail-foot{display:grid;gap:6px;padding:10px;border-top:1px solid var(--dsw-alias-border-subtle,#dedbd5)}.dsh-hermes-fleet-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.28);display:grid;place-items:center;pointer-events:auto;z-index:50;padding:16px}.dsh-hermes-fleet-modal{width:min(480px,100%);max-height:min(90vh,720px);overflow:auto;display:grid;gap:12px;padding:16px;border-radius:14px;background:var(--dsh-alias-bg-layer-1,#fff);border:1px solid var(--dsw-alias-border-subtle,#dedbd5);box-shadow:0 16px 48px rgba(0,0,0,.18)}.dsh-hermes-fleet-modal h4{margin:0;font-size:16px}.dsh-hermes-fleet-group-row{display:grid;gap:4px;padding:8px 9px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:var(--dsh-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-fleet-group-row button{justify-self:start}
 `
+
+const FLEET_PINNED_KEY = 'dsh-hermes-bot:fleet-pinned'
+
+interface FleetBotRow {
+  readonly id: string
+  readonly handle: string
+  readonly title: string
+  readonly status: string
+  readonly fleetRole?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly source: 'roster' | 'registry'
+  readonly needsYou: boolean
+  readonly busy: boolean
+  readonly activationCode?: string | undefined
+}
+
+interface FleetWebState {
+  readonly diagnostics: Diagnostics
+  readonly loading: boolean
+  readonly error?: string | undefined
+  readonly message?: string | undefined
+  readonly collapsed: boolean
+  readonly tab: 'bots' | 'cron' | 'groups'
+  readonly query: string
+  readonly botModalOpen: boolean
+  readonly pinned: readonly string[]
+  readonly actionPending: boolean
+}
+
+function isFleetManagedSessionId(sessionId: string): boolean {
+  return sessionId.startsWith('hermes-bot-') || sessionId.startsWith('hermes-group-')
+}
+
+function readPinnedBots(): string[] {
+  try {
+    const raw = localStorage.getItem(FLEET_PINNED_KEY)
+    if (raw === null) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(item => String(item).trim().toLowerCase()).filter(Boolean) : []
+  } catch {
+    return []
+  }
+}
+
+function writePinnedBots(values: readonly string[]): void {
+  try {
+    localStorage.setItem(FLEET_PINNED_KEY, JSON.stringify([...new Set(values.map(item => item.trim().toLowerCase()).filter(Boolean))]))
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function resolveBotSessionId(ctx: ClientContext, handle: string, explicit?: string): string | undefined {
+  if (explicit !== undefined && explicit !== '') return explicit
+  const list = ctx.sessions.list.getSnapshot()
+  for (const id of list.ids) {
+    const summary = list.byId[id]
+    if (summary?.agentPreset === handle) return id
+  }
+  for (const id of list.ids) {
+    if (id.includes(handle)) return id
+  }
+  return undefined
+}
+
+class FleetWebController {
+  private readonly store
+  private disposed = false
+  private pollTimer: number | undefined
+
+  public constructor(private readonly ctx: ClientContext) {
+    this.store = createSnapshotStore<FleetWebState>({
+      diagnostics: emptyDiagnostics(),
+      loading: true,
+      collapsed: false,
+      tab: 'bots',
+      query: '',
+      botModalOpen: false,
+      pinned: readPinnedBots(),
+      actionPending: false,
+    })
+    void this.refresh()
+    this.pollTimer = window.setInterval(() => { void this.refresh(true) }, 2_000)
+  }
+
+  public snapshot = (): FleetWebState => this.store.getSnapshot()
+
+  public subscribe = (listener: () => void): (() => void) => this.store.subscribe(listener)
+
+  public dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    if (this.pollTimer !== undefined) window.clearInterval(this.pollTimer)
+  }
+
+  private publish(patch: Partial<FleetWebState>): void {
+    if (this.disposed) return
+    this.store.update(current => ({ ...current, ...patch }))
+  }
+
+  private ownerSessionId(): string | undefined {
+    const list = this.ctx.sessions.list.getSnapshot()
+    const current = list.current
+    if (current !== undefined && !isFleetManagedSessionId(current)) return current
+    for (const id of list.ids) {
+      if (!isFleetManagedSessionId(id)) return id
+    }
+    return undefined
+  }
+
+  public async refresh(silent = false): Promise<void> {
+    if (!silent) this.publish({ loading: true, error: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, { headers: { accept: 'application/json' } })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ diagnostics: data.diagnostics, loading: false })
+    } catch (error) {
+      this.publish({ loading: false, error: `读取 Fleet 状态失败：${String(error)}` })
+    }
+  }
+
+  public setCollapsed(collapsed: boolean): void {
+    this.publish({ collapsed })
+  }
+
+  public setTab(tab: FleetWebState['tab']): void {
+    this.publish({ tab })
+  }
+
+  public setQuery(query: string): void {
+    this.publish({ query })
+  }
+
+  public setBotModalOpen(open: boolean): void {
+    this.publish({ botModalOpen: open, ...(open ? {} : { message: undefined, error: undefined }) })
+  }
+
+  public togglePin(handle: string): void {
+    const normalized = handle.trim().toLowerCase()
+    const pinned = new Set(this.snapshot().pinned)
+    if (pinned.has(normalized)) pinned.delete(normalized)
+    else pinned.add(normalized)
+    const next = [...pinned]
+    writePinnedBots(next)
+    this.publish({ pinned: next })
+  }
+
+  public botRows(): FleetBotRow[] {
+    const state = this.snapshot()
+    const list = this.ctx.sessions.list.getSnapshot()
+    const pendingApprovals = (state.diagnostics.fleet?.approvals ?? []).filter(item => item.status === 'pending').length
+    const rows = new Map<string, FleetBotRow>()
+    for (const bot of state.diagnostics.bots ?? []) {
+      const handle = String(bot.id ?? '').trim().toLowerCase()
+      if (handle === '') continue
+      rows.set(handle, {
+        id: handle,
+        handle,
+        title: bot.title ?? handle,
+        status: 'active',
+        fleetRole: bot.fleetRole,
+        sessionId: bot.canonicalSessionId as string | undefined,
+        source: 'roster',
+        needsYou: false,
+        busy: Boolean(list.byId[resolveBotSessionId(this.ctx, handle, bot.canonicalSessionId as string | undefined) ?? '']?.running),
+      })
+    }
+    for (const bot of state.diagnostics.fleet?.registryBots ?? []) {
+      const handle = String(bot.handle ?? bot.id ?? '').trim().toLowerCase()
+      if (handle === '') continue
+      const sessionId = resolveBotSessionId(this.ctx, handle)
+      const needsYou = bot.status === 'draft' && bot.activationCode !== undefined
+      rows.set(handle, {
+        id: String(bot.id ?? handle),
+        handle,
+        title: bot.title ?? handle,
+        status: bot.status ?? 'draft',
+        fleetRole: bot.fleetRole,
+        sessionId,
+        source: 'registry',
+        needsYou,
+        busy: bot.busy === true,
+        activationCode: bot.activationCode,
+      })
+    }
+    if (pendingApprovals > 0 && rows.size === 0) {
+      rows.set('fleet', {
+        id: 'fleet',
+        handle: 'fleet',
+        title: 'Fleet 审批',
+        status: 'pending',
+        source: 'roster',
+        needsYou: true,
+        busy: false,
+      })
+    }
+    return [...rows.values()]
+  }
+
+  public needsYouCount(): number {
+    const list = this.ctx.sessions.list.getSnapshot()
+    let count = (this.snapshot().diagnostics.fleet?.approvals ?? []).filter(item => item.status === 'pending').length
+    count += this.botRows().filter(bot => bot.needsYou).length
+    for (const id of list.ids) {
+      if (list.byId[id]?.pendingInteraction !== undefined) count += 1
+    }
+    return count
+  }
+
+  public async ensureFleetEnabled(): Promise<boolean> {
+    this.publish({ actionPending: true, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'save_fleet_config',
+          enableFleet: true,
+          collaboration: {
+            enabled: true,
+            features: { webChatBotCreation: true, dynamicRegistry: true, savedWorkflows: true, routines: true },
+          },
+        }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      await this.refresh(true)
+      this.publish({ message: 'Fleet 已启用，可以创建 Bot 并切换会话。' })
+      return true
+    } catch (error) {
+      this.publish({ error: `启用 Fleet 失败：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ actionPending: false })
+    }
+  }
+
+  public async createBotDraft(input: {
+    handle: string
+    title: string
+    description: string
+    capabilities: string
+    soul: string
+    fleetRole: FleetProfileDraft['fleetRole']
+  }): Promise<void> {
+    const sessionId = this.ownerSessionId()
+    if (sessionId === undefined) {
+      this.publish({ error: '请先在中间栏打开一个编程 Session，再创建 Bot。' })
+      return
+    }
+    this.publish({ actionPending: true, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'bot_create_draft',
+          sessionId,
+          handle: input.handle.trim().toLowerCase(),
+          title: input.title.trim(),
+          description: input.description.trim(),
+          capabilities: input.capabilities,
+          soul: input.soul.trim(),
+          fleetRole: input.fleetRole,
+        }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      await this.refresh(true)
+      this.publish({ botModalOpen: false, message: typeof body.message === 'string' ? body.message : 'Bot 草稿已创建。' })
+    } catch (error) {
+      this.publish({ error: `创建 Bot 失败：${String(error)}` })
+    } finally {
+      this.publish({ actionPending: false })
+    }
+  }
+
+  public openBot(handle: string, sessionId?: string): void {
+    const resolved = resolveBotSessionId(this.ctx, handle, sessionId)
+    if (resolved === undefined) {
+      void this.sendOwnerCommand(`@${handle} 你好，请介绍一下你的职责。`)
+      return
+    }
+    this.ctx.sessions.open(resolved as never)
+  }
+
+  public openOwnerSession(): void {
+    const sessionId = this.ownerSessionId()
+    if (sessionId !== undefined) this.ctx.sessions.open(sessionId as never)
+  }
+
+  public async sendOwnerCommand(text: string): Promise<void> {
+    const sessionId = this.ownerSessionId()
+    if (sessionId === undefined) {
+      this.publish({ error: '请先打开一个 owner 编程 Session。' })
+      return
+    }
+    this.publish({ actionPending: true, error: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'owner_web_command', sessionId, text }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      this.ctx.sessions.open(sessionId as never)
+      await this.refresh(true)
+    } catch (error) {
+      this.publish({ error: `发送命令失败：${String(error)}` })
+    } finally {
+      this.publish({ actionPending: false })
+    }
+  }
+
+  public async confirmBot(handle: string, code: string): Promise<void> {
+    await this.sendOwnerCommand(`/bot confirm ${code.trim()}`)
+  }
+
+  public async createTeam(name: string, memberBotIds: readonly string[]): Promise<void> {
+    const sessionId = this.ownerSessionId()
+    if (sessionId === undefined) {
+      this.publish({ error: '请先打开 owner Session 再创建 Team。' })
+      return
+    }
+    this.publish({ actionPending: true, error: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'team_create', sessionId, name, memberBotIds }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      await this.refresh(true)
+      this.publish({ message: typeof body.message === 'string' ? body.message : 'Team 已创建。' })
+    } catch (error) {
+      this.publish({ error: `创建 Team 失败：${String(error)}` })
+    } finally {
+      this.publish({ actionPending: false })
+    }
+  }
+}
+
+function BotCreateDialog({
+  controller,
+  onClose,
+}: {
+  controller: FleetWebController
+  onClose: () => void
+}) {
+  const state = useSyncExternalStore(controller.subscribe, controller.snapshot, controller.snapshot)
+  const [handle, setHandle] = useState('')
+  const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
+  const [capabilities, setCapabilities] = useState('')
+  const [soul, setSoul] = useState('')
+  const [fleetRole, setFleetRole] = useState<FleetProfileDraft['fleetRole']>('generalist')
+  return (
+    <div className="dsh-hermes-fleet-modal-backdrop" onClick={onClose}>
+      <div className="dsh-hermes-fleet-modal" onClick={event => { event.stopPropagation() }}>
+        <h4>新建 Agent</h4>
+        <p className="dsh-hermes-muted">填写 Bot 档案；保存后会生成草稿和 8 位确认码，在中间会话发送 /bot confirm 即可激活。</p>
+        {state.error === undefined ? null : <div className="dsh-hermes-alert dsh-hermes-error">{state.error}</div>}
+        <div className="dsh-hermes-grid">
+          <Field label="Bot ID" hint="小写，例如 researcher"><input value={handle} onChange={event => { setHandle(event.target.value.toLowerCase()) }} autoComplete="off" /></Field>
+          <Field label="名称"><input value={title} onChange={event => { setTitle(event.target.value) }} /></Field>
+          <Field label="职责说明"><textarea value={description} onChange={event => { setDescription(event.target.value) }} /></Field>
+          <Field label="能力（逗号分隔）"><input value={capabilities} onChange={event => { setCapabilities(event.target.value) }} /></Field>
+          <Field label="Fleet 角色"><select value={fleetRole} onChange={event => { setFleetRole(event.target.value as FleetProfileDraft['fleetRole']) }}><option value="worker">Worker</option><option value="verifier">Verifier</option><option value="synthesizer">Synthesizer</option><option value="generalist">Generalist</option></select></Field>
+          <Field label="SOUL / 系统说明"><textarea value={soul} onChange={event => { setSoul(event.target.value) }} /></Field>
+        </div>
+        <div className="dsh-hermes-action-row">
+          <button type="button" className="dsh-hermes-secondary" onClick={onClose}>取消</button>
+          <button type="button" className="dsh-hermes-primary" disabled={state.actionPending || handle.trim() === '' || title.trim() === ''} onClick={() => { void controller.createBotDraft({ handle, title, description, capabilities, soul, fleetRole }) }}>{state.actionPending ? '创建中…' : '创建草稿'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FleetSidebarRail({ controller, ctx }: { controller: FleetWebController; ctx: ClientContext }) {
+  const state = useSyncExternalStore(controller.subscribe, controller.snapshot, controller.snapshot)
+  const sessionList = useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot, ctx.sessions.list.getSnapshot)
+  const fleetEnabled = state.diagnostics.collaboration?.enabled !== false
+  const webCreation = state.diagnostics.collaboration?.features?.webChatBotCreation === true
+    || state.diagnostics.collaboration?.features?.dynamicRegistry === true
+  const query = state.query.trim().toLowerCase()
+  const rows = controller.botRows()
+    .filter(row => query === '' || row.handle.includes(query) || row.title.toLowerCase().includes(query))
+    .sort((left, right) => {
+      const leftPinned = state.pinned.includes(left.handle) ? 0 : 1
+      const rightPinned = state.pinned.includes(right.handle) ? 0 : 1
+      if (leftPinned !== rightPinned) return leftPinned - rightPinned
+      if (left.needsYou !== right.needsYou) return left.needsYou ? -1 : 1
+      return left.title.localeCompare(right.title)
+    })
+  const currentSession = sessionList.current
+  const routines = state.diagnostics.fleet?.routines ?? []
+  const teams = state.diagnostics.fleet?.teams ?? []
+  const rooms = (state.diagnostics.fleet?.rooms ?? []).filter(room => room.closed !== true)
+  const badge = controller.needsYouCount()
+  return (
+    <div className="dsh-hermes-fleet-rail-host">
+      <aside className={`dsh-hermes-fleet-rail${state.collapsed ? ' collapsed' : ''}`}>
+        <div className="dsh-hermes-fleet-rail-head">
+          {!state.collapsed ? <h3>BOTS</h3> : null}
+          <div className="dsh-hermes-action-row">
+            {badge > 0 ? <span className="dsh-hermes-fleet-badge">{String(badge)}</span> : null}
+            <button type="button" className="dsh-hermes-secondary" onClick={() => { controller.setCollapsed(!state.collapsed) }}>{state.collapsed ? '›' : '‹'}</button>
+          </div>
+        </div>
+        {state.collapsed ? null : (
+          <>
+            <div className="dsh-hermes-fleet-rail-tabs">
+              <button type="button" className={`dsh-hermes-fleet-rail-tab${state.tab === 'bots' ? ' active' : ''}`} onClick={() => { controller.setTab('bots') }}>BOTS</button>
+              <button type="button" className={`dsh-hermes-fleet-rail-tab${state.tab === 'groups' ? ' active' : ''}`} onClick={() => { controller.setTab('groups') }}>群组</button>
+              <button type="button" className={`dsh-hermes-fleet-rail-tab${state.tab === 'cron' ? ' active' : ''}`} onClick={() => { controller.setTab('cron') }}>CRON</button>
+            </div>
+            <div className="dsh-hermes-fleet-rail-body">
+              {state.message === undefined ? null : <div className="dsh-hermes-alert dsh-hermes-success">{state.message}</div>}
+              {state.error === undefined ? null : <div className="dsh-hermes-alert dsh-hermes-error">{state.error}</div>}
+              {!fleetEnabled || !webCreation ? (
+                <div className="dsh-hermes-alert dsh-hermes-notice">
+                  Fleet Web 尚未启用。
+                  <button type="button" className="dsh-hermes-secondary" disabled={state.actionPending} onClick={() => { void controller.ensureFleetEnabled() }}>一键启用</button>
+                </div>
+              ) : null}
+              {state.tab === 'bots' ? (
+                <>
+                  <input className="dsh-hermes-fleet-rail-search" value={state.query} placeholder="搜索 Bot…" onChange={event => { controller.setQuery(event.target.value) }} />
+                  <div className="dsh-hermes-fleet-rail-scroll">
+                    {rows.length === 0 ? <div className="dsh-hermes-id-empty">{state.loading ? '加载中…' : '还没有 Bot；点击下方 + New Agent。'}</div> : rows.map(row => {
+                      const active = resolveBotSessionId(ctx, row.handle, row.sessionId) === currentSession
+                      return (
+                        <button type="button" key={`${row.source}:${row.handle}`} className={`dsh-hermes-fleet-bot-row${active ? ' active' : ''}`} onClick={() => {
+                          if (row.activationCode !== undefined && row.status === 'draft') {
+                            void controller.confirmBot(row.handle, row.activationCode)
+                            return
+                          }
+                          controller.openBot(row.handle, row.sessionId)
+                        }}>
+                          <span className={`dsh-hermes-fleet-dot${row.needsYou ? ' needs' : row.busy ? ' busy' : row.status === 'draft' ? ' draft' : ''}`} />
+                          <div><strong>{row.title}</strong><span>@{row.handle} · {row.fleetRole ?? 'generalist'} · {row.status}</span></div>
+                          <span className="dsh-hermes-secondary" role="button" tabIndex={0} onClick={event => { event.stopPropagation(); controller.togglePin(row.handle) }} onKeyDown={event => { if (event.key === 'Enter') { event.stopPropagation(); controller.togglePin(row.handle) } }}>{state.pinned.includes(row.handle) ? '★' : '☆'}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </>
+              ) : null}
+              {state.tab === 'groups' ? (
+                <div className="dsh-hermes-fleet-rail-scroll">
+                  {teams.length === 0 && rooms.length === 0 ? <div className="dsh-hermes-id-empty">还没有 Team 或群聊房间。可在 owner 会话发送 /team create 创建。</div> : null}
+                  {teams.map(team => (
+                    <div className="dsh-hermes-fleet-group-row" key={team.id}>
+                      <strong>{team.name ?? team.id}</strong>
+                      <span className="dsh-hermes-muted">{(team.memberBotIds ?? []).map(id => '@' + id).join('、')}</span>
+                      <button type="button" className="dsh-hermes-secondary" onClick={() => { void controller.sendOwnerCommand(`@${team.id ?? 'team'} 请根据当前上下文协作。`) }}>打开群协作</button>
+                    </div>
+                  ))}
+                  {rooms.map(room => (
+                    <div className="dsh-hermes-fleet-group-row" key={room.id}>
+                      <strong>Room {room.id}</strong>
+                      <span className="dsh-hermes-muted">{(room.participants ?? []).map(id => '@' + id).join('、')} · {String(room.messageCount ?? 0)} 条</span>
+                      <button type="button" className="dsh-hermes-secondary" onClick={() => {
+                        const mention = (room.participants ?? []).map(id => '@' + id).join(' ')
+                        void controller.sendOwnerCommand(`${mention} 请继续 Group Room 协作。`)
+                      }}>@everyone 继续</button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {state.tab === 'cron' ? (
+                <div className="dsh-hermes-fleet-rail-scroll">
+                  {routines.length === 0 ? <div className="dsh-hermes-id-empty">{state.diagnostics.collaboration?.features?.routines === true ? '暂无 Cron Workflow。' : '请先在设置中启用 routines。'}</div> : routines.map(routine => (
+                    <div className="dsh-hermes-fleet-group-row" key={routine.id}>
+                      <strong>{routine.name ?? routine.id}</strong>
+                      <span className="dsh-hermes-muted">{routine.cron} {routine.timezone} · {routine.workflowId}</span>
+                      <span className="dsh-hermes-muted">{routine.status} · 下次 {routine.nextRunAt === undefined ? '—' : new Date(routine.nextRunAt).toLocaleString()}</span>
+                    </div>
+                  ))}
+                  <button type="button" className="dsh-hermes-secondary" onClick={() => { void controller.sendOwnerCommand('/routine list') }}>刷新 Cron 列表</button>
+                </div>
+              ) : null}
+            </div>
+            <div className="dsh-hermes-fleet-rail-foot">
+              <button type="button" className="dsh-hermes-primary" disabled={!fleetEnabled || state.actionPending} onClick={() => { controller.setBotModalOpen(true) }}>+ New Agent</button>
+              <button type="button" className="dsh-hermes-secondary" onClick={() => { controller.openOwnerSession() }}>Owner 会话</button>
+            </div>
+          </>
+        )}
+      </aside>
+      {state.botModalOpen ? <BotCreateDialog controller={controller} onClose={() => { controller.setBotModalOpen(false) }} /> : null}
+    </div>
+  )
+}
+
+function installFleetSessionMetadata(ctx: ClientContext): () => void {
+  return ctx.sessions.provide({
+    props: ['fleetKind'],
+    resolve(sessionId) {
+      if (sessionId.startsWith('hermes-bot-')) return { fleetKind: 'bot' }
+      if (sessionId.startsWith('hermes-group-')) return { fleetKind: 'group' }
+      return { fleetKind: undefined }
+    },
+  })
+}
+
+function installFleetSidebar(ctx: ClientContext, controller: FleetWebController): () => void {
+  const disposers: Array<() => void> = []
+  disposers.push(installFleetSessionMetadata(ctx))
+  ctx.slots.inject('shell.overlay', () => {
+    ctx.slots.register({
+      name: 'shell.overlay',
+      id: 'dsh-hermes-fleet-rail',
+      order: 40,
+    }, () => <FleetSidebarRail controller={controller} ctx={ctx} />)
+  })
+  return () => {
+    for (const dispose of disposers) dispose()
+  }
+}
 
 function shouldRegisterOwnerConversationSession(sessionId: string, list: SessionListState): boolean {
   if (sessionId === '' || sessionId.startsWith('hermes-bot-')) return false
@@ -1387,6 +1923,8 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(installStyles, 'dsh-hermes-bot: styles')
   ctx.effect(() => installOwnerWebSessionRegistration(ctx), 'dsh-hermes-bot: owner web session registration')
   const controller = new FeishuSetupController(ctx)
+  const fleetController = new FleetWebController(ctx)
+  ctx.effect(() => installFleetSidebar(ctx, fleetController), 'dsh-hermes-bot: fleet sidebar')
   ctx.effect(() => {
     const disposers = [
       ctx.on('credentials/updated', (ref) => {
@@ -1397,13 +1935,14 @@ export function apply(ctx: ClientContext): void {
     return () => {
       for (const dispose of disposers) dispose()
       controller.dispose()
+      fleetController.dispose()
     }
   }, 'dsh-hermes-bot: settings invalidations')
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'dsh-hermes-bot',
     order: 25,
-    label: () => '飞书机器人',
+    label: () => 'DeepSeek Bot',
     inject: () => ({ controller }),
   }, SettingsSection))
 }

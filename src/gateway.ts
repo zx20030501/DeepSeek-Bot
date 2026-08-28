@@ -127,6 +127,7 @@ import type {
   RunRecord,
   SendBotMessageInput,
   TaskRecord,
+  TeamDefinition,
 } from './types.js'
 
 interface SessionLike { readonly id: unknown }
@@ -934,13 +935,20 @@ export class BotGateway {
     const approvals = await this.approvals.snapshot()
     await this.reconcileFleetApprovals(approvals)
     const fleetFeatures = this.config.collaboration?.features
-    const [mailbox, taskSnapshot, rooms, registryEntries] = await Promise.all([
+    const localActor = actorForTarget(LOCAL_WEB_TARGET)
+    const [mailbox, taskSnapshot, rooms, registryEntries, visibleTeams, routineRows] = await Promise.all([
       this.mailbox.dashboardSnapshot(),
       this.tasks.dashboardSnapshot(),
       this.rooms.snapshot(),
       fleetFeatures?.dynamicRegistry === true || fleetFeatures?.webChatBotCreation === true
         ? this.registry.list(undefined, true)
         : Promise.resolve([] as BotRegistryEntry[]),
+      this.config.collaboration?.enabled === false
+        ? Promise.resolve([] as TeamDefinition[])
+        : this.teams.listTeams({ actorId: localActor }).catch(() => [] as TeamDefinition[]),
+      this.routinesEnabled()
+        ? this.listRoutines().catch(() => [] as RoutineRecord[])
+        : Promise.resolve([] as RoutineRecord[]),
     ])
     const pendingActivation = new Map(
       approvals
@@ -1051,6 +1059,25 @@ export class BotGateway {
             runId: item.envelope.runId,
           },
           updatedAt: item.updatedAt,
+        })),
+        teams: visibleTeams.slice(0, 30).map(team => ({
+          id: team.id,
+          name: team.name,
+          status: team.status,
+          memberBotIds: [...team.memberBotIds],
+          ...(team.managerBotId === undefined || team.managerBotId === null ? {} : { managerBotId: team.managerBotId }),
+          maxConcurrency: team.maxConcurrency,
+          updatedAt: team.updatedAt,
+        })),
+        routines: routineRows.slice(0, 30).map(routine => ({
+          id: routine.id,
+          name: routine.name,
+          status: routine.status,
+          cron: routine.cron,
+          timezone: routine.timezone,
+          workflowId: routine.workflowId,
+          nextRunAt: routine.nextRunAt,
+          updatedAt: routine.updatedAt,
         })),
       },
     }
@@ -2502,6 +2529,45 @@ export class BotGateway {
     this.localWebReplySessions.set(targetKey(LOCAL_WEB_TARGET), id)
     await this.rememberSessionTarget(id, LOCAL_WEB_TARGET)
     await this.ensureLocalWebOwnerTools(id)
+  }
+
+  /** Inject a Fleet / @mention / slash command into a registered owner DSH web session. */
+  public async dispatchOwnerWebCommand(sessionId: string, text: string): Promise<void> {
+    const id = sessionKey(sessionId)
+    if (!this.canRegisterOwnerWebSession(id)) throw new Error('无效的 DSH Web 会话，不能注入 Fleet 命令。')
+    await this.registerLocalWebOwnerSession(id)
+    const trimmed = text.trim()
+    if (trimmed === '') throw new Error('命令不能为空。')
+    await this.withDurableMutation(() => this.acceptOwnerWebInbound({
+      id: `local-web:cmd:${id}:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text: trimmed,
+      receivedAt: Date.now(),
+    }, id))
+  }
+
+  /** Trusted local-dashboard Bot draft creation (no Feishu/Telegram binding required). */
+  public async createWebDashboardBotDraft(input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
+    return this.createDynamicBotDraft(input, LOCAL_WEB_TARGET)
+  }
+
+  /** Trusted local-dashboard Team creation for the web BOTS panel. */
+  public async createWebDashboardTeam(name: string, memberBotIds: readonly string[]): Promise<TeamDefinition> {
+    const actor = actorForTarget(LOCAL_WEB_TARGET)
+    const members = [...new Set(memberBotIds.map(value => value.trim().toLowerCase()).filter(Boolean))]
+    if (name.trim() === '' || members.length === 0) throw new Error('Team 名称和成员不能为空。')
+    for (const botId of members) {
+      if (!this.directory.canInvoke(botId, LOCAL_WEB_TARGET)) {
+        throw new Error(`Bot @${botId} 不存在或当前用户无权使用。`)
+      }
+    }
+    return this.teams.createTeam({
+      name: name.trim(),
+      scope: 'user',
+      ownerId: actor,
+      memberBotIds: members,
+      maxConcurrency: Math.min(3, members.length),
+    }, actor)
   }
 
   private latestLocalWebOwnerSession(): string | undefined {

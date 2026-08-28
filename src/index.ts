@@ -137,6 +137,9 @@ export function apply(ctx: Context, config: unknown = {}): void {
     setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
     registerLocalWebOwnerSession: sessionId => gateway.registerLocalWebOwnerSession(sessionId),
+    createWebDashboardBotDraft: input => gateway.createWebDashboardBotDraft(input),
+    createWebDashboardTeam: (name, memberBotIds) => gateway.createWebDashboardTeam(name, memberBotIds),
+    dispatchOwnerWebCommand: (sessionId, text) => gateway.dispatchOwnerWebCommand(sessionId, text),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {

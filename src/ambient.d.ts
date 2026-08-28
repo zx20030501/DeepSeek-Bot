@@ -15,6 +15,16 @@ declare module '@deepseek-ai/dsh-host-webserver' {
   }
 }
 
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotMap {
+    'shell.overlay': {
+      kind: 'list'
+      scope: 'root'
+      owner: { children?: never }
+    }
+  }
+}
+
 declare module '@deepseek-ai/dsh-client-runtime/client' {
   export type ClientContext = any
   export interface SnapshotStore<T> {

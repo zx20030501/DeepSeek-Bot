@@ -215,3 +215,54 @@ test('setup route registers owner DSH web conversation sessions on demand', asyn
   assert.deepEqual(calls, ['owner-programming-session'])
   assert.match(response.json.message, /Bot 创建工具/u)
 })
+
+test('setup route save_fleet_config merges fleet flags without credential body', async () => {
+  const calls = []
+  const harness = createHarness({
+    async saveAndApplySettings(settings) {
+      calls.push(settings.collaboration.features.webChatBotCreation)
+    },
+  })
+  const response = await harness.post({
+    action: 'save_fleet_config',
+    enableFleet: true,
+  })
+  assert.equal(response.status, 200)
+  assert.deepEqual(calls, [true])
+  assert.match(response.json.message, /Fleet/u)
+})
+
+test('setup route bot_create_draft and owner_web_command delegate to gateway actions', async () => {
+  const calls = []
+  const harness = createHarness({
+    async registerLocalWebOwnerSession(sessionId) {
+      calls.push(['register', sessionId])
+    },
+    async createWebDashboardBotDraft(input) {
+      calls.push(['draft', input.handle])
+      return { status: 'draft', botId: 'bot_1', handle: input.handle, confirmationCode: 'ABCD2345', message: 'draft ok' }
+    },
+    async dispatchOwnerWebCommand(sessionId, text) {
+      calls.push(['command', sessionId, text])
+    },
+  })
+  const draft = await harness.post({
+    action: 'bot_create_draft',
+    sessionId: 'owner-session',
+    handle: 'analyst',
+    title: 'Analyst',
+  })
+  assert.equal(draft.status, 200)
+  assert.equal(draft.json.draft.handle, 'analyst')
+  const command = await harness.post({
+    action: 'owner_web_command',
+    sessionId: 'owner-session',
+    text: '/fleet research this',
+  })
+  assert.equal(command.status, 200)
+  assert.deepEqual(calls, [
+    ['register', 'owner-session'],
+    ['draft', 'analyst'],
+    ['command', 'owner-session', '/fleet research this'],
+  ])
+})
