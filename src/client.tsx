@@ -5,6 +5,7 @@ import {
 } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionListState } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
@@ -1323,6 +1324,52 @@ const CSS = `
 .dsh-hermes-diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dsh-hermes-secondary{border:1px solid var(--dsw-alias-border-subtle,#d9d5ce);border-radius:999px;background:transparent;color:inherit;padding:7px 12px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.dsh-hermes-diagnostic-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.dsh-hermes-diagnostic-grid>div{display:grid;gap:5px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1)}.dsh-hermes-diagnostic-grid span,.dsh-hermes-diagnostic-details span{font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}.dsh-hermes-diagnostic-grid strong{font-size:13px}.dsh-hermes-diagnostic-empty{padding:11px;border-radius:10px;background:rgba(224,162,55,.1);font-size:11px;line-height:1.5;color:#986818}.dsh-hermes-diagnostic-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dsh-hermes-diagnostic-details>div{display:grid;gap:5px;min-width:0}.dsh-hermes-diagnostic-details strong,.dsh-hermes-diagnostic-details code{font-size:11px;overflow-wrap:anywhere}.dsh-hermes-diagnostic-details code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:720px){.dsh-hermes-diagnostic-grid,.dsh-hermes-diagnostic-details{grid-template-columns:1fr 1fr}.dsh-hermes-diagnostic-head{display:grid}}
 `
 
+function shouldRegisterOwnerConversationSession(sessionId: string, list: SessionListState): boolean {
+  if (sessionId === '' || sessionId.startsWith('hermes-bot-')) return false
+  const summary = list.byId[sessionId]
+  if (summary?.origin === 'subagent') return false
+  return true
+}
+
+async function postOwnerWebSessionRegistration(sessionId: string): Promise<boolean> {
+  const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'register_owner_web_session', sessionId }),
+  })
+  return response.ok
+}
+
+function installOwnerWebSessionRegistration(ctx: ClientContext): () => void {
+  const registered = new Set<string>()
+  let inflight: string | undefined
+
+  const sync = (): void => {
+    const list = ctx.sessions.list.getSnapshot()
+    const current = list.current
+    if (current === undefined || !shouldRegisterOwnerConversationSession(current, list)) return
+    if (registered.has(current) || inflight === current) return
+    inflight = current
+    void postOwnerWebSessionRegistration(current)
+      .then(ok => { if (ok) registered.add(current) })
+      .catch(() => undefined)
+      .finally(() => {
+        if (inflight === current) inflight = undefined
+      })
+  }
+
+  sync()
+  const offList = ctx.sessions.list.subscribe(sync)
+  const offReset = ctx.on('connection/reset', () => {
+    registered.clear()
+    sync()
+  })
+  return () => {
+    offList()
+    offReset()
+  }
+}
+
 function installStyles(): () => void {
   const id = '@dsh-hermes-bot/client'
   const existing = document.querySelector<HTMLStyleElement>(`style[data-plugin-css="${id}"]`)
@@ -1334,10 +1381,11 @@ function installStyles(): () => void {
   return () => { style.remove() }
 }
 
-export const inject = ['slots']
+export const inject = ['slots', 'sessions']
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(installStyles, 'dsh-hermes-bot: styles')
+  ctx.effect(() => installOwnerWebSessionRegistration(ctx), 'dsh-hermes-bot: owner web session registration')
   const controller = new FeishuSetupController(ctx)
   ctx.effect(() => {
     const disposers = [

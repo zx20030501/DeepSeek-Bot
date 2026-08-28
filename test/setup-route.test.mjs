@@ -197,3 +197,21 @@ test('setup save waits for transactional runtime apply and does not fall back to
   assert.doesNotMatch(response.json.error, /new-secret-for-test|controlled runtime apply failure/u)
   assert.deepEqual(harness.directReplaceCalls, [])
 })
+
+test('setup route registers owner DSH web conversation sessions on demand', async () => {
+  const calls = []
+  const harness = createHarness({
+    async registerLocalWebOwnerSession(sessionId) {
+      calls.push(sessionId)
+    },
+  })
+  const missing = await harness.post({ action: 'register_owner_web_session' })
+  assert.equal(missing.status, 400)
+  const response = await harness.post({
+    action: 'register_owner_web_session',
+    sessionId: 'owner-programming-session',
+  })
+  assert.equal(response.status, 200)
+  assert.deepEqual(calls, ['owner-programming-session'])
+  assert.match(response.json.message, /Bot 创建工具/u)
+})
