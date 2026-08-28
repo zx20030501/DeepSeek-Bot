@@ -2456,18 +2456,14 @@ test('createBotDraftFromSession rejects Feishu-bound session even when webChatBo
   }
 })
 
-test('native DSH web user agent receives bot_create_draft tools via owner session registration hook', async () => {
-  // Production: agent/session-start with explicit header.agentPreset, or turn/start with platform=local.
+test('native DSH web user agent receives bot_create_draft tools via explicit owner registration', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek-native-web-tools-'))
   let gateway
   try {
     const agents = new Map()
     const registeredTools = new Map()
     const agentRegistry = {
-      get(id) {
-        const sessionKey = String(id)
-        return agents.get(sessionKey)
-      },
+      get(id) { return agents.get(String(id)) },
       async resume() { throw new Error('not found') },
       async create() { throw new Error('native sessions should not call create') },
     }
@@ -2488,16 +2484,10 @@ test('native DSH web user agent receives bot_create_draft tools via owner sessio
     const agentCtx = { get(name) { return name === 'tools' ? runtime : undefined } }
     const nativeAgent = {
       id: sessionId, ctx: agentCtx, status: 'idle', options: {}, cancel() {}, followup() {},
-      session: {
-        id: sessionId,
-        events: [],
-        seq: 0,
-        header: { version: 0, id: sessionId, createdAt: Date.now(), agentPreset: 'default' },
-      },
+      session: { id: sessionId, events: [], seq: 0 },
     }
     agents.set(sessionId, nativeAgent)
-    gateway.tryRegisterOwnerWebSessionFromAgentStart(nativeAgent)
-    await new Promise(resolve => setTimeout(resolve, 50))
+    await gateway.registerLocalWebOwnerSession(sessionId)
     assert.ok(registeredTools.has('bot_create_draft'), 'Native DSH web session should receive bot_create_draft tool')
     assert.ok(registeredTools.has('bot_update_draft'), 'Native DSH web session should receive bot_update_draft tool')
   } finally {

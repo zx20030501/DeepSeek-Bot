@@ -45,6 +45,7 @@ export interface SetupRouteActions {
   replayFleetTask?: (taskId: string) => Promise<FleetReplayResult | undefined>
   setDynamicBotStatus?: (botId: string, status: 'active' | 'disabled' | 'deleted') => Promise<BotRegistryEntry | undefined>
   validateStaticProfiles?: (handles: readonly string[]) => Promise<void>
+  registerLocalWebOwnerSession?: (sessionId: string) => Promise<void>
   saveAndApplySettings?: (settings: HermesBotSettings, appSecret?: string) => Promise<void>
 }
 
@@ -151,6 +152,7 @@ async function handleRequest(
     && action !== 'fleet_task_cancel'
     && action !== 'fleet_task_replay'
     && action !== 'bot_registry_status'
+    && action !== 'register_owner_web_session'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -250,6 +252,17 @@ async function handleRequest(
     const snapshot = await readSnapshot(ctx, source, diagnostics)
     const verb = status === 'active' ? '启用' : status === 'disabled' ? '停用' : '删除'
     sendJson(res, 200, { ...snapshot, message: `已${verb} @${bot.definition.handle}。` })
+    return
+  }
+  if (action === 'register_owner_web_session') {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    if (sessionId === '') throw new SetupRequestError(400, '缺少 DSH Web 会话 ID。')
+    if (actions.registerLocalWebOwnerSession === undefined) {
+      throw new SetupRequestError(503, 'DSH Web 会话注册服务还没有准备好。')
+    }
+    await actions.registerLocalWebOwnerSession(sessionId)
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    sendJson(res, 200, { ...snapshot, message: '已为本机 DSH Web 对话会话安装 Bot 创建工具。' })
     return
   }
   let settings: HermesBotSettings

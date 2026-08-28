@@ -136,6 +136,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
     replayFleetTask: taskId => gateway.replayFleetTask(taskId),
     setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
+    registerLocalWebOwnerSession: sessionId => gateway.registerLocalWebOwnerSession(sessionId),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
@@ -151,9 +152,6 @@ export function apply(ctx: Context, config: unknown = {}): void {
     requestGatewayRefresh()
   })
 
-  ctx.on('agent/session-start', (payload: { readonly agent: { readonly id: unknown; readonly session?: unknown } }) => {
-    gateway.tryRegisterOwnerWebSessionFromAgentStart(payload.agent)
-  })
   ctx.on('session/event', (session, event) => {
     gateway.tryRegisterOwnerWebSession(session, event)
     gateway.onSessionEvent(session, event)
