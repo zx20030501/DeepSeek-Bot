@@ -488,8 +488,8 @@ export class BotGateway {
   private readonly sessionTargets = new Map<string, BotTarget>()
   /** DSH web owner sessions positively registered for in-chat bot creation tools. */
   private readonly localWebOwnerSessions = new Set<string>()
-  /** Sessions already evaluated for owner-web registration (turn/start only). */
-  private readonly ownerWebRegistrationChecked = new Set<string>()
+  /** Fleet worker session ids — owner tools must never install here. */
+  private readonly fleetWorkerSessions = new Set<string>()
   private readonly internalRuns = new Map<string, InternalRun>()
   private readonly internalRunBySession = new Map<string, string>()
   private readonly activeBotRuns = new Map<string, string>()
@@ -2443,21 +2443,23 @@ export class BotGateway {
   }
 
   /**
-   * Positive identity: owner DSH web user session (platform local or explicitly registered).
-   * Never true for Feishu/Telegram, internal runs, or unregistered native sessions.
+   * Positive identity: only sessions explicitly registered as owner DSH web users.
+   * Never inferred from transport bindings, Harness events, or Fleet worker ids.
    */
   private isLocalWebOwnerSession(sessionId: string): boolean {
     const id = sessionKey(sessionId)
     if (this.internalRunBySession.has(id)) return false
     if (this.isHermesBotWorkerSession(id)) return false
-    if (this.localWebOwnerSessions.has(id)) return true
-    const target = this.sessionTargets.get(id) ?? this.state.snapshot().sessions[id]
-    if (target?.platform === 'feishu' || target?.platform === 'telegram') return false
-    return target?.platform === 'local'
+    if (this.fleetWorkerSessions.has(id)) return false
+    return this.localWebOwnerSessions.has(id)
   }
 
   private isHermesBotWorkerSession(sessionId: string): boolean {
     return sessionId.startsWith('hermes-bot-')
+  }
+
+  private markFleetWorkerSession(sessionId: string): void {
+    this.fleetWorkerSessions.add(sessionKey(sessionId))
   }
 
   /** Shared transport/worker guards — never infer owner from missing data. */
@@ -2466,36 +2468,18 @@ export class BotGateway {
     const id = sessionKey(sessionId)
     if (this.internalRunBySession.has(id)) return false
     if (this.isHermesBotWorkerSession(id)) return false
+    if (this.fleetWorkerSessions.has(id)) return false
     const target = this.sessionTargets.get(id) ?? this.state.snapshot().sessions[id]
     if (target?.platform === 'feishu' || target?.platform === 'telegram') return false
     return true
   }
 
   /**
-   * Positive identity at turn/start: only an explicit platform=local binding.
+   * Harness session/event hook. Owner tool installation is explicit-only
+   * (registerLocalWebOwnerSession via DSH web client, setup-route, or local inbound).
    */
-  private shouldRegisterOwnerWebSessionAtTurnStart(sessionId: string): boolean {
-    if (!this.canRegisterOwnerWebSession(sessionId)) return false
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
-    return target?.platform === 'local'
-  }
-
-  /**
-   * Observe Harness session/event for platform=local owner sessions only.
-   * Called from plugin index.ts on turn/start — never guesses from headers.
-   */
-  public tryRegisterOwnerWebSession(session: SessionLike, event: unknown): void {
-    if (!this.webDynamicBotCreationEnabled()) return
-    const record = asRecord(event)
-    if (record.type !== 'turn/start') return
-    const id = sessionKey(session.id)
-    if (this.isHermesBotWorkerSession(id) || this.internalRunBySession.has(id)) return
-    if (this.ownerWebRegistrationChecked.has(id)) return
-    this.ownerWebRegistrationChecked.add(id)
-    if (!this.shouldRegisterOwnerWebSessionAtTurnStart(id)) return
-    void this.registerLocalWebOwnerSession(id).catch(error => {
-      this.log('warn', `owner web session tool registration failed: ${String(error)}`)
-    })
+  public tryRegisterOwnerWebSession(_session: SessionLike, _event: unknown): void {
+    // Intentionally no-op: never install bot_create_draft / bot_update_draft from session/event.
   }
 
   /**
@@ -4383,6 +4367,7 @@ export class BotGateway {
         await this.failUndeliverableRun(lease.item.envelope, error)
         continue
       }
+      this.markFleetWorkerSession(scopedSessionId)
       const internal: InternalRun = {
         runId: run.id,
         botId: bot.id,
@@ -5049,7 +5034,7 @@ export class BotGateway {
     if (failed) {
       const detail = reason + '; compensation ' + (failed.workflowNodeId ?? failed.id) + ' failed: ' + (failed.error ?? failed.status)
       await this.cancelCompiledWorkflowChildren(input.definition.id, input.workflowRunId, detail)
-      await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+      await this.sendDeliveredText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
       await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
       await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_failed', {
         workflowRunId: input.workflowRunId,
@@ -5068,7 +5053,7 @@ export class BotGateway {
     )
     if (targetNodeIds.every(nodeId => completedByNode.get(prefix + nodeId)?.status === 'completed')) {
       const detail = reason + '; compensation completed'
-      await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+      await this.sendDeliveredText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
       await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
       await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.compensation_completed', {
         workflowRunId: input.workflowRunId,
@@ -5470,10 +5455,7 @@ export class BotGateway {
           })
           .filter(Boolean)
         const finalResult = ([...parts, ...controlParts].join('\n\n') || input.latestOutput || 'Workflow 没有产生文本结果。').slice(0, 50_000)
-        await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 完成：\n' + finalResult, 'workflow-result:' + input.workflowRunId)
-        // Flush before marking the root complete so tests and callers observe the
-        // outbound message once the Workflow Task is already terminal.
-        await this.outbox.flush()
+        await this.sendDeliveredText(input.replyTarget, 'Workflow ' + input.definition.name + ' 完成：\n' + finalResult, 'workflow-result:' + input.workflowRunId)
         await this.tasks.completeTask(input.rootTaskId, finalResult, 'workflow-runtime')
         await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.completed', {
           workflowRunId: input.workflowRunId,
@@ -5667,7 +5649,7 @@ export class BotGateway {
       }
       await this.cancelCompiledWorkflowChildren(input.definitionId, input.workflowRunId, 'Workflow root failed: ' + detail)
       if (input.replyTarget) {
-        await this.sendText(input.replyTarget, 'Workflow ' + input.workflowName + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+        await this.sendDeliveredText(input.replyTarget, 'Workflow ' + input.workflowName + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
       }
       await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
       await this.tasks.audit('workflow', input.definitionId, 'workflow-runtime', 'workflow.failed', {
@@ -5701,7 +5683,7 @@ export class BotGateway {
       }, input.correlationId)
     }
     await this.cancelCompiledWorkflowChildren(input.definition.id, input.workflowRunId, 'Workflow root failed: ' + detail)
-    await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
+    await this.sendDeliveredText(input.replyTarget, 'Workflow ' + input.definition.name + ' 失败：' + detail, 'workflow-failed:' + input.workflowRunId)
     await this.tasks.failTask(input.rootTaskId, detail, 'workflow-runtime')
     await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.failed', {
       workflowRunId: input.workflowRunId,
@@ -6874,6 +6856,12 @@ export class BotGateway {
 
   private async sendText(target: BotTarget, text: string, key: string): Promise<void> {
     await this.outbox.enqueue({ key, target, text })
+  }
+
+  /** Enqueue and drain the outbox lane so terminal Workflow notifications are observable before Task state flips. */
+  private async sendDeliveredText(target: BotTarget, text: string, key: string): Promise<void> {
+    await this.outbox.enqueue({ key, target, text })
+    await this.outbox.flush()
   }
 
   private transportFor(platform: string): BotTransport | undefined {

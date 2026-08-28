@@ -156,6 +156,7 @@ export class HarnessBridge {
 
   private async configureAgent(agent: Agent, setup?: AgentSetupLike): Promise<void> {
     if (setup === undefined || this.internalToolsConfigured.has(agent as object)) return
+    if (this.userToolsConfigured.has(agent as object)) return
     const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
     if (agentContext === undefined) return
     await setup(agentContext)
@@ -171,6 +172,7 @@ export class HarnessBridge {
     if (String(sessionId).startsWith('hermes-bot-')) return false
     const agent = this.agents.get(sessionId)
     if (!agent || this.userToolsConfigured.has(agent as object)) return false
+    if (this.internalToolsConfigured.has(agent as object)) return false
     const agentContext = (agent as unknown as { readonly ctx?: Context }).ctx
     if (agentContext === undefined) return false
     await setup(agentContext)
