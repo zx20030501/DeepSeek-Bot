@@ -165,8 +165,7 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
         dynamicRegistry: config.collaboration?.features?.dynamicRegistry === true,
         chatBotCreation: config.collaboration?.features?.dynamicRegistry === true
           && config.collaboration?.features?.chatBotCreation === true,
-        webChatBotCreation: config.collaboration?.features?.dynamicRegistry === true
-          && config.collaboration?.features?.webChatBotCreation === true,
+        webChatBotCreation: config.collaboration?.features?.webChatBotCreation === true,
       },
     },
     profiles: Object.entries(config.profiles ?? {}).map(([id, profile]) => profileSettings(id, profile)),
@@ -240,7 +239,7 @@ export function gatewayConfigFromSettings(
         ...base.collaboration?.features,
         dynamicRegistry: collaborationFeatures.dynamicRegistry,
         chatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.chatBotCreation,
-        webChatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.webChatBotCreation,
+        webChatBotCreation: collaborationFeatures.webChatBotCreation,
       },
     },
   }

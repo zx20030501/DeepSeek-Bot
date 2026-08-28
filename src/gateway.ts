@@ -629,11 +629,12 @@ export class BotGateway {
   private async fleetStatusUnlocked(): Promise<Record<string, unknown>> {
     const approvals = await this.approvals.snapshot()
     await this.reconcileFleetApprovals(approvals)
+    const fleetFeatures = this.config.collaboration?.features
     const [mailbox, taskSnapshot, rooms, registryEntries] = await Promise.all([
       this.mailbox.dashboardSnapshot(),
       this.tasks.dashboardSnapshot(),
       this.rooms.snapshot(),
-      this.config.collaboration?.features?.dynamicRegistry === true
+      fleetFeatures?.dynamicRegistry === true || fleetFeatures?.webChatBotCreation === true
         ? this.registry.list(undefined, true)
         : Promise.resolve([] as BotRegistryEntry[]),
     ])
@@ -891,8 +892,6 @@ export class BotGateway {
     actor = actorForTarget(target),
   ): Promise<BotCreateDraftToolResult> {
     return this.withBotNamespaceMutation(async () => {
-      const features = this.config.collaboration?.features
-      if (features?.dynamicRegistry !== true) throw new Error('动态 Bot 注册表尚未启用，请先在本机 Fleet 设置中开启。')
       if (target.userId === undefined) throw new Error('当前消息没有可验证的用户 ID，不能安全创建私人 Bot。')
       const handle = input.handle.trim().toLowerCase()
       const existing = await this.registry.getByHandle(handle)
@@ -1102,8 +1101,6 @@ export class BotGateway {
     target: BotTarget,
     actor: string,
   ): Promise<BotUpdateDraftToolResult> {
-    const features = this.config.collaboration?.features
-    if (features?.dynamicRegistry !== true) throw new Error('动态 Bot 注册表尚未启用')
     const entry = await this.registry.getByHandle(input.handle)
     if (entry === undefined || entry.definition.source === 'config' || entry.definition.ownerId !== actor) {
       throw new Error(`找不到当前用户的 Bot 草稿：@${input.handle.trim().toLowerCase()}`)
@@ -1148,11 +1145,13 @@ export class BotGateway {
 
   /**
    * Whether DSH web chat (tool-based) bot creation is enabled.
-   * Requires dynamicRegistry AND webChatBotCreation flags.
+   * Only requires webChatBotCreation flag - does NOT require dynamicRegistry.
+   * This allows local DSH web users to create bots without enabling the
+   * broader dynamic registry (which would also allow Feishu/Telegram creation).
    */
   private webDynamicBotCreationEnabled(): boolean {
     const features = this.config.collaboration?.features
-    return features?.dynamicRegistry === true && features.webChatBotCreation === true
+    return features?.webChatBotCreation === true
   }
 
   /**
@@ -1559,7 +1558,7 @@ export class BotGateway {
     await this.assertStaticProfileNamespace(this.config)
     if (features && Object.values(features).some(Boolean)) await this.teams.load()
     await this.refreshBotDirectory()
-    if (features?.dynamicRegistry === true) {
+    if (features?.dynamicRegistry === true || features?.webChatBotCreation === true) {
       await this.reconcileBotActivationApprovals()
     }
   }
@@ -1587,7 +1586,8 @@ export class BotGateway {
     this.profileRuntimeRefs.clear()
     this.dynamicBlockedReasons.clear()
     for (const handle of combined.keys()) this.profileRuntimeRefs.set(handle, { source: 'static' })
-    if (this.config.collaboration?.features?.dynamicRegistry === true) {
+    const features = this.config.collaboration?.features
+    if (features?.dynamicRegistry === true || features?.webChatBotCreation === true) {
       for (const entry of await this.registry.list()) {
         const profile = runtimeProfileFor(entry)
         if (profile === undefined) {
@@ -2340,17 +2340,23 @@ export class BotGateway {
     decision: 'approved' | 'rejected',
     actor: string,
   ): Promise<FleetApprovalRecord | undefined> {
-    // Note: Bot activation confirmation from Feishu/Telegram /bot confirm command
-    // is blocked in handleDynamicBotCommand. API-level resolveApproval is allowed
-    // for proper actors (including the bot owner calling from DSH Web dashboard).
-    const approval = await this.approvals.resolveByCode(code, decision, actor)
-    if (!approval) return undefined
+    // Security: For bot-activation approvals, only DSH Web local actors can approve.
+    // Feishu/Telegram inbound actors must NOT be able to use resolveApproval as a
+    // backdoor to activate bots. This enforces "owner-only web create" requirement.
+    const approval = await this.approvals.getByCode(code)
+    if (approval?.kind === 'bot-activation' && decision === 'approved') {
+      if (!this.isLocalOwner(actor)) {
+        throw new Error('Bot 确认必须从本机 DSH Web 页面进行，不能通过飞书/Telegram 操作。')
+      }
+    }
+    const resolved = await this.approvals.resolveByCode(code, decision, actor)
+    if (!resolved) return undefined
     await this.scheduleNextApprovalExpiry()
-    const resolutionActor = approval.resolvedBy ?? actor
-    await this.tasks.audit('approval', approval.id, resolutionActor, `approval.${approval.status}`, { entityId: approval.entityId }, approval.entityId)
-    await this.applyFleetApprovalResolution(approval, resolutionActor)
-    this.reconciledApprovalIds.add(approval.id)
-    return approval
+    const resolutionActor = resolved.resolvedBy ?? actor
+    await this.tasks.audit('approval', resolved.id, resolutionActor, `approval.${resolved.status}`, { entityId: resolved.entityId }, resolved.entityId)
+    await this.applyFleetApprovalResolution(resolved, resolutionActor)
+    this.reconciledApprovalIds.add(resolved.id)
+    return resolved
   }
 
   private async applyFleetApprovalResolution(approval: FleetApprovalRecord, resolutionActor: string): Promise<void> {
