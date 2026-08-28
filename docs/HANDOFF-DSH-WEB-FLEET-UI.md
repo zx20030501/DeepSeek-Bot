@@ -102,8 +102,10 @@ ctx.sessions.provide({
 
 ## 3. 还没做 / 下一步（按优先级）
 
+> **顺序修正（2026-08-28 深夜）**：设计依据见 [CHAT-COLLAB-RESEARCH-GROK-HERMES.md](CHAT-COLLAB-RESEARCH-GROK-HERMES.md)（Grok × Hermes 群聊调研，v1.0）。按其 §8，执行顺序应以「**点群打开 `hermes-group-*`**（容器）→ 按 Bot 归属灌 transcript → Room 长期化 → 驱动器 v1 → 人头」为准——消息头需要群会话容器才有落点，下面第 1 条的「多人消息头」相应后移到容器就绪之后（§8 第 6 步，DSH `conversation` 接不上时仅 overlay fallback）。
+
 1. **群聊中栏**：多人消息头、会话里点选 `@人` / `@everyone`。要接 DSH `conversation` 节点，不要再走 slash。这是产品缺口最大的一块。
-2. **点群聊打开中栏房间会话**：现在「继续协作」是对话框发任务，中栏不一定切到 `hermes-group-*`。应对齐点 Bot 的 `sessions.open`。
+2. **点群聊打开中栏房间会话**：现在「继续协作」是对话框发任务，中栏不一定切到 `hermes-group-*`。应对齐点 Bot 的 `sessions.open`。**（← 实际先做这条，见上方顺序修正）**
 3. **Team 发任务创建完房间后立刻切到该群聊**（与 2 一起）。
 4. **审批卡片**：已按 `entityId` 去重、过期过滤、「忽略」= reject。仍可能留下历史 workflow 卡，可再加批量清理。
 5. **PR #38 是否 merge**：建议群聊中栏有一版能用的再合；或先合右栏点击化，中栏当 follow-up。
