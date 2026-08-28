@@ -482,3 +482,76 @@ test('setup route team_delete removes a Team without slash commands', async () =
   assert.match(removed.json.message, /删除/u)
   assert.deepEqual(calls, ['team_1'])
 })
+test('trusted setup route manages saved Workflows (list/launch/stop/delete)', async () => {
+  const calls = []
+  const workflowRecord = {
+    schemaVersion: 1,
+    id: 'wf-dashboard',
+    revision: 3,
+    status: 'active',
+    createdAt: 1,
+    updatedAt: 2,
+    name: 'Dashboard flow',
+    description: 'd',
+    ownerId: 'user:feishu:ou_test',
+    scope: 'user',
+    entryNodeId: 'start',
+    nodes: [{ id: 'start', label: 'Start', kind: 'task', capability: 'start', outputs: ['result'] }],
+    edges: [],
+    inputs: [],
+    outputs: [],
+    policy: {
+      budget: { maxDepth: 8, maxParallel: 2, maxFanOut: 2, maxMessages: 20, maxTokens: 20000, maxCostUnits: 100 },
+      allowedCapabilities: ['start'],
+      allowedPermissions: [],
+      allowExternalEffects: false,
+    },
+  }
+  const harness = createHarness({
+    async listWorkflows(actor) {
+      calls.push(['list', actor])
+      return [workflowRecord]
+    },
+    async launchWorkflow(workflowId, target, actor) {
+      calls.push(['launch', workflowId, target.platform, actor])
+      return { workflowRunId: 'run-1', rootTaskId: 'task-1', dispatched: [] }
+    },
+    async stopWorkflow(workflowId, actor) {
+      calls.push(['stop', workflowId, actor])
+      return 2
+    },
+    async deleteWorkflow(workflowId, actor) {
+      calls.push(['delete', workflowId, actor])
+      return true
+    },
+  })
+
+  const listed = await harness.post({ action: 'workflow_list' })
+  assert.equal(listed.status, 200)
+  assert.equal(listed.json.workflows[0].id, 'wf-dashboard')
+  assert.equal(listed.json.workflows[0].revision, 3)
+
+  const launched = await harness.post({ action: 'workflow_launch', workflowId: 'wf-dashboard' })
+  assert.equal(launched.status, 200)
+  assert.match(launched.json.message, /run-1/u)
+
+  const stopped = await harness.post({ action: 'workflow_stop', workflowId: 'wf-dashboard' })
+  assert.equal(stopped.status, 200)
+  assert.match(stopped.json.message, /2/u)
+
+  const deleted = await harness.post({ action: 'workflow_delete', workflowId: 'wf-dashboard' })
+  assert.equal(deleted.status, 200)
+  assert.match(deleted.json.message, /已停用/u)
+
+  const missing = await harness.post({ action: 'workflow_launch' })
+  assert.equal(missing.status, 400)
+
+  const unknown = await harness.post({ action: 'workflow_purge' })
+  assert.equal(unknown.status, 400)
+  assert.deepEqual(calls, [
+    ['list', 'local-dashboard'],
+    ['launch', 'wf-dashboard', 'internal', 'local-dashboard'],
+    ['stop', 'wf-dashboard', 'local-dashboard'],
+    ['delete', 'wf-dashboard', 'local-dashboard'],
+  ])
+})

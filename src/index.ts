@@ -149,6 +149,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
     createWebDashboardRoutine: input => gateway.createWebDashboardRoutine(input),
     updateRoutine: (routineId, patch) => gateway.updateRoutine(routineId, patch),
     deleteRoutine: routineId => gateway.deleteRoutine(routineId),
+    listWorkflows: () => gateway.listWorkflowDefinitions('local-dashboard'),
+    launchWorkflow: (workflowId, target) => gateway.launchWorkflowDefinition(workflowId, 'local-dashboard', target, 'local-dashboard'),
+    stopWorkflow: workflowId => gateway.cancelWorkflowRuns(workflowId, 'local-dashboard'),
+    deleteWorkflow: workflowId => gateway.deleteWorkflowDefinition(workflowId, 'local-dashboard'),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
@@ -190,6 +194,36 @@ export {
   parseBotMentions,
 } from './collaboration.js'
 export { PairingStore } from './pairing.js'
+export { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
+export type {
+  BotAskInput,
+  BotAskRecord,
+  BotAskReply,
+  BotAskRegisterInput,
+  BotAskReplyInput,
+  BotAskResult,
+  BotAskStatus,
+  BotAskWaitOptions,
+} from './bot-ask.js'
+export { ManagerActionLog, ManagerPauseRegistry } from './manager-control.js'
+export type {
+  ManagerActionInput,
+  ManagerActionKind,
+  ManagerActionQuery,
+  ManagerActionRecord,
+  ManagerBotObservation,
+  ManagerObservation,
+  ManagerObserveOptions,
+  ManagerPauseActionResult,
+  ManagerPauseInput,
+  ManagerPauseRecord,
+  ManagerReplanInput,
+  ManagerReplanObservationInput,
+  ManagerReplanResult,
+  ManagerStopResult,
+  ManagerWaitOptions,
+  ManagerWaitResult,
+} from './manager-control.js'
 export {
   REMOTE_TRANSPORT_SCHEMA_VERSION,
   HttpRemoteBotTransport,

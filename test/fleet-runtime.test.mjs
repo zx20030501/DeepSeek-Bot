@@ -840,6 +840,10 @@ test('durable Workflow map fan-out dispatches bounded item Tasks and reduces the
     assert.ok(snapshot.tasks.some(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'expand' && task.status === 'completed'))
     assert.ok(snapshot.tasks.some(task => task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'collect' && task.status === 'completed'))
     assert.ok(prompts.filter(item => item.preset.startsWith('worker')).length >= 3)
+    const sendDeadline = Date.now() + 2_000
+    while (!sent.some(item => item.text.includes('Workflow Map and reduce 完成')) && Date.now() < sendDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
     assert.ok(sent.some(item => item.text.includes('Workflow Map and reduce 完成')))
   } finally {
     if (gateway) await gateway.stop()
@@ -968,6 +972,10 @@ test('Workflow failure waits for durable reverse-order compensation before faili
       task.workflowRunId === launch.workflowRunId && task.workflowNodeId === 'compensation:failure:undo-start'
     ))
     assert.equal(compensation?.status, 'completed')
+    const sendDeadline = Date.now() + 2_000
+    while (!sent.some(item => item.text.includes('compensation completed')) && Date.now() < sendDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
     assert.ok(sent.some(item => item.text.includes('compensation completed')))
   } finally {
     if (gateway) await gateway.stop()

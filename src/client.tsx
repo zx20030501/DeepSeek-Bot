@@ -236,18 +236,29 @@ interface FleetTaskDetailView {
   readonly deliveries: Array<{ id: string; state: string; attempts: number; botId: string; runId: string; lastError?: string }>
 }
 
+interface SavedWorkflowView {
+  readonly id: string
+  readonly name: string
+  readonly status: string
+  readonly revision: number
+  readonly scope: string
+  readonly nodeCount: number
+}
+
 interface SetupState {
   readonly status: 'loading' | 'ready' | 'unavailable'
   readonly settings?: HermesBotSettings
   readonly writable: boolean
   readonly credential: CredentialState
   readonly diagnostics: Diagnostics
+  readonly workflows: readonly SavedWorkflowView[]
   readonly saving: boolean
   readonly diagnosing: boolean
   readonly pairingApproving: boolean
   readonly fleetApproving: boolean
   readonly fleetTaskAction?: string | undefined
   readonly botRegistryAction?: string | undefined
+  readonly workflowAction?: string | undefined
   readonly fleetTaskDetail?: FleetTaskDetailView | undefined
   readonly message?: string | undefined
   readonly error?: string | undefined
@@ -391,6 +402,7 @@ class FeishuSetupController {
       writable: false,
       credential: emptyCredential(),
       diagnostics: emptyDiagnostics(),
+      workflows: [],
       saving: false,
       diagnosing: false,
       pairingApproving: false,
@@ -418,6 +430,7 @@ class FeishuSetupController {
         diagnosticsError: undefined,
         error: undefined,
       })
+      void this.refreshWorkflows()
     } catch (error) {
       this.publish({ status: 'unavailable', error: `读取飞书机器人设置失败：${String(error)}` })
     }
@@ -775,6 +788,60 @@ class FeishuSetupController {
     }
   }
 
+  public async refreshWorkflows(): Promise<void> {
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'workflow_list' }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({ workflows: data.workflows ?? [] })
+    } catch (error) {
+      this.publish({ workflows: [], error: `读取 Workflow 列表失败：${String(error)}` })
+    }
+  }
+
+  private async runWorkflowAction(action: 'workflow_launch' | 'workflow_stop' | 'workflow_delete', workflowId: string, failPrefix: string): Promise<boolean> {
+    this.publish({ workflowAction: action + ':' + workflowId, error: undefined, message: undefined })
+    try {
+      const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ action, workflowId }),
+      })
+      const body = await readRouteBody(response)
+      if (!response.ok) throw new Error(errorFromBody(body, response.status))
+      const data = setupResponseFromBody(body)
+      this.publish({
+        workflows: data.workflows ?? this.snapshot().workflows,
+        diagnostics: data.diagnostics,
+        message: data.message ?? 'Workflow 操作完成。',
+      })
+      void this.refreshWorkflows()
+      return true
+    } catch (error) {
+      this.publish({ error: `${failPrefix}：${String(error)}` })
+      return false
+    } finally {
+      this.publish({ workflowAction: undefined })
+    }
+  }
+
+  public launchWorkflow(workflowId: string): Promise<boolean> {
+    return this.runWorkflowAction('workflow_launch', workflowId, '启动 Workflow 失败')
+  }
+
+  public stopWorkflow(workflowId: string): Promise<boolean> {
+    return this.runWorkflowAction('workflow_stop', workflowId, '停止 Workflow 失败')
+  }
+
+  public deleteWorkflow(workflowId: string): Promise<boolean> {
+    return this.runWorkflowAction('workflow_delete', workflowId, '停用 Workflow 失败')
+  }
+
   public dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -793,6 +860,7 @@ interface SetupResponse {
   readonly writable: boolean
   readonly credential: CredentialState
   readonly diagnostics: Diagnostics
+  readonly workflows?: readonly SavedWorkflowView[]
   readonly message?: string
   readonly pairingCandidate?: PairingCandidate
 }
@@ -829,6 +897,7 @@ function setupResponseFromBody(body: Record<string, unknown>): SetupResponse {
       && !Array.isArray(body.diagnostics)
       ? body.diagnostics as Diagnostics
       : emptyDiagnostics(),
+    ...(Array.isArray(body.workflows) ? { workflows: body.workflows as SavedWorkflowView[] } : {}),
     ...(typeof body.message === 'string' ? { message: body.message } : {}),
     ...(body.pairingCandidate !== null
       && typeof body.pairingCandidate === 'object'
@@ -963,6 +1032,8 @@ function FleetStatusPanel({
   taskAction,
   taskDetail,
   registryAction,
+  workflows,
+  workflowAction,
   onResolve,
   onRefresh,
   onDetail,
@@ -970,12 +1041,17 @@ function FleetStatusPanel({
   onReplay,
   onCloseDetail,
   onRegistryStatus,
+  onLaunchWorkflow,
+  onStopWorkflow,
+  onDeleteWorkflow,
 }: {
   diagnostics: Diagnostics
   approving: boolean
   taskAction?: string | undefined
   taskDetail?: FleetTaskDetailView | undefined
   registryAction?: string | undefined
+  workflows: readonly SavedWorkflowView[]
+  workflowAction?: string | undefined
   onResolve: (code: string, decision: 'approved' | 'rejected') => void
   onRefresh: () => void
   onDetail: (taskId: string) => void
@@ -983,10 +1059,14 @@ function FleetStatusPanel({
   onReplay: (taskId: string) => void
   onCloseDetail: () => void
   onRegistryStatus: (botId: string, status: 'active' | 'disabled' | 'deleted') => void
+  onLaunchWorkflow: (workflowId: string) => void
+  onStopWorkflow: (workflowId: string) => void
+  onDeleteWorkflow: (workflowId: string) => void
 }) {
   const fleet = diagnostics.fleet
   const approvals = (fleet?.approvals ?? []).filter(approval => approval.status === 'pending')
-  const workflows = fleet?.workflows ?? []
+  const fleetWorkflows = fleet?.workflows ?? []
+  const askCounts = fleet?.askCounts ?? { pending: 0, answered: 0, 'timed-out': 0, cancelled: 0 }
   const tasks = fleet?.tasks ?? []
   const deadLetters = fleet?.deadLetters ?? []
   const registryBots = fleet?.registryBots ?? []
@@ -1028,13 +1108,29 @@ function FleetStatusPanel({
       </div>
       <div className="dsh-hermes-fleet-columns">
         <div><strong>待审批</strong>{approvals.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : approvals.map(approval => <div className="dsh-hermes-fleet-row" key={approval.id}><div><code>{approval.code}</code><span>{approval.summary ?? approval.kind}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'approved') }}>批准</button><button type="button" className="dsh-hermes-secondary" disabled={approving || approval.code === undefined} onClick={() => { if (approval.code) onResolve(approval.code, 'rejected') }}>拒绝</button></div></div>)}</div>
-        <div><strong>最近工作流</strong>{workflows.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : workflows.slice(0, 6).map(workflow => <div className="dsh-hermes-fleet-row" key={workflow.id}><div><code>{workflow.id}</code><span>{workflow.status} · {(workflow.workerBotIds ?? []).map(id => '@' + id).join('、')}</span></div></div>)}</div>
+        <div><strong>Ask 汇总</strong><span className="dsh-hermes-muted">{askCounts.pending} 待答 · {askCounts.answered} 已答{askCounts['timed-out'] > 0 ? ` · ${askCounts['timed-out']} 超时` : ''}</span></div>
+        <div><strong>最近工作流</strong>{fleetWorkflows.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : fleetWorkflows.slice(0, 6).map(workflow => <div className="dsh-hermes-fleet-row" key={workflow.id}><div><code>{workflow.id}</code><span>{workflow.status} · {(workflow.workerBotIds ?? []).map(id => '@' + id).join('、')}</span></div></div>)}</div>
         <div><strong>最近任务</strong>{tasks.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : tasks.slice(0, 10).map(task => {
           const taskId = task.id ?? ''
           const terminal = task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
           return <div className="dsh-hermes-fleet-row" key={taskId}><div><code>{taskId}</code><span>{task.status} · {task.title}</span></div><div className="dsh-hermes-action-row"><button type="button" className="dsh-hermes-secondary" disabled={taskId === '' || taskAction !== undefined} onClick={() => { onDetail(taskId) }}>详情</button>{terminal ? <button type="button" className="dsh-hermes-secondary" disabled={taskId === '' || taskAction !== undefined} onClick={() => { onReplay(taskId) }}>重放</button> : <button type="button" className="dsh-hermes-danger" disabled={taskId === '' || taskAction !== undefined} onClick={() => { if (window.confirm(`确定取消任务 ${taskId}？正在运行的 Bot 会立即停止。`)) onCancel(taskId) }}>取消</button>}</div></div>
         })}</div>
         <div><strong>死信</strong>{deadLetters.length === 0 ? <span className="dsh-hermes-muted">暂无</span> : deadLetters.slice(0, 6).map(item => <div className="dsh-hermes-fleet-row" key={item.id}><div><code>{item.envelope?.taskId ?? item.id}</code><span>@{item.envelope?.to} · {item.lastError}</span></div></div>)}</div>
+      </div>
+      <div className="dsh-hermes-workflows">
+        <div className="dsh-hermes-diagnostic-head"><div><h4>Workflow 管理</h4><p className="dsh-hermes-muted">已保存的 Workflow 定义：启动新实例、停止运行中的实例或停用定义。创建/编辑请使用聊天命令 /wf run。</p></div><button type="button" className="dsh-hermes-secondary" onClick={onRefresh}>刷新</button></div>
+        {workflows.length === 0 ? <span className="dsh-hermes-muted">暂无已保存的 Workflow；可在聊天中用 /wf list 查看。</span> : workflows.slice(0, 20).map(workflow => (
+          <div className="dsh-hermes-fleet-row" key={workflow.id}>
+            <div><code>{workflow.id}</code><span>{workflow.name} · {workflow.status} · v{workflow.revision} · {workflow.nodeCount} 节点 · {workflow.scope}</span></div>
+            <div className="dsh-hermes-action-row">
+              <button type="button" className="dsh-hermes-secondary" disabled={workflowAction !== undefined} onClick={() => { onLaunchWorkflow(workflow.id) }}>启动</button>
+              <button type="button" className="dsh-hermes-secondary" disabled={workflowAction !== undefined} onClick={() => { onStopWorkflow(workflow.id) }}>停止运行</button>
+              {workflow.status === 'active'
+                ? <button type="button" className="dsh-hermes-danger" disabled={workflowAction !== undefined} onClick={() => { if (window.confirm(`确定停用 Workflow「${workflow.name}」？停用后不会出现在列表且无法启动。`)) onDeleteWorkflow(workflow.id) }}>停用</button>
+                : null}
+            </div>
+          </div>
+        ))}
       </div>
       {taskDetail === undefined ? null : <div className="dsh-hermes-task-detail">
         <div className="dsh-hermes-diagnostic-head"><div><h4>任务详情</h4><code>{taskDetail.task.id}</code></div><button type="button" className="dsh-hermes-secondary" onClick={onCloseDetail}>关闭</button></div>
@@ -1308,6 +1404,8 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         taskAction={state.fleetTaskAction}
         taskDetail={state.fleetTaskDetail}
         registryAction={state.botRegistryAction}
+        workflows={state.workflows}
+        workflowAction={state.workflowAction}
         onResolve={(code, decision) => { void controller.resolveFleetApproval(code, decision) }}
         onRefresh={() => { void controller.refreshDiagnostics() }}
         onDetail={taskId => { void controller.loadFleetTask(taskId) }}
@@ -1315,6 +1413,9 @@ function LoadedSettings({ controller }: { controller: FeishuSetupController }) {
         onReplay={taskId => { void controller.replayFleetTask(taskId) }}
         onCloseDetail={() => { controller.clearFleetTaskDetail() }}
         onRegistryStatus={(botId, status) => { void controller.updateDynamicBotStatus(botId, status) }}
+        onLaunchWorkflow={workflowId => { void controller.launchWorkflow(workflowId) }}
+        onStopWorkflow={workflowId => { void controller.stopWorkflow(workflowId) }}
+        onDeleteWorkflow={workflowId => { void controller.deleteWorkflow(workflowId) }}
       />
 
       <DiagnosticPanel diagnostics={state.diagnostics} error={state.diagnosticsError} onRefresh={() => { void controller.refreshDiagnostics() }} />
@@ -1345,6 +1446,7 @@ body[data-ds-dark-theme] .dsh-hermes-fleet-bot-row,body[data-ds-dark-theme] .dsh
 body[data-ds-dark-theme] .dsh-hermes-fleet-bot-row span,body[data-ds-dark-theme] .dsh-hermes-fleet-rail-tab:not(.active),body[data-ds-dark-theme] .dsh-hermes-fleet-pin-btn,body[data-ds-dark-theme] .dsh-hermes-fleet-rail-empty,body[data-ds-dark-theme] .dsh-hermes-fleet-rail-icon-btn,body[data-ds-dark-theme] .dsh-hermes-fleet-pending-row span{color:#c4bfb6}
 body[data-ds-dark-theme] .dsh-hermes-fleet-rail-foot .dsh-hermes-secondary,body[data-ds-dark-theme] .dsh-hermes-secondary{color:#f3f0ea;background:var(--dsw-alias-bg-layer-2,#2a2a2a)}
 body[data-ds-dark-theme] .dsh-hermes-fleet-rail-search{background:var(--dsw-alias-bg-layer-2,#242424);border-color:rgba(255,255,255,.14)}
+.dsh-hermes-workflows{display:grid;gap:8px;padding:10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,light-dark(#f7f5f1,#242424))}
 `
 
 const FLEET_PINNED_KEY = 'dsh-hermes-bot:fleet-pinned'

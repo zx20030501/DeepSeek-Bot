@@ -76,6 +76,7 @@ export function parseBotMentions(text: string, knownBotIds: Iterable<string>, ma
 
 export class BotDirectory {
   private readonly entries = new Map<string, BotDescriptor>()
+  private readonly capabilityIndex = new Map<string, Set<string>>()
 
   public constructor(
     profiles: Iterable<BotProfile> = [],
@@ -110,6 +111,46 @@ export class BotDirectory {
         enabled: profile.enabled !== false,
       })
     }
+    this.rebuildCapabilityIndex()
+  }
+
+  /** capability -> ids of enabled Bots that advertise it (exact strings). */
+  private rebuildCapabilityIndex(): void {
+    this.capabilityIndex.clear()
+    for (const entry of this.entries.values()) {
+      if (!entry.enabled) continue
+      for (const capability of entry.capabilities) {
+        let ids = this.capabilityIndex.get(capability)
+        if (ids === undefined) {
+          ids = new Set()
+          this.capabilityIndex.set(capability, ids)
+        }
+        ids.add(entry.id)
+      }
+    }
+  }
+
+  /**
+   * Fast candidate lookup for a capability. Exact matches come from the index;
+   * on a miss the legacy substring semantics (bot capability contains the
+   * requested term) are preserved as a bounded fallback scan.
+   */
+  public botsWithCapability(capability: string): readonly string[] {
+    const key = capability.trim()
+    if (key === '') return []
+    const exact = this.capabilityIndex.get(key)
+    if (exact !== undefined && exact.size > 0) return [...exact]
+    const matches: string[] = []
+    for (const [term, ids] of this.capabilityIndex) {
+      if (!term.includes(key)) continue
+      for (const id of ids) if (!matches.includes(id)) matches.push(id)
+    }
+    return matches
+  }
+
+  /** Number of distinct advertised capability terms (index size). */
+  public capabilityCount(): number {
+    return this.capabilityIndex.size
   }
 
   public get(id: string): BotDescriptor | undefined {
@@ -343,6 +384,7 @@ export class BotMailbox {
     workerId: string,
     blockedTargets: ReadonlySet<string> = new Set(),
     at = now(),
+    filter?: (item: MailboxItem) => boolean,
   ): Promise<MailboxLease | undefined> {
     await this.load()
     await this.recoverExpired(at)
@@ -352,6 +394,7 @@ export class BotMailbox {
       .filter(item => !blockedTargets.has(item.envelope.to))
       .filter(item => item.state === 'queued' && item.nextAttemptAt <= at)
       .filter(item => item.envelope.expiresAt === undefined || item.envelope.expiresAt > at)
+      .filter(item => filter === undefined || filter(item))
       .sort((a, b) => a.createdAt - b.createdAt)
     const item = candidates[0]
     if (!item) return undefined
