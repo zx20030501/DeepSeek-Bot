@@ -186,6 +186,18 @@ function actorForTarget(target: BotTarget): string {
   return `user:${target.platform}:${target.userId ?? target.chatId}`
 }
 
+/**
+ * Default target for unbound DSH web sessions (no Feishu/Telegram identity).
+ * Used when webChatBotCreation is enabled and the session has no transport binding.
+ * Actor becomes 'user:local:local-owner', owner is the local DSH installation.
+ */
+const LOCAL_WEB_TARGET: BotTarget = {
+  platform: 'local',
+  chatId: 'local-dashboard',
+  chatType: 'dm',
+  userId: 'local-owner',
+}
+
 function splitBotLabels(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；]+/u).map(item => item.trim()).filter(Boolean))]
 }
@@ -415,6 +427,7 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       features: {
         dynamicRegistry: fleetFeatures.dynamicRegistry === true,
         chatBotCreation: fleetFeatures.chatBotCreation === true,
+        webChatBotCreation: fleetFeatures.webChatBotCreation === true,
         peerMessaging: fleetFeatures.peerMessaging === true,
         managerAgent: fleetFeatures.managerAgent === true,
         savedWorkflows: fleetFeatures.savedWorkflows === true,
@@ -907,11 +920,12 @@ export class BotGateway {
   private async fleetStatusUnlocked(): Promise<Record<string, unknown>> {
     const approvals = await this.approvals.snapshot()
     await this.reconcileFleetApprovals(approvals)
+    const fleetFeatures = this.config.collaboration?.features
     const [mailbox, taskSnapshot, rooms, registryEntries] = await Promise.all([
       this.mailbox.dashboardSnapshot(),
       this.tasks.dashboardSnapshot(),
       this.rooms.snapshot(),
-      this.config.collaboration?.features?.dynamicRegistry === true
+      fleetFeatures?.dynamicRegistry === true || fleetFeatures?.webChatBotCreation === true
         ? this.registry.list(undefined, true)
         : Promise.resolve([] as BotRegistryEntry[]),
     ])
@@ -2129,7 +2143,7 @@ export class BotGateway {
     actor = actorForTarget(target),
   ): Promise<BotCreateDraftToolResult> {
     return this.withBotNamespaceMutation(async () => {
-      if (!this.dynamicBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用，请先在本机 Fleet 设置中开启。')
+      if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用，请先在本机 Fleet 设置中开启。')
       if (target.userId === undefined) throw new Error('当前消息没有可验证的用户 ID，不能安全创建私人 Bot。')
       const handle = input.handle.trim().toLowerCase()
       const existing = await this.registry.getByHandle(handle)
@@ -2185,7 +2199,10 @@ export class BotGateway {
     actor = 'local-dashboard',
   ): Promise<BotRegistryEntry | undefined> {
     return this.withBotLifecycleFence(async () => {
-      if (this.config.collaboration?.features?.dynamicRegistry !== true) throw new Error('动态 Bot 注册表尚未启用。')
+      const features = this.config.collaboration?.features
+      if (features?.dynamicRegistry !== true && features?.webChatBotCreation !== true) {
+        throw new Error('动态 Bot 注册表尚未启用。')
+      }
       const current = await this.registry.get(botId)
       if (current === undefined || current.definition.source === 'config') return undefined
       if (current.definition.status === 'draft' && status !== 'deleted') {
@@ -2365,7 +2382,7 @@ export class BotGateway {
     target: BotTarget,
     actor: string,
   ): Promise<BotUpdateDraftToolResult> {
-    if (!this.dynamicBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
+    if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
     const entry = await this.registry.getByHandle(input.handle)
     if (entry === undefined || entry.definition.source === 'config' || entry.definition.ownerId !== actor) {
       throw new Error(`找不到当前用户的 Bot 草稿：@${input.handle.trim().toLowerCase()}`)
@@ -2396,22 +2413,50 @@ export class BotGateway {
   }
 
   private async createBotDraftFromSession(sessionId: string, input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
-    if (!this.dynamicBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
-    if (target === undefined) throw new Error('无法确认当前 Agent 会话对应的用户')
+    if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
+    // Use Feishu/Telegram target if bound, otherwise fall back to local DSH web target.
+    // This allows unbound DSH web sessions to create bots with only webChatBotCreation enabled.
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
     return this.createDynamicBotDraft(input, target)
   }
 
   private async updateBotDraftFromSession(sessionId: string, input: BotUpdateDraftToolInput): Promise<BotUpdateDraftToolResult> {
-    if (!this.dynamicBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
-    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId]
-    if (target === undefined) throw new Error('无法确认当前 Agent 会话对应的用户')
+    if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用')
+    const target = this.sessionTargets.get(sessionId) ?? this.state.snapshot().sessions[sessionId] ?? LOCAL_WEB_TARGET
     return this.updateDynamicBotDraft(input, target)
   }
 
-  private dynamicBotCreationEnabled(): boolean {
+  /**
+   * Whether DSH web chat (tool-based) bot creation is enabled.
+   * Only requires webChatBotCreation flag - does NOT require dynamicRegistry.
+   */
+  private webDynamicBotCreationEnabled(): boolean {
+    const features = this.config.collaboration?.features
+    return features?.webChatBotCreation === true
+  }
+
+  /**
+   * Whether transport (Feishu/Telegram) bot creation is enabled.
+   * Requires both dynamicRegistry AND chatBotCreation flags.
+   */
+  private transportDynamicBotCreationEnabled(): boolean {
     const features = this.config.collaboration?.features
     return features?.dynamicRegistry === true && features.chatBotCreation === true
+  }
+
+  /**
+   * Whether any bot creation path is enabled.
+   */
+  private anyBotCreationEnabled(): boolean {
+    const features = this.config.collaboration?.features
+    return features?.dynamicRegistry === true || features?.webChatBotCreation === true
+  }
+
+  /**
+   * Whether the actor is a local owner (DSH Web).
+   */
+  private isLocalOwner(actor: string): boolean {
+    return actor === 'local-dashboard' || actor.startsWith('system:') || actor.startsWith('user:local:')
   }
 
   private async ensureBotActivationApproval(entry: BotRegistryEntry, actor: string): Promise<FleetApprovalRecord> {
@@ -2803,7 +2848,7 @@ export class BotGateway {
     await this.assertStaticProfileNamespace(this.config)
     if (features && Object.values(features).some(Boolean)) await this.teams.load()
     await this.refreshBotDirectory()
-    if (features?.dynamicRegistry === true) {
+    if (features?.dynamicRegistry === true || features?.webChatBotCreation === true) {
       await this.reconcileBotActivationApprovals()
     }
   }
@@ -2831,7 +2876,8 @@ export class BotGateway {
     this.profileRuntimeRefs.clear()
     this.dynamicBlockedReasons.clear()
     for (const handle of combined.keys()) this.profileRuntimeRefs.set(handle, { source: 'static' })
-    if (this.config.collaboration?.features?.dynamicRegistry === true) {
+    const features = this.config.collaboration?.features
+    if (features?.dynamicRegistry === true || features?.webChatBotCreation === true) {
       for (const entry of await this.registry.list()) {
         const profile = runtimeProfileFor(entry)
         if (profile === undefined) {
@@ -3268,7 +3314,7 @@ export class BotGateway {
           binding.sessionId as SessionId,
           profile,
           binding.modelOverride,
-          this.dynamicBotCreationEnabled() ? agentCtx => this.installUserFleetTools(agentCtx) : undefined,
+          this.anyBotCreationEnabled() ? agentCtx => this.installUserFleetTools(agentCtx) : undefined,
         )
         if (dynamicProfile) await this.rememberDirectProfileSession(profile.name, binding.sessionId)
         // Hermes routes known DSH commands natively; an unknown /xxx is still a
@@ -3877,6 +3923,17 @@ export class BotGateway {
     decision: 'approved' | 'rejected',
     actor: string,
   ): Promise<FleetApprovalRecord | undefined> {
+    // Security: For bot-activation approvals, only DSH Web local actors can approve when
+    // the full dynamicRegistry is disabled. When dynamicRegistry is ON, Feishu/Telegram
+    // actors can still use /bot confirm (existing behavior). This prevents resolveApproval
+    // from being a backdoor when only webChatBotCreation is enabled.
+    const pending = await this.approvals.getByCode(code)
+    if (pending?.kind === 'bot-activation' && decision === 'approved') {
+      const features = this.config.collaboration?.features
+      if (features?.dynamicRegistry !== true && !this.isLocalOwner(actor)) {
+        throw new Error('Bot 确认必须从本机 DSH Web 页面进行，不能通过飞书/Telegram 操作。')
+      }
+    }
     const approval = await this.approvals.resolveByCode(code, decision, actor)
     if (!approval) return undefined
     await this.scheduleNextApprovalExpiry()
@@ -3891,7 +3948,8 @@ export class BotGateway {
     if (approval.status === 'pending') return
     if (approval.kind === 'bot-activation') {
       if (approval.status !== 'approved') return
-      if (this.config.collaboration?.features?.dynamicRegistry !== true) {
+      const features = this.config.collaboration?.features
+      if (features?.dynamicRegistry !== true && features?.webChatBotCreation !== true) {
         throw new Error('Dynamic Bot Registry was disabled before activation could be applied')
       }
       const entry = await this.registry.get(approval.entityId)
@@ -6394,8 +6452,8 @@ export class BotGateway {
     const parts = args.trim().split(/\s+/u)
     const action = (parts[0] ?? '').toLowerCase()
     if (!new Set(['create', 'confirm', 'list', 'status', 'edit', 'disable', 'enable', 'delete', 'clone']).has(action)) return false
-    if (!this.dynamicBotCreationEnabled()) {
-      await this.completeWithText(message, walId, binding, '对话创建 Bot 尚未启用。请在本机设置页依次开启“动态 Bot 注册表”和“允许在对话中创建 Bot”，保存后发送 /new。')
+    if (!this.transportDynamicBotCreationEnabled()) {
+      await this.completeWithText(message, walId, binding, '飞书/Telegram 端 Bot 命令尚未启用。请通过 DSH Web 页面（127.0.0.1:3080）创建和管理 Bot。')
       return true
     }
     const actor = actorForTarget(message.target)

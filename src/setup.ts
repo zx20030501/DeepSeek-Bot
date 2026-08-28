@@ -36,6 +36,7 @@ export interface HermesBotSettings {
     features: {
       dynamicRegistry: boolean
       chatBotCreation: boolean
+      webChatBotCreation: boolean
       peerMessaging: boolean
       managerAgent: boolean
       savedWorkflows: boolean
@@ -109,6 +110,7 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
     features: z.object({
       dynamicRegistry: z.boolean().default(false),
       chatBotCreation: z.boolean().default(false),
+      webChatBotCreation: z.boolean().default(false),
       peerMessaging: z.boolean().default(false),
       managerAgent: z.boolean().default(false),
       savedWorkflows: z.boolean().default(false),
@@ -117,6 +119,7 @@ export const HermesBotSettingsSchema: z<HermesBotSettings> = z.object({
     }).default({
       dynamicRegistry: false,
       chatBotCreation: false,
+      webChatBotCreation: false,
       peerMessaging: false,
       managerAgent: false,
       savedWorkflows: false,
@@ -184,6 +187,7 @@ export function settingsFromGatewayConfig(config: BotGatewayConfig): HermesBotSe
         dynamicRegistry: config.collaboration?.features?.dynamicRegistry === true,
         chatBotCreation: config.collaboration?.features?.dynamicRegistry === true
           && config.collaboration?.features?.chatBotCreation === true,
+        webChatBotCreation: config.collaboration?.features?.webChatBotCreation === true,
         peerMessaging: config.collaboration?.features?.peerMessaging === true,
         managerAgent: config.collaboration?.features?.managerAgent === true,
         savedWorkflows: config.collaboration?.features?.savedWorkflows === true,
@@ -263,6 +267,7 @@ export function gatewayConfigFromSettings(
         ...base.collaboration?.features,
         dynamicRegistry: collaborationFeatures.dynamicRegistry,
         chatBotCreation: collaborationFeatures.dynamicRegistry && collaborationFeatures.chatBotCreation,
+        webChatBotCreation: collaborationFeatures.webChatBotCreation,
         peerMessaging: collaborationFeatures.peerMessaging,
         managerAgent: collaborationFeatures.managerAgent,
         savedWorkflows: collaborationFeatures.savedWorkflows,
