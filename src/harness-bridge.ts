@@ -136,9 +136,8 @@ export class HarnessBridge {
       const resumed = await this.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: options,
-        ...(setup === undefined ? {} : { setup }),
       })
-      if (setup !== undefined) this.internalToolsConfigured.add(resumed.agent as object)
+      await this.configureAgent(resumed.agent, setup)
       return resumed.agent
     } catch (resumeError: unknown) {
       try {
@@ -146,9 +145,8 @@ export class HarnessBridge {
           sessionId,
           agentOptions: options,
           meta: { agentPreset: profile.name, cwd: process.cwd() },
-          ...(setup === undefined ? {} : { setup }),
         })
-        if (setup !== undefined) this.internalToolsConfigured.add(created.agent as object)
+        await this.configureAgent(created.agent, setup)
         return created.agent
       } catch (createError: unknown) {
         throw new Error(`could not resume or create DSH session: ${String(createError)} (resume: ${String(resumeError)})`)

@@ -5471,6 +5471,9 @@ export class BotGateway {
           .filter(Boolean)
         const finalResult = ([...parts, ...controlParts].join('\n\n') || input.latestOutput || 'Workflow 没有产生文本结果。').slice(0, 50_000)
         await this.sendText(input.replyTarget, 'Workflow ' + input.definition.name + ' 完成：\n' + finalResult, 'workflow-result:' + input.workflowRunId)
+        // Flush before marking the root complete so tests and callers observe the
+        // outbound message once the Workflow Task is already terminal.
+        await this.outbox.flush()
         await this.tasks.completeTask(input.rootTaskId, finalResult, 'workflow-runtime')
         await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.completed', {
           workflowRunId: input.workflowRunId,
