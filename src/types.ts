@@ -623,6 +623,12 @@ export interface GroupRoomRecord {
   readonly maxTurns?: number
   readonly maxMessages: number
   readonly messages: readonly GroupRoomMessage[]
+  /**
+   * Number of room messages already projected into the middle-column
+   * `hermes-group-<roomId>` session. Monotonic; survives the sliding
+   * message window because it counts all-time appends, not list indexes.
+   */
+  readonly projectedCount?: number
   readonly closed: boolean
   readonly createdAt: number
   readonly updatedAt: number

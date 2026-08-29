@@ -66,7 +66,8 @@ export interface SetupRouteActions {
   dispatchWebDashboardTask?: (to: string, instruction: string) => Promise<{ taskId?: string; handle: string }>
   planWebDashboardTask?: (instruction: string) => Promise<{ workflowId: string; taskId: string; status: string }>
   dispatchWebDashboardTeamTask?: (teamId: string, instruction: string) => Promise<{ teamId: string; taskId?: string }>
-  dispatchWebDashboardRoomTask?: (botIds: readonly string[], instruction: string) => Promise<{ botIds: string[] }>
+  dispatchWebDashboardRoomTask?: (botIds: readonly string[], instruction: string) => Promise<{ botIds: string[]; roomId?: string }>
+  openWebDashboardRoom?: (roomId: string) => Promise<{ sessionId: string; title: string; participants: string[]; closed: boolean }>
   createWebDashboardRoutine?: (input: { name: string; cron: string; timezone?: string; to: string; instruction: string }) => Promise<{ id: string; name: string; cron: string; timezone: string; status: string; nextRunAt: number }>
   updateRoutine?: (routineId: string, patch: { enabled?: boolean }) => Promise<{ id: string; status: string }>
   deleteRoutine?: (routineId: string) => Promise<boolean>
@@ -346,6 +347,7 @@ async function handleRequest(
     && action !== 'workflow_launch'
     && action !== 'workflow_stop'
     && action !== 'workflow_delete'
+    && action !== 'open_web_dashboard_room'
   ) {
     throw new SetupRequestError(400, '不认识的设置操作。')
   }
@@ -568,13 +570,15 @@ async function handleRequest(
     if (actions.dispatchWebDashboardTeamTask === undefined) {
       throw new SetupRequestError(503, 'Web Team 派任务服务还没有准备好。')
     }
+    let result: { teamId: string; taskId?: string; roomId?: string }
     try {
-      await actions.dispatchWebDashboardTeamTask(teamId, instruction)
+      result = await actions.dispatchWebDashboardTeamTask(teamId, instruction)
     } catch (error: unknown) {
       throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
     }
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    replyJson(200, { ...snapshot, message: `已向 Team 发送任务。` })
+    const roomSessionId = result.roomId === undefined ? undefined : `hermes-group-${result.roomId}`
+    replyJson(200, { ...snapshot, message: `已向 Team 发送任务。`, roomSessionId })
     return
   }
   if (action === 'fleet_room_dispatch') {
@@ -588,13 +592,29 @@ async function handleRequest(
     if (actions.dispatchWebDashboardRoomTask === undefined) {
       throw new SetupRequestError(503, 'Web 群聊协作服务还没有准备好。')
     }
+    let result: { botIds: string[]; roomId?: string }
     try {
-      await actions.dispatchWebDashboardRoomTask(botIds, instruction)
+      result = await actions.dispatchWebDashboardRoomTask(botIds, instruction)
     } catch (error: unknown) {
       throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
     }
     const snapshot = await readSnapshot(ctx, source, diagnostics)
-    replyJson(200, { ...snapshot, message: '已继续群聊协作。' })
+    const roomSessionId = result.roomId === undefined ? undefined : `hermes-group-${result.roomId}`
+    replyJson(200, { ...snapshot, message: '已继续群聊协作。', roomSessionId })
+    return
+  }
+  if (action === 'open_web_dashboard_room') {
+    const roomId = typeof body.roomId === 'string' ? body.roomId.trim() : ''
+    if (roomId === '') throw new SetupRequestError(400, '缺少群房间 ID。')
+    if (actions.openWebDashboardRoom === undefined) throw new SetupRequestError(503, '群房间服务还没有准备好，请稍后再试。')
+    let room: { sessionId: string; title: string; participants: string[]; closed: boolean }
+    try {
+      room = await actions.openWebDashboardRoom(roomId)
+    } catch (error: unknown) {
+      throw new SetupRequestError(409, error instanceof Error ? error.message : String(error))
+    }
+    const snapshot = await readSnapshot(ctx, source, diagnostics)
+    replyJson(200, { ...snapshot, room, message: `群会话 ${room.sessionId} 已就绪。` })
     return
   }
   if (action === 'routine_create') {

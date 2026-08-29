@@ -3330,7 +3330,7 @@ export class BotGateway {
   }
 
   /** Trusted local-dashboard Team task (no owner-session @mention injection). */
-  public async dispatchWebDashboardTeamTask(teamId: string, instruction: string): Promise<{ teamId: string; taskId?: string }> {
+  public async dispatchWebDashboardTeamTask(teamId: string, instruction: string): Promise<{ teamId: string; taskId?: string; roomId?: string }> {
     const reference = teamId.trim().replace(/^@/u, '')
     const text = instruction.trim()
     if (reference === '' || text === '') throw new Error('Team 和任务内容不能为空。')
@@ -3342,18 +3342,19 @@ export class BotGateway {
       text,
       receivedAt: Date.now(),
     }
+    let createdRoomId: string | undefined
     await this.withDurableMutation(async () => {
       const accepted = await this.wal.accept(message)
       if (!accepted.inserted || accepted.item.state !== 'accepted') {
         throw new Error('无法发送 Team 任务（重复请求）。')
       }
-      await this.handleTeamMention(message, accepted.item.id, binding, reference, text)
+      createdRoomId = await this.handleTeamMention(message, accepted.item.id, binding, reference, text)
     })
-    return { teamId: reference }
+    return { teamId: reference, ...(createdRoomId === undefined ? {} : { roomId: createdRoomId }) }
   }
 
   /** Trusted local-dashboard Group Room continuation (no owner-session @mention injection). */
-  public async dispatchWebDashboardRoomTask(botIds: readonly string[], instruction: string): Promise<{ botIds: string[] }> {
+  public async dispatchWebDashboardRoomTask(botIds: readonly string[], instruction: string): Promise<{ botIds: string[]; roomId?: string }> {
     const ids = [...new Set(botIds.map(value => value.trim().replace(/^@/u, '').toLowerCase()).filter(Boolean))]
     const text = instruction.trim()
     if (ids.length === 0 || text === '') throw new Error('Bot 和任务内容不能为空。')
@@ -3365,14 +3366,66 @@ export class BotGateway {
       text,
       receivedAt: Date.now(),
     }
+    let createdRoomId: string | undefined
     await this.withDurableMutation(async () => {
       const accepted = await this.wal.accept(message)
       if (!accepted.inserted || accepted.item.state !== 'accepted') {
         throw new Error('无法继续群聊协作（重复请求）。')
       }
-      await this.handleCollaborationRequest(message, accepted.item.id, binding, ids, text)
+      createdRoomId = await this.handleCollaborationRequest(message, accepted.item.id, binding, ids, text)
     })
-    return { botIds: ids }
+    return { botIds: ids, ...(createdRoomId === undefined ? {} : { roomId: createdRoomId }) }
+  }
+
+  /** Trusted local-dashboard Group Room open: resolves the middle-column projection target. */
+  public async openWebDashboardRoom(roomId: string): Promise<{ sessionId: string; title: string; participants: string[]; closed: boolean }> {
+    const reference = roomId.trim()
+    if (reference === '') throw new Error('缺少群房间 ID。')
+    const room = await this.rooms.get(reference)
+    if (room === undefined) throw new Error('群房间不存在或已被清理。')
+    await this.projectRoomToSession(reference)
+    return {
+      sessionId: `hermes-group-${reference}`,
+      title: groupRoomTitle(room.participants),
+      participants: [...room.participants],
+      closed: room.closed,
+    }
+  }
+
+  /**
+   * Mirror unconsumed Group Room transcript lines into the middle-column
+   * `hermes-group-<roomId>` session. Append-only (never starts a turn) and
+   * idempotent via the monotonic `projectedCount` watermark, so the client
+   * can call it after creating the session to backfill history, and bot turn
+   * completions call it again to append only new lines.
+   */
+  private async projectRoomToSession(roomId: string): Promise<void> {
+    const room = await this.rooms.get(roomId)
+    if (room === undefined) return
+    // No session to deliver into yet; leave the watermark untouched so the
+    // next call (after the client creates hermes-group-<roomId>) projects it.
+    if (this.bridge === undefined) return
+    const projected = room.projectedCount ?? 0
+    if (room.messageCount <= projected) return
+    // `room.messages` is a fixed-window sliding buffer (maxMessages), so its
+    // array index does NOT equal the global message index. Map the watermark
+    // onto array space using the window's leading total-count offset.
+    const windowStart = room.messageCount - room.messages.length
+    const from = Math.max(projected, windowStart)
+    const messages = room.messages.slice(from - windowStart)
+    if (messages.length === 0) {
+      // Window has slid past the watermark; advance it so we never re-deliver.
+      if (projected < windowStart) await this.rooms.markProjected(roomId, windowStart)
+      return
+    }
+    const sessionId = `hermes-group-${roomId}`
+    let delivered = 0
+    for (const message of messages) {
+      const actor = message.from.startsWith('user:') ? 'user' : message.from
+      if (this.bridge.deliverGroupSessionMessage(sessionId as SessionId, `@${actor}：\n${message.text}`) === true) delivered += 1
+    }
+    const newWatermark = from + delivered
+    if (newWatermark > projected) await this.rooms.markProjected(roomId, newWatermark)
   }
 
   /** Trusted local-dashboard Cron: recurring Bot task, no slash commands. */
@@ -3811,6 +3864,7 @@ export class BotGateway {
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, actor)
         await this.rooms.append(room.id, source.createdBy, source.instruction)
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('could not reserve replay Group Room turn')
         botId = first.botId
@@ -4468,11 +4522,12 @@ export class BotGateway {
     binding: ChatBinding,
     teamReference: string,
     instruction: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const claimed = await this.wal.claim(walId, binding.sessionId)
-    if (!claimed) return
+    if (!claimed) return undefined
     const requester = actorForTarget(message.target)
     let createdTaskId: string | undefined
+    let createdRoomId: string | undefined
     let threadId: string | undefined
     try {
       const route = await this.teamRouter.resolve({
@@ -4498,7 +4553,7 @@ export class BotGateway {
           taskId: workflow.taskId,
           memberBotIds: route.participantBotIds,
         }, thread.contextId)
-        return
+        return undefined
       }
 
       const task = await this.tasks.createTask({
@@ -4518,9 +4573,11 @@ export class BotGateway {
       if (route.participantBotIds.length > 1) {
         const room = await this.rooms.open(message.target, task.id, route.participantBotIds)
         roomId = room.id
+        createdRoomId = room.id
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, requester)
         await this.rooms.append(room.id, requester, instruction || '请根据当前 Team 上下文协作处理。')
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('无法为 Team Room 保留第一轮')
         assignedBot = first.botId
@@ -4582,6 +4639,7 @@ export class BotGateway {
       )
       await this.wal.complete(walId)
       void this.drainCollaboration().catch(error => this.log('warn', 'Team Router dispatch failed: ' + String(error)))
+      return createdRoomId
     } catch (error: unknown) {
       if (threadId !== undefined) await this.setTeamThreadStatus(threadId, 'cancelled')
       if (createdTaskId !== undefined) {
@@ -4599,6 +4657,7 @@ export class BotGateway {
         'team-error:' + message.id,
       )
     }
+    return undefined
   }
 
   private async setTeamThreadStatus(threadId: string, status: 'completed' | 'cancelled'): Promise<void> {
@@ -4664,23 +4723,24 @@ export class BotGateway {
     binding: ChatBinding,
     botIds: readonly string[],
     instruction: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
+    let createdRoomId: string | undefined
     const validBots = botIds.filter(botId => this.directory.get(botId)?.enabled && this.directory.canInvoke(botId, message.target))
-    if (!validBots.length) return
+    if (!validBots.length) return undefined
     try {
       const claimed = await this.wal.claim(walId, binding.sessionId)
-      if (!claimed) return
+      if (!claimed) return undefined
       const from = `user:${message.target.platform}:${message.target.userId ?? message.target.chatId}`
       const denied = botIds.filter(botId => !validBots.includes(botId))
       if (denied.length > 0) {
         await this.sendText(message.target, `以下 Bot 没有对你或当前聊天授权：${denied.map(botId => '@' + botId).join('、')}`, `mesh-denied:${message.id}`)
         await this.wal.complete(walId)
-        return
+        return undefined
       }
       if (this.requiresFleetApproval(validBots, false)) {
         const plan = this.planForExplicitBots(validBots)
         await this.createFleetWorkflow(message, walId, from, instruction, plan, true)
-        return
+        return undefined
       }
       const task = await this.tasks.createTask({
         title: instruction,
@@ -4696,9 +4756,11 @@ export class BotGateway {
       if (validBots.length > 1) {
         const room = await this.rooms.open(message.target, task.id, validBots)
         roomId = room.id
+        createdRoomId = room.id
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, from)
         await this.rooms.append(room.id, from, instruction)
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('could not reserve the first Group Room turn')
         assignedBot = first.botId
@@ -4745,6 +4807,7 @@ export class BotGateway {
       )
       await this.wal.complete(walId)
       void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration dispatch failed: ${String(error)}`))
+      return createdRoomId
     } catch (error: unknown) {
       await this.handleInboundFailure(
         message,
@@ -4755,6 +4818,7 @@ export class BotGateway {
         `mesh-error:${message.id}`,
       )
     }
+    return undefined
   }
 
   private requiresFleetApproval(botIds: readonly string[], autoPlanned: boolean): boolean {
@@ -5270,6 +5334,9 @@ export class BotGateway {
     )
     const activeRuns = new Set(this.internalRunBySession.keys())
     for (const [sessionId, lastActiveAt] of [...this.sessionActivity.entries()]) {
+      // Group Room sessions are long-lived middle-column projections, not
+      // worker runtimes; idle reaping must never kill them.
+      if (String(sessionId).startsWith('hermes-group-')) continue
       if (lastActiveAt > cutoff || busySessionIds.has(sessionId) || activeRuns.has(sessionId)) continue
       if (this.reapedSessions.has(sessionId)) continue
       const agent = this.bridge?.getAgent(sessionId as SessionId)
@@ -6049,6 +6116,7 @@ export class BotGateway {
     const handoffId = typeof internal.envelope.payload.handoffId === 'string' ? internal.envelope.payload.handoffId : undefined
     if (roomId) {
       await this.rooms.append(roomId, internal.botId, result)
+      await this.projectRoomToSession(roomId)
       const next = await this.rooms.reserveNext(roomId)
       const currentRun = await this.tasks.run(runId)
       if (next && currentRun) {

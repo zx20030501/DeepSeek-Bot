@@ -1996,6 +1996,65 @@ class FleetWebController {
     }
   }
 
+  public openRoom(roomId: string): void {
+    void this.openRoomSession(roomId)
+  }
+
+  private async openRoomSession(roomId: string): Promise<void> {
+    const cleaned = roomId.trim()
+    if (cleaned === '') {
+      this.publish({ error: '缺少群房间 ID。' })
+      return
+    }
+    try {
+      // Validate the room + trigger backfill (no-op until the session exists).
+      await this.callOpenRoom(cleaned)
+      const resolved = `hermes-group-${cleaned}`
+      const list = this.ctx.sessions.list.getSnapshot()
+      let opened = resolved
+      if (list.byId[resolved] === undefined) {
+        const sessions = this.ctx.sessions as SessionsWithCreate
+        if (typeof sessions.create !== 'function') {
+          this.publish({ error: '无法创建群聊会话。' })
+          return
+        }
+        const currentId = this.ownerSessionId() ?? list.current
+        const createOpts = ownerSessionCreateContext(this.ctx, currentId)
+        try {
+          const created = await sessions.create({ sessionId: resolved, ...createOpts })
+          if (typeof created === 'string' && created !== '') opened = created
+        } catch (error) {
+          const listed = this.ctx.sessions.list.getSnapshot().byId[resolved]
+          if (listed === undefined) throw error
+        }
+        await waitUntilSessionListed(this.ctx, opened)
+        await attachSessionToOwnerWorkspace(this.ctx, opened, currentId)
+      } else {
+        await attachSessionToOwnerWorkspace(this.ctx, opened, this.ownerSessionId() ?? list.current)
+      }
+      this.ctx.sessions.open(opened as never)
+      await waitUntilSessionListed(this.ctx, opened, 800)
+      if (this.ctx.sessions.list.getSnapshot().current !== opened) {
+        this.ctx.sessions.open(opened as never)
+      }
+      // Now that the session exists, backfill the Group Room transcript.
+      await this.callOpenRoom(cleaned)
+      this.publish({ error: undefined, message: `已打开群聊会话 ${opened}。直接在中间栏查看时间线。` })
+    } catch (error) {
+      this.publish({ error: `打开群聊失败：${String(error)}` })
+    }
+  }
+
+  private async callOpenRoom(roomId: string): Promise<void> {
+    const response = await fetch(HERMES_BOT_SETUP_ROUTE, {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'open_web_dashboard_room', roomId }),
+    })
+    const body = await readRouteBody(response)
+    if (!response.ok) throw new Error(errorFromBody(body, response.status))
+  }
+
   public openOwnerSession(): void {
     const sessionId = this.ownerSessionId()
     if (sessionId !== undefined) this.ctx.sessions.open(sessionId as never)
@@ -2056,6 +2115,8 @@ class FleetWebController {
       if (!response.ok) throw new Error(errorFromBody(body, response.status))
       const data = setupResponseFromBody(body)
       this.publish({ diagnostics: data.diagnostics, message: data.message ?? '已向 Team 发送任务。' })
+      const roomSessionId = typeof body.roomSessionId === 'string' && body.roomSessionId !== '' ? body.roomSessionId : undefined
+      if (roomSessionId !== undefined) void this.openRoom(roomSessionId.replace(/^hermes-group-/u, ''))
     } catch (error) {
       this.publish({ error: `Team 发任务失败：${String(error)}` })
     } finally {
@@ -2080,6 +2141,8 @@ class FleetWebController {
       if (!response.ok) throw new Error(errorFromBody(body, response.status))
       const data = setupResponseFromBody(body)
       this.publish({ diagnostics: data.diagnostics, message: data.message ?? '已继续群聊协作。' })
+      const roomSessionId = typeof body.roomSessionId === 'string' && body.roomSessionId !== '' ? body.roomSessionId : undefined
+      if (roomSessionId !== undefined) void this.openRoom(roomSessionId.replace(/^hermes-group-/u, ''))
     } catch (error) {
       this.publish({ error: `群聊协作失败：${String(error)}` })
     } finally {
@@ -2822,6 +2885,7 @@ function FleetSidebarRail({ controller, ctx }: { controller: FleetWebController;
                     <div
                       className="dsh-hermes-fleet-group-row"
                       key={room.id}
+                      onClick={() => { void controller.openRoom(room.id ?? '') }}
                       onContextMenu={event => {
                         event.preventDefault()
                         setMenu({ kind: 'room', id: room.id ?? '', participants: room.participants ?? [], ...menuPoint(event, false) })
@@ -2830,7 +2894,7 @@ function FleetSidebarRail({ controller, ctx }: { controller: FleetWebController;
                       <strong>{room.title ?? (`群聊 · ${(room.participants ?? []).map(id => '@' + id).join('、')}`)}</strong>
                       <span className="dsh-hermes-muted">{(room.participants ?? []).map(id => '@' + id).join('、')} · {String(room.messageCount ?? 0)} 条</span>
                       <div className="dsh-hermes-action-row">
-                        <button type="button" className="dsh-hermes-secondary" onClick={() => { setComposer({ kind: 'room', bots: room.participants ?? [], title: '继续群聊协作' }) }}>继续协作</button>
+                        <button type="button" className="dsh-hermes-secondary" onClick={event => { event.stopPropagation(); setComposer({ kind: 'room', bots: room.participants ?? [], title: '继续群聊协作' }) }}>继续协作</button>
                         <button type="button" className="dsh-hermes-fleet-more" aria-label="更多操作" onClick={event => {
                           event.stopPropagation()
                           setMenu({ kind: 'room', id: room.id ?? '', participants: room.participants ?? [], ...menuPoint(event, true) })

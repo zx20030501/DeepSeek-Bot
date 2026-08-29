@@ -146,6 +146,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
     planWebDashboardTask: instruction => gateway.planWebDashboardTask(instruction),
     dispatchWebDashboardTeamTask: (teamId, instruction) => gateway.dispatchWebDashboardTeamTask(teamId, instruction),
     dispatchWebDashboardRoomTask: (botIds, instruction) => gateway.dispatchWebDashboardRoomTask(botIds, instruction),
+    openWebDashboardRoom: roomId => gateway.openWebDashboardRoom(roomId),
     createWebDashboardRoutine: input => gateway.createWebDashboardRoutine(input),
     updateRoutine: (routineId, patch) => gateway.updateRoutine(routineId, patch),
     deleteRoutine: routineId => gateway.deleteRoutine(routineId),

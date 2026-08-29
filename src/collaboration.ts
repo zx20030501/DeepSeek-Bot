@@ -1690,6 +1690,7 @@ export class GroupRoomStore {
       botTurnCount: 0,
       roundCount: 0,
       messageCount: 0,
+      projectedCount: 0,
       maxRounds: this.maxRounds,
       maxMessages: this.maxMessages,
       messages: [],
@@ -1744,6 +1745,26 @@ export class GroupRoomStore {
     const current = await this.get(roomId)
     if (!current) return undefined
     const next: GroupRoomRecord = { ...current, closed: true, updatedAt: now() }
+    await this.state.update(state => {
+      state.rooms[roomId] = next
+      return state
+    })
+    return this.clone(next)
+  }
+
+  /**
+   * Record how many all-time room messages have been mirrored into the
+   * middle-column group session. Idempotent and monotonic: callers pass the
+   * room's `messageCount` they have fully projected up to.
+   */
+  public async markProjected(roomId: string, projectedCount: number): Promise<GroupRoomRecord | undefined> {
+    const current = await this.get(roomId)
+    if (!current) return undefined
+    const next: GroupRoomRecord = {
+      ...current,
+      projectedCount: Math.max(current.projectedCount ?? 0, projectedCount),
+      updatedAt: now(),
+    }
     await this.state.update(state => {
       state.rooms[roomId] = next
       return state

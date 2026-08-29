@@ -210,6 +210,17 @@ export class HarnessBridge {
     return false
   }
 
+  /**
+   * Mirror one Group Room transcript line into the middle-column group
+   * session projection (`hermes-group-<roomId>`). Same append-only, no-turn
+   * contract as {@link deliverLocalWebNotice}; attribution rides the visible
+   * `@actor：` prefix. No-op until the client has created the session.
+   */
+  public deliverGroupSessionMessage(sessionId: SessionId, text: string): boolean {
+    if (!String(sessionId).startsWith('hermes-group-')) return false
+    return this.deliverLocalWebNotice(sessionId, text)
+  }
+
   public async followup(agent: Agent, text: string): Promise<void> {
     const message = createUserMessage({
       content: [{ type: 'text', text }],
