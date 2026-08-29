@@ -2210,6 +2210,9 @@ test('unbound local DSH web session can create+confirm bot into roster via API w
     const botEntry = gateway.directory.get('local-research-bot')
     assert.ok(botEntry, 'Bot should be in the roster after confirmation')
     assert.equal(botEntry.enabled, true)
+    const dispatched = await gateway.dispatchWebDashboardTask('local-research-bot', 'summarize the latest notes')
+    assert.equal(dispatched.handle, 'local-research-bot')
+    assert.ok(dispatched.taskId)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })
@@ -2593,6 +2596,7 @@ test('registered unbound DSH web owner session starts Group Room from roster @me
     const snapshot = await gateway.fleetStatus()
     assert.equal(snapshot.fleet.rooms.length, 1)
     assert.deepEqual([...snapshot.fleet.rooms[0].participants].sort(), ['rosterbota', 'rosterbotb'])
+    assert.match(String(snapshot.fleet.rooms[0].title), /@rosterbota/u)
     assert.equal(snapshot.fleet.tasks.length, 1)
     assert.equal(registeredTools.has('bot_create_draft'), false)
     assert.equal(agent.followupCalls.length, 0, 'owner conversation must not be stolen by followup')
@@ -2631,12 +2635,57 @@ test('registered unbound DSH web owner session /fleet hits planner without dynam
     await gateway.start()
     await gateway.registerLocalWebOwnerSession(sessionId)
     emitOwnerWebUserMessage(gateway, sessionId, '/fleet research this issue')
-    assert.equal(await waitUntil(async () => (await gateway.fleetStatus()).fleet.workflows.length === 1), true)
+    assert.equal(await waitUntil(async () => {
+      const status = await gateway.fleetStatus()
+      return status.fleet.workflows.length === 1
+        && status.fleet.workflows[0]?.status === 'pending-approval'
+        && status.fleet.approvals.some(item => item.status === 'pending' && item.kind === 'workflow')
+    }, 8_000), true)
     const snapshot = await gateway.fleetStatus()
-    assert.equal(snapshot.fleet.workflows[0].status, 'pending-approval')
     assert.ok(snapshot.fleet.workflows[0].workerBotIds.length >= 1)
+    assert.equal(await waitUntil(() => ownerWebNoticeTexts(agent).some(text => /Fleet 已生成执行计划/u.test(text)), 8_000), true)
+    assert.equal(agent.followupCalls.length, 0)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('local DSH web dashboard plans a Fleet workflow without /fleet command injection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-fleet-plan-api-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-owner-fleet-api'
+    const agents = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('planner path should not create worker agents before approval') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false }, feishu: { enabled: false },
+      profiles: {
+        rosterbota: { fleetRole: 'worker', capabilities: ['research'] },
+        rosterbotb: { fleetRole: 'synthesizer', capabilities: ['summary'] },
+      },
+      collaboration: {
+        enabled: true,
+        autoPlanner: true,
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: false },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    const planned = await gateway.planWebDashboardTask('research this issue')
+    assert.equal(planned.status, 'pending-approval')
+    assert.ok(planned.workflowId)
+    assert.ok(planned.taskId)
+    const snapshot = await gateway.fleetStatus()
+    assert.equal(snapshot.fleet.workflows.length, 1)
+    assert.equal(snapshot.fleet.workflows[0].status, 'pending-approval')
     assert.equal(snapshot.fleet.approvals.some(item => item.status === 'pending' && item.kind === 'workflow'), true)
-    assert.equal(await waitUntil(() => ownerWebNoticeTexts(agent).some(text => /Fleet 已生成执行计划/u.test(text))), true)
     assert.equal(agent.followupCalls.length, 0)
   } finally {
     if (gateway) await gateway.stop()
@@ -2811,6 +2860,151 @@ test('Feishu inbound @mentions still open a Group Room after DSH web Fleet wirin
     const snapshot = await gateway.fleetStatus()
     assert.equal(snapshot.fleet.rooms.length, 1)
     assert.deepEqual([...snapshot.fleet.rooms[0].participants].sort(), ['rosterbota', 'rosterbotb'])
+    assert.match(String(snapshot.fleet.rooms[0].title), /群聊/u)
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('local DSH Web can activate a draft Bot by status without a live confirmation code', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-activate-'))
+  const ownerTarget = { platform: 'feishu', chatId: 'oc_owner', chatType: 'dm', userId: 'ou_owner' }
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, webChatBotCreation: true, chatBotCreation: true } },
+    })
+    await gateway.start()
+    const draft = await gateway.createWebDashboardBotDraft({
+      handle: 'webact1',
+      title: 'Web Activate',
+      role: 'worker',
+    })
+    assert.equal(draft.status, 'draft')
+    await assert.rejects(
+      gateway.setDynamicBotStatus(draft.botId, 'active', 'user:feishu:ou_owner'),
+      /8 位确认码/u,
+    )
+    const activated = await gateway.setDynamicBotStatus(draft.botId, 'active')
+    assert.equal(activated?.definition.status, 'active')
+    const feishuDraft = await gateway.createDynamicBotDraft({
+      handle: 'feishydraft',
+      title: 'Feishu Draft',
+      role: 'worker',
+    }, ownerTarget)
+    await assert.rejects(
+      gateway.setDynamicBotStatus(feishuDraft.botId, 'active', 'user:feishu:ou_owner'),
+      /8 位确认码/u,
+    )
+    const approved = await gateway.resolveApproval(feishuDraft.confirmationCode, 'approved', 'user:feishu:ou_owner')
+    assert.equal(approved?.status, 'approved')
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('local DSH Web can edit an active Bot archive without slash commands', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-edit-'))
+  let gateway
+  try {
+    gateway = new BotGateway({}, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      collaboration: { features: { dynamicRegistry: true, webChatBotCreation: true, chatBotCreation: true } },
+    })
+    await gateway.start()
+    const draft = await gateway.createWebDashboardBotDraft({
+      handle: 'webedit1',
+      title: 'Before Edit',
+      description: 'old desc',
+      soul: 'old soul',
+      role: 'worker',
+    })
+    const activated = await gateway.setDynamicBotStatus(draft.botId, 'active')
+    assert.equal(activated?.definition.status, 'active')
+    const updated = await gateway.updateWebDashboardBot({
+      handle: 'webedit1',
+      title: 'After Edit',
+      description: 'new desc',
+      capabilities: ['research'],
+      soul: 'new soul',
+      role: 'verifier',
+    })
+    assert.equal(updated.status, 'active')
+    assert.equal(updated.handle, 'webedit1')
+    assert.equal(updated.version > (activated?.definition.version ?? 0), true)
+    const snapshot = await gateway.fleetStatus()
+    const row = snapshot.fleet.registryBots.find(item => item.handle === 'webedit1')
+    assert.equal(row?.title, 'After Edit')
+    assert.equal(row?.description, 'new desc')
+    assert.equal(row?.soul, 'new soul')
+    assert.equal(row?.fleetRole, 'verifier')
+    assert.deepEqual(row?.capabilities, ['research'])
+    const stillDraft = await gateway.createWebDashboardBotDraft({
+      handle: 'webeditdraft',
+      title: 'Draft Title',
+      role: 'generalist',
+    })
+    const revisedDraft = await gateway.updateWebDashboardBot({ handle: 'webeditdraft', title: 'Draft v2' })
+    assert.equal(revisedDraft.status, 'draft')
+    assert.equal(revisedDraft.botId, stillDraft.botId)
+    const draftRow = (await gateway.fleetStatus()).fleet.registryBots.find(item => item.handle === 'webeditdraft')
+    assert.equal(draftRow?.title, 'Draft v2')
+    await assert.rejects(
+      gateway.updateWebDashboardBot({ handle: 'missing-bot', title: 'Nope' }),
+      /找不到当前用户的动态 Bot/u,
+    )
+  } finally {
+    if (gateway) await gateway.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('local DSH Web reuses same-named Teams, can delete them, and returns Team dispatch after the Room exists', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek-bot-web-team-reuse-'))
+  let gateway
+  try {
+    const sessionId = 'dsh-web-owner-team-reuse'
+    const agents = new Map()
+    const agent = ownerWebAgent(sessionId)
+    agents.set(sessionId, agent)
+    gateway = new BotGateway({ get: name => name === 'agents' ? {
+      get(id) { return agents.get(String(id)) },
+      async resume() { throw new Error('not found') },
+      async create() { throw new Error('team dispatch should reuse existing workers') },
+    } : undefined }, {
+      stateDir: root,
+      telegram: { enabled: false },
+      feishu: { enabled: false },
+      profiles: {
+        rosterbota: { capabilities: ['research'] },
+        rosterbotb: { capabilities: ['writing'] },
+      },
+      collaboration: {
+        enabled: true,
+        approvalMode: 'never',
+        features: { dynamicRegistry: false, chatBotCreation: false, webChatBotCreation: true },
+      },
+    })
+    await gateway.start()
+    await gateway.registerLocalWebOwnerSession(sessionId)
+    const first = await gateway.createWebDashboardTeam('alpha', ['rosterbota', 'rosterbotb'])
+    const second = await gateway.createWebDashboardTeam('alpha', ['rosterbotb', 'rosterbota'])
+    assert.equal(second.id, first.id)
+    const dispatched = await gateway.dispatchWebDashboardTeamTask(first.id, 'draft the brief')
+    assert.equal(dispatched.teamId, first.id)
+    const afterDispatch = await gateway.fleetStatus()
+    assert.equal(afterDispatch.fleet.rooms.length, 1)
+    assert.match(String(afterDispatch.fleet.rooms[0].title), /@rosterbota/u)
+    await gateway.deleteWebDashboardTeam(first.id)
+    const afterDelete = await gateway.fleetStatus()
+    assert.equal(afterDelete.fleet.teams.some(team => team.id === first.id), false)
   } finally {
     if (gateway) await gateway.stop()
     await rm(root, { recursive: true, force: true })

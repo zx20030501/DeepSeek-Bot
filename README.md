@@ -68,6 +68,20 @@ dsh web
 
 如果只使用后端环境变量，可以只运行 `npm run build`；Web 设置页依赖 DSH Web 的 client peer 组件。
 
+## DSH Web Fleet UI（Hermes 右栏）
+
+在本机 `dsh web`（`http://127.0.0.1:3080`）可使用 **右栏 BOTS 通讯录**（搜索、pin、+ New Agent、群组与 CRON Tab），无需飞书凭据。该 UI 在分支 `cursor/hermes-fleet-sidebar-cf56`（[PR #38](https://github.com/zx20030501/DeepSeek-Bot/pull/38)），**尚未合并 main**。
+
+**接手与手测**（必读）：
+
+- [docs/HANDOFF-DSH-WEB-FLEET-UI.md](docs/HANDOFF-DSH-WEB-FLEET-UI.md) — 跨机器交接（另一台机器请先读这篇）
+- [docs/DSH_WEB_LOCAL_VERIFICATION.md](docs/DSH_WEB_LOCAL_VERIFICATION.md) — 本地 3080 手测清单
+- [docs/DSH_WEB_FLEET_UI.md](docs/DSH_WEB_FLEET_UI.md) — 右栏 UI 技术说明
+- [docs/DSH_WEB_SETUP_API.md](docs/DSH_WEB_SETUP_API.md) — Web setup API 参考
+- [docs/README.md](docs/README.md) — 全文档索引
+
+快速路径：读 [交接文档](docs/HANDOFF-DSH-WEB-FLEET-UI.md) → `git checkout cursor/hermes-fleet-sidebar-cf56` → `npm run build:all` → `dsh plugin --profile web add . --ignore-scripts` → 打开 3080 → 右栏 **一键启用** → **+ New Agent** → **确认激活**。
+
 ## 配置
 
 新配置前缀是 `DEEPSEEK_BOT_`，旧的 `DSH_HERMES_BOT_` 变量仍兼容：

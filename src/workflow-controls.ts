@@ -201,3 +201,48 @@ export function compensationNodeIds(
 export function workflowBindingNames(bindings: readonly WorkflowInputBinding[] | undefined): readonly string[] {
   return [...new Set((bindings ?? []).map(binding => binding.name))]
 }
+
+const COMPILED_APPROVAL_PREFIX = 'compiled-workflow:'
+
+/**
+ * Durable approval identity for a compiled Workflow approval node. Encoded in
+ * the approval record's entityId so resolution can find the control Task
+ * without a schema change.
+ */
+export function workflowApprovalEntityId(workflowRunId: string, nodeId: string): string {
+  return COMPILED_APPROVAL_PREFIX + workflowRunId + '|' + nodeId
+}
+
+export function parseWorkflowApprovalEntityId(
+  entityId: string,
+): { readonly workflowRunId: string; readonly nodeId: string } | undefined {
+  if (!entityId.startsWith(COMPILED_APPROVAL_PREFIX)) return undefined
+  const body = entityId.slice(COMPILED_APPROVAL_PREFIX.length)
+  const separator = body.indexOf('|')
+  if (separator <= 0 || separator === body.length - 1) return undefined
+  return { workflowRunId: body.slice(0, separator), nodeId: body.slice(separator + 1) }
+}
+
+export interface WorkflowRetryState {
+  readonly attempts: number
+  readonly nextAttemptAt: number
+  readonly previousError?: string
+}
+
+/**
+ * Read the durable retry counter stored on a Workflow node Task's inputs.
+ * Unknown input shapes fall back to a fresh attempt.
+ */
+export function readWorkflowRetryState(inputs: Readonly<Record<string, unknown>> | undefined): WorkflowRetryState {
+  const raw = isRecord(inputs) && isRecord(inputs.__dshWorkflowRetry) ? inputs.__dshWorkflowRetry : {}
+  return {
+    attempts: typeof raw.attempts === 'number' && Number.isFinite(raw.attempts) ? Math.max(0, Math.floor(raw.attempts)) : 0,
+    nextAttemptAt: typeof raw.nextAttemptAt === 'number' && Number.isFinite(raw.nextAttemptAt) ? raw.nextAttemptAt : 0,
+    ...(typeof raw.previousError === 'string' && raw.previousError !== '' ? { previousError: raw.previousError.slice(0, 500) } : {}),
+  }
+}
+
+/** True while a node is waiting out its retry backoff. */
+export function isWorkflowRetryPending(state: WorkflowRetryState, at = Date.now()): boolean {
+  return state.attempts > 0 && state.nextAttemptAt > at
+}

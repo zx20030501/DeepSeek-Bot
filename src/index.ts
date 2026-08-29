@@ -137,6 +137,23 @@ export function apply(ctx: Context, config: unknown = {}): void {
     setDynamicBotStatus: (botId, status) => gateway.setDynamicBotStatus(botId, status),
     validateStaticProfiles: handles => gateway.validateStaticProfileHandles(handles),
     registerLocalWebOwnerSession: sessionId => gateway.registerLocalWebOwnerSession(sessionId),
+    createWebDashboardBotDraft: input => gateway.createWebDashboardBotDraft(input),
+    updateWebDashboardBot: input => gateway.updateWebDashboardBot(input),
+    createWebDashboardTeam: (name, memberBotIds) => gateway.createWebDashboardTeam(name, memberBotIds),
+    deleteWebDashboardTeam: teamId => gateway.deleteWebDashboardTeam(teamId),
+    dispatchOwnerWebCommand: (sessionId, text) => gateway.dispatchOwnerWebCommand(sessionId, text),
+    dispatchWebDashboardTask: (to, instruction) => gateway.dispatchWebDashboardTask(to, instruction),
+    planWebDashboardTask: instruction => gateway.planWebDashboardTask(instruction),
+    dispatchWebDashboardTeamTask: (teamId, instruction) => gateway.dispatchWebDashboardTeamTask(teamId, instruction),
+    dispatchWebDashboardRoomTask: (botIds, instruction) => gateway.dispatchWebDashboardRoomTask(botIds, instruction),
+    openWebDashboardRoom: roomId => gateway.openWebDashboardRoom(roomId),
+    createWebDashboardRoutine: input => gateway.createWebDashboardRoutine(input),
+    updateRoutine: (routineId, patch) => gateway.updateRoutine(routineId, patch),
+    deleteRoutine: routineId => gateway.deleteRoutine(routineId),
+    listWorkflows: () => gateway.listWorkflowDefinitions('local-dashboard'),
+    launchWorkflow: (workflowId, target) => gateway.launchWorkflowDefinition(workflowId, 'local-dashboard', target, 'local-dashboard'),
+    stopWorkflow: workflowId => gateway.cancelWorkflowRuns(workflowId, 'local-dashboard'),
+    deleteWorkflow: workflowId => gateway.deleteWorkflowDefinition(workflowId, 'local-dashboard'),
     saveAndApplySettings,
   })
   ctx.inject(['credentials'], (credentialsCtx) => {
@@ -178,6 +195,36 @@ export {
   parseBotMentions,
 } from './collaboration.js'
 export { PairingStore } from './pairing.js'
+export { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
+export type {
+  BotAskInput,
+  BotAskRecord,
+  BotAskReply,
+  BotAskRegisterInput,
+  BotAskReplyInput,
+  BotAskResult,
+  BotAskStatus,
+  BotAskWaitOptions,
+} from './bot-ask.js'
+export { ManagerActionLog, ManagerPauseRegistry } from './manager-control.js'
+export type {
+  ManagerActionInput,
+  ManagerActionKind,
+  ManagerActionQuery,
+  ManagerActionRecord,
+  ManagerBotObservation,
+  ManagerObservation,
+  ManagerObserveOptions,
+  ManagerPauseActionResult,
+  ManagerPauseInput,
+  ManagerPauseRecord,
+  ManagerReplanInput,
+  ManagerReplanObservationInput,
+  ManagerReplanResult,
+  ManagerStopResult,
+  ManagerWaitOptions,
+  ManagerWaitResult,
+} from './manager-control.js'
 export {
   REMOTE_TRANSPORT_SCHEMA_VERSION,
   HttpRemoteBotTransport,

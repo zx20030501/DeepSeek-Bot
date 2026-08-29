@@ -201,6 +201,12 @@ export interface BotCollaborationConfig {
   readonly mailboxRetryMaxMs?: number
   readonly botRunMaxAttempts?: number
   readonly maxParallelRuns?: number
+  /** Per-requester cap on concurrently active Bot runs; 0 (default) is unlimited. */
+  readonly perUserMaxRuns?: number
+  /** Idle direct-chat Agent sessions are stopped after this many ms; 0 (default) disables reaping. */
+  readonly sessionIdleTimeoutMs?: number
+  /** How often the idle-session reaper runs. */
+  readonly sessionIdleCheckMs?: number
   readonly defaultSessionScope?: BotSessionScope
   readonly approvalMode?: 'never' | 'auto-planned' | 'multi-bot' | 'always'
   readonly approvalTtlMs?: number
@@ -617,6 +623,12 @@ export interface GroupRoomRecord {
   readonly maxTurns?: number
   readonly maxMessages: number
   readonly messages: readonly GroupRoomMessage[]
+  /**
+   * Number of room messages already projected into the middle-column
+   * `hermes-group-<roomId>` session. Monotonic; survives the sliding
+   * message window because it counts all-time appends, not list indexes.
+   */
+  readonly projectedCount?: number
   readonly closed: boolean
   readonly createdAt: number
   readonly updatedAt: number
@@ -712,6 +724,10 @@ export interface SendBotMessageInput {
   readonly correlationId?: string
   readonly ttlMs?: number
   readonly expiresAt?: number
+  /** Control-plane replies to non-Bot addresses reuse the original Task/Run identity. */
+  readonly taskId?: string
+  readonly runId?: string
+  readonly attemptId?: string
 }
 
 export interface ReplyToBotMessageInput {

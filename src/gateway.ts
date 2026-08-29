@@ -18,9 +18,28 @@ import { PairingStore } from './pairing.js'
 import { FeishuTransport } from './feishu.js'
 import { TelegramTransport } from './telegram.js'
 import { createFleetHandoffTool, type FleetHandoffToolInput } from './fleet-tool.js'
-import { generateManagerPlan } from './manager-policy.js'
+import { generateManagerPlan, generateReplanSuggestion } from './manager-policy.js'
+import {
+  ManagerActionLog,
+  ManagerPauseRegistry,
+  boundedPollInterval,
+  boundedWaitTimeout,
+  normalizeManagerReplanObservations,
+  type ManagerActionQuery,
+  type ManagerActionRecord,
+  type ManagerObservation,
+  type ManagerObserveOptions,
+  type ManagerPauseActionResult,
+  type ManagerReplanInput,
+  type ManagerReplanResult,
+  type ManagerStopResult,
+  type ManagerWaitOptions,
+  type ManagerWaitResult,
+} from './manager-control.js'
 import { parseFleetMentions } from './mention-parser.js'
 import { createPeerEnvelope, isPeerMessage, normalizePeerPolicy, peerMessageIdempotencyKey, validatePeerPayload } from './peer-messaging.js'
+import { BotAskRegistry, askReplyIdempotencyKey } from './bot-ask.js'
+import type { BotAskInput, BotAskRecord, BotAskResult, BotAskWaitOptions } from './bot-ask.js'
 import {
   HttpRemoteBotTransport,
   RemoteDeliveryLedger,
@@ -69,10 +88,12 @@ import {
   compensationNodeIds,
   evaluateWorkflowCondition,
   mapWorkflowValues,
+  parseWorkflowApprovalEntityId,
   parseWorkflowResult,
   resolveWorkflowInputs as resolveWorkflowControlInputs,
   reduceWorkflowValues,
   serializeWorkflowResult,
+  workflowApprovalEntityId,
 } from './workflow-controls.js'
 import {
   BotDirectory,
@@ -89,6 +110,8 @@ import type {
   ManagerPlan,
   WorkflowDefinition,
   WorkflowDraft,
+  WorkflowManifest,
+  WorkflowRetrySpec,
   WorkflowValueType,
 } from './fleet-v2-types.js'
 import type {
@@ -127,6 +150,7 @@ import type {
   RunRecord,
   SendBotMessageInput,
   TaskRecord,
+  TeamDefinition,
 } from './types.js'
 
 interface SessionLike { readonly id: unknown }
@@ -200,9 +224,21 @@ const LOCAL_WEB_TARGET: BotTarget = {
 
 const LOCAL_WEB_PLUGIN = 'dsh-hermes-bot'
 const OWNER_WEB_FLEET_COMMANDS = new Set(['fleet', 'approve', 'reject'])
+const CRON_BOT_WORKFLOW_PREFIX = 'cron-bot:'
 
 function splitBotLabels(value: string): string[] {
   return [...new Set(value.split(/[\s,，、;；]+/u).map(item => item.trim()).filter(Boolean))]
+}
+
+function sameBotSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  const expected = new Set(left.map(id => id.toLowerCase()))
+  return right.every(id => expected.has(id.toLowerCase()))
+}
+
+function groupRoomTitle(participants: readonly string[]): string {
+  const labels = participants.map(id => '@' + id)
+  return labels.length === 0 ? '群聊' : `群聊 · ${labels.join('、')}`
 }
 
 function sessionKey(sessionId: unknown): string {
@@ -257,6 +293,8 @@ export interface WorkflowLaunchOptions {
   readonly launchId?: string
   /** JSON-safe values used by input references in the Workflow graph. */
   readonly inputs?: Readonly<Record<string, unknown>>
+  /** Whole-workflow deadline from launch; the run fails if it is not done in time. */
+  readonly deadlineMs?: number
 }
 
 export interface WorkflowLaunchResult {
@@ -413,6 +451,9 @@ export function normalizeConfig(raw: unknown = {}): BotGatewayConfig {
       mailboxRetryMaxMs: typeof collaboration.mailboxRetryMaxMs === 'number' ? collaboration.mailboxRetryMaxMs : 60_000,
       botRunMaxAttempts: typeof collaboration.botRunMaxAttempts === 'number' ? collaboration.botRunMaxAttempts : 3,
       maxParallelRuns: typeof collaboration.maxParallelRuns === 'number' ? collaboration.maxParallelRuns : 6,
+      perUserMaxRuns: typeof collaboration.perUserMaxRuns === 'number' ? Math.max(0, Math.floor(collaboration.perUserMaxRuns)) : 0,
+      sessionIdleTimeoutMs: typeof collaboration.sessionIdleTimeoutMs === 'number' ? Math.max(1_000, Math.floor(collaboration.sessionIdleTimeoutMs)) : 0,
+      sessionIdleCheckMs: typeof collaboration.sessionIdleCheckMs === 'number' ? Math.max(100, Math.floor(collaboration.sessionIdleCheckMs)) : 30_000,
       defaultSessionScope: collaboration.defaultSessionScope === 'shared' || collaboration.defaultSessionScope === 'chat' || collaboration.defaultSessionScope === 'task'
         ? collaboration.defaultSessionScope
         : 'requester',
@@ -462,6 +503,9 @@ export class BotGateway {
   private readonly rooms: GroupRoomStore
   private readonly approvals: FleetApprovalStore
   private readonly workflows: WorkflowStore
+  private readonly askRegistry: BotAskRegistry
+  private readonly managerActions: ManagerActionLog
+  private readonly managerPauses: ManagerPauseRegistry
   private readonly routines: RoutineStore
   private readonly registry: BotRegistry
   private readonly routineScheduler: RoutineScheduler
@@ -501,6 +545,7 @@ export class BotGateway {
   /** Direct chat sessions that have actually invoked each dynamic profile. */
   private readonly directProfileSessions = new Map<string, Set<string>>()
   private readonly workflowLanes = new Map<string, Promise<void>>()
+  private readonly workflowWakeTimers = new Set<ReturnType<typeof setTimeout>>()
   /** Serializes concurrent launches that share the same caller-provided launch ID. */
   private readonly workflowLaunchLanes = new Map<string, Promise<void>>()
   private readonly runLanes = new Map<string, Promise<void>>()
@@ -518,6 +563,10 @@ export class BotGateway {
   private collaborationDrainDueAt: number | undefined
   private approvalExpiryTimer: ReturnType<typeof setTimeout> | undefined
   private approvalExpiryDueAt: number | undefined
+  /** Last-observed activity per direct-chat session, keyed like sessionTargets. */
+  private readonly sessionActivity = new Map<string, number>()
+  private readonly reapedSessions = new Set<string>()
+  private idleReapTimer: ReturnType<typeof setTimeout> | undefined
   private readonly fleetHandoffTool = createFleetHandoffTool((sessionId, input) => this.requestModelHandoff(sessionId, input))
   private readonly botCreateDraftTool = createBotCreateDraftTool((sessionId, input) => this.createBotDraftFromSession(sessionId, input))
   private readonly botUpdateDraftTool = createBotUpdateDraftTool((sessionId, input) => this.updateBotDraftFromSession(sessionId, input))
@@ -540,6 +589,9 @@ export class BotGateway {
     this.remoteDeliveryLedger = new RemoteDeliveryLedger(join(stateDir, 'remote-inbox.jsonl'))
     this.tasks = new TaskRunStore(join(stateDir, 'tasks.jsonl'))
     this.workflows = new WorkflowStore(join(stateDir, 'workflows.jsonl'))
+    this.askRegistry = new BotAskRegistry(join(stateDir, 'bot-asks.jsonl'))
+    this.managerActions = new ManagerActionLog(join(stateDir, 'manager-actions.jsonl'))
+    this.managerPauses = new ManagerPauseRegistry(join(stateDir, 'manager-pauses.jsonl'))
     this.routines = new RoutineStore(join(stateDir, 'routines.jsonl'))
     this.routineScheduler = new RoutineScheduler({
       store: this.routines,
@@ -584,6 +636,7 @@ export class BotGateway {
     this.running = true
     this.stopped = false
     this.outbox.start()
+    this.scheduleNextIdleReap()
     this.started = this.boot()
     try {
       await this.started
@@ -617,6 +670,8 @@ export class BotGateway {
     if (this.approvalExpiryTimer !== undefined) clearTimeout(this.approvalExpiryTimer)
     this.approvalExpiryTimer = undefined
     this.approvalExpiryDueAt = undefined
+    if (this.idleReapTimer !== undefined) clearTimeout(this.idleReapTimer)
+    this.idleReapTimer = undefined
     // Cancel heartbeats that have not started before yielding. A callback that
     // already entered is covered by withDurableMutation below and is drained.
     for (const internal of this.internalRuns.values()) {
@@ -673,6 +728,8 @@ export class BotGateway {
       }
     }
     for (const internal of stoppingRuns) this.cleanupInternalRun(internal)
+    for (const timer of this.workflowWakeTimers) clearTimeout(timer)
+    this.workflowWakeTimers.clear()
     await this.outbox.stop()
   }
 
@@ -795,6 +852,7 @@ export class BotGateway {
   public onSessionEvent(session: SessionLike, event: unknown): void {
     if (this.stopped) return
     const id = sessionKey(session.id)
+    this.sessionActivity.set(id, Date.now())
     const previous = this.sessionEventLanes.get(id) ?? Promise.resolve()
     let task: Promise<void>
     task = previous
@@ -934,13 +992,21 @@ export class BotGateway {
     const approvals = await this.approvals.snapshot()
     await this.reconcileFleetApprovals(approvals)
     const fleetFeatures = this.config.collaboration?.features
-    const [mailbox, taskSnapshot, rooms, registryEntries] = await Promise.all([
+    const localActor = actorForTarget(LOCAL_WEB_TARGET)
+    const [mailbox, taskSnapshot, rooms, registryEntries, visibleTeams, routineRows, asks] = await Promise.all([
       this.mailbox.dashboardSnapshot(),
       this.tasks.dashboardSnapshot(),
       this.rooms.snapshot(),
       fleetFeatures?.dynamicRegistry === true || fleetFeatures?.webChatBotCreation === true
         ? this.registry.list(undefined, true)
         : Promise.resolve([] as BotRegistryEntry[]),
+      this.config.collaboration?.enabled === false
+        ? Promise.resolve([] as TeamDefinition[])
+        : this.teams.listTeams({ actorId: localActor }).catch(() => [] as TeamDefinition[]),
+      this.routinesEnabled()
+        ? this.listRoutines().catch(() => [] as RoutineRecord[])
+        : Promise.resolve([] as RoutineRecord[]),
+      this.askRegistry.snapshot(),
     ])
     const pendingActivation = new Map(
       approvals
@@ -981,7 +1047,22 @@ export class BotGateway {
         runs: taskSnapshot.runs,
         handoffs: taskSnapshot.handoffs,
         workflows: taskSnapshot.workflows,
-        approvals: approvals.slice(0, 50),
+        approvals: (() => {
+          const latestPending = new Map<string, (typeof approvals)[number]>()
+          const rest: typeof approvals = []
+          for (const approval of approvals) {
+            if (approval.status === 'pending') {
+              const key = `${approval.kind}:${approval.entityId}`
+              const prev = latestPending.get(key)
+              if (prev === undefined || approval.createdAt >= prev.createdAt) latestPending.set(key, approval)
+            } else {
+              rest.push(approval)
+            }
+          }
+          return [...latestPending.values(), ...rest]
+            .sort((left, right) => right.createdAt - left.createdAt)
+            .slice(0, 40)
+        })(),
         registryBots: registryEntries.map(entry => {
           const runtimeRef = this.profileRuntimeRefs.get(entry.definition.handle)
           const runtimeReady = runtimeProfileFor(entry) !== undefined
@@ -1014,6 +1095,8 @@ export class BotGateway {
             revision: entry.definition.currentRevision,
             fleetRole: entry.revision.fleetRole,
             capabilities: [...entry.revision.capabilities],
+            ...(entry.revision.description === undefined ? {} : { description: entry.revision.description }),
+            ...(entry.revision.soul === undefined ? {} : { soul: entry.revision.soul }),
             runtimeReady,
             fleetMembership,
             membershipReason,
@@ -1027,19 +1110,53 @@ export class BotGateway {
             ...(pendingActivation.get(entry.definition.id)?.code === undefined
               ? {}
               : { activationCode: pendingActivation.get(entry.definition.id)!.code }),
+            ...(this.directory.get(entry.definition.handle)?.canonicalSessionId === undefined
+              ? {}
+              : { canonicalSessionId: this.directory.get(entry.definition.handle)!.canonicalSessionId }),
             updatedAt: entry.definition.updatedAt,
           }
         }),
-        rooms: rooms.slice(-20).reverse().map(room => ({
-          id: room.id,
-          taskId: room.taskId,
-          participants: [...room.participants],
-          epoch: room.epoch,
-          roundCount: room.roundCount,
-          messageCount: room.messageCount,
-          closed: room.closed,
-          updatedAt: room.updatedAt,
+        rooms: (() => {
+          const latest = new Map<string, (typeof rooms)[number]>()
+          for (const room of rooms) {
+            if (room.closed === true) continue
+            const key = [...room.participants].map(id => id.toLowerCase()).sort().join(',')
+            const prev = latest.get(key)
+            if (prev === undefined || room.updatedAt >= prev.updatedAt) latest.set(key, room)
+          }
+          return [...latest.values()]
+            .sort((left, right) => right.updatedAt - left.updatedAt)
+            .slice(0, 12)
+            .map(room => ({
+              id: room.id,
+              taskId: room.taskId,
+              title: groupRoomTitle(room.participants),
+              participants: [...room.participants],
+              epoch: room.epoch,
+              roundCount: room.roundCount,
+              messageCount: room.messageCount,
+              closed: room.closed,
+              updatedAt: room.updatedAt,
+            }))
+        })(),
+        asks: asks.slice(-50).reverse().map(ask => ({
+          askId: ask.askId,
+          from: ask.from,
+          to: [...ask.to],
+          status: ask.status,
+          question: ask.question.slice(0, 120),
+          replyCount: ask.replies.length,
+          ...(ask.teamId === undefined ? {} : { teamId: ask.teamId }),
+          ...(ask.threadId === undefined ? {} : { threadId: ask.threadId }),
+          ...(ask.parentAskId === undefined ? {} : { parentAskId: ask.parentAskId }),
+          updatedAt: ask.updatedAt,
         })),
+        askCounts: {
+          pending: asks.filter(ask => ask.status === 'pending').length,
+          answered: asks.filter(ask => ask.status === 'answered').length,
+          'timed-out': asks.filter(ask => ask.status === 'timed-out').length,
+          cancelled: asks.filter(ask => ask.status === 'cancelled').length,
+        },
         deadLetters: mailbox.deadLetters.map(item => ({
           id: item.id,
           state: item.state,
@@ -1051,6 +1168,28 @@ export class BotGateway {
             runId: item.envelope.runId,
           },
           updatedAt: item.updatedAt,
+        })),
+        teams: visibleTeams
+          .filter(team => team.status === 'active')
+          .slice(0, 30)
+          .map(team => ({
+          id: team.id,
+          name: team.name,
+          status: team.status,
+          memberBotIds: [...team.memberBotIds],
+          ...(team.managerBotId === undefined || team.managerBotId === null ? {} : { managerBotId: team.managerBotId }),
+          maxConcurrency: team.maxConcurrency,
+          updatedAt: team.updatedAt,
+        })),
+        routines: routineRows.slice(0, 30).map(routine => ({
+          id: routine.id,
+          name: routine.name,
+          status: routine.status,
+          cron: routine.cron,
+          timezone: routine.timezone,
+          workflowId: routine.workflowId,
+          nextRunAt: routine.nextRunAt,
+          updatedAt: routine.updatedAt,
         })),
       },
     }
@@ -1097,6 +1236,10 @@ export class BotGateway {
       },
       this.activeBotRuns,
     )
+    const pausedBots = new Set((await this.managerPauses.paused()).map(pause => pause.botId))
+    const effectiveDescriptors = descriptors.map(descriptor => (
+      pausedBots.has(descriptor.id) ? { ...descriptor, status: 'unavailable' as const } : descriptor
+    ))
     const plan = generateManagerPlan({
       taskId: task.id,
       traceId,
@@ -1108,12 +1251,23 @@ export class BotGateway {
       ...(input.requiresExternalEffect === undefined ? {} : { requiresExternalEffect: input.requiresExternalEffect }),
       ...(input.budget === undefined ? {} : { budget: input.budget }),
       ...(input.maxAssignments === undefined ? {} : { maxAssignments: input.maxAssignments }),
-    }, managerBotId, descriptors)
+    }, managerBotId, effectiveDescriptors)
     await this.tasks.audit('task', task.id, requester, 'manager.plan_created', {
       plan,
       requester,
       replyTarget: input.replyTarget,
     }, traceId)
+    await this.managerActions.record({
+      kind: 'plan',
+      actor: requester,
+      taskId: task.id,
+      traceId,
+      detail: {
+        plan: structuredClone(plan),
+        replyTarget: input.replyTarget,
+        ...(input.maxAssignments === undefined ? {} : { maxAssignments: input.maxAssignments }),
+      },
+    })
     if (plan.policyDecision === 'deny') {
       await this.tasks.failTask(task.id, plan.reasons.join('; '), 'botfleet')
       return { taskId: task.id, traceId, plan, dispatched: [] }
@@ -1161,6 +1315,9 @@ export class BotGateway {
       }
       if (bot.approvalRequired || this.config.collaboration?.approvalMode === 'always') {
         throw new Error('Manager delegation requires a separate approved Bot invocation: ' + bot.id)
+      }
+      if (await this.managerPauses.isPaused(bot.id)) {
+        throw new Error('Manager delegation target is paused: ' + bot.id)
       }
       const existing = await this.mailbox.getByIdempotencyKey(spec.idempotencyKey)
       if (existing !== undefined) {
@@ -1211,9 +1368,351 @@ export class BotGateway {
       }
     }
     if (dispatched.length > 0) {
+      await this.managerActions.record({
+        kind: 'dispatch',
+        actor: requester,
+        taskId: task.id,
+        traceId: plan.traceId,
+        detail: {
+          planId: plan.planId,
+          planRevision: plan.planRevision,
+          dispatched: dispatched.length,
+          targets: dispatched.map(envelope => envelope.to),
+        },
+      })
       void this.drainCollaboration().catch(error => this.log('warn', 'Manager delegation drain failed: ' + String(error)))
     }
     return dispatched
+  }
+
+  /**
+   * Manager observation: a bounded, Manager-ready view of the Fleet. Bot
+   * status is derived from real run state (busy = active run, timeout/failed =
+   * last failed run, unavailable = disabled or paused).
+   */
+  public async managerObserve(options: ManagerObserveOptions = {}): Promise<ManagerObservation> {
+    return this.withDurableMutation(async () => {
+      const maxBots = Math.max(1, Math.min(500, options.maxBots ?? 100))
+      const maxTasks = Math.max(1, Math.min(500, options.maxTasks ?? 100))
+      const [snapshot, asks, pauses] = await Promise.all([
+        this.tasks.snapshot(),
+        this.askRegistry.snapshot(),
+        this.managerPauses.paused(),
+      ])
+      const pauseByBot = new Map(pauses.map(pause => [pause.botId, pause]))
+      const failuresByBot = new Map<string, { runId: string; error: string; at: number }>()
+      const inFlightByBot = new Map<string, number>()
+      for (const run of snapshot.runs) {
+        if (run.status === 'queued' || run.status === 'running') {
+          inFlightByBot.set(run.botId, (inFlightByBot.get(run.botId) ?? 0) + 1)
+        }
+        if (run.status === 'failed') {
+          const candidate = { runId: run.id, error: run.error ?? 'Run failed', at: run.updatedAt }
+          const previous = failuresByBot.get(run.botId)
+          if (previous === undefined || candidate.at >= previous.at) failuresByBot.set(run.botId, candidate)
+        }
+      }
+      const bots: ManagerObservation['bots'] = this.directory.list().slice(0, maxBots).map(bot => {
+        const paused = pauseByBot.get(bot.id)
+        const lastFailure = failuresByBot.get(bot.id)
+        const inFlight = inFlightByBot.get(bot.id) ?? 0
+        let status: 'available' | 'busy' | 'unavailable' | 'timeout' | 'failed'
+        if (!bot.enabled || paused !== undefined) status = 'unavailable'
+        else if (inFlight > 0) status = 'busy'
+        else if (lastFailure !== undefined && /expired|timed out|timeout/u.test(lastFailure.error)) status = 'timeout'
+        else if (lastFailure !== undefined) status = 'failed'
+        else status = 'available'
+        return {
+          id: bot.id,
+          ...(bot.title === undefined ? {} : { title: bot.title }),
+          status,
+          inFlight,
+          capabilities: [...bot.capabilities],
+          skills: [...bot.skills],
+          ...(bot.fleetRole === undefined ? {} : { role: bot.fleetRole }),
+          ...(paused === undefined ? {} : { paused: { reason: paused.reason, until: paused.until } }),
+          ...(lastFailure === undefined ? {} : { lastFailure }),
+        }
+      })
+      const workflows = snapshot.workflows
+      const activeWorkflowStatuses = new Set(['pending-approval', 'running', 'verifying', 'synthesizing'])
+      const observation: ManagerObservation = {
+        now: Date.now(),
+        bots,
+        tasks: snapshot.tasks.slice(-maxTasks).map(task => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          assignedTo: task.assignedTo,
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          ...(task.result === undefined ? {} : { result: String(task.result).slice(0, 500) }),
+          ...(task.error === undefined ? {} : { error: String(task.error).slice(0, 500) }),
+        })),
+        runs: snapshot.runs.slice(-(maxTasks * 2)).map(run => ({
+          id: run.id,
+          taskId: run.taskId,
+          botId: run.botId,
+          status: run.status,
+          attemptId: run.attemptId,
+          ...(run.error === undefined ? {} : { error: String(run.error).slice(0, 500) }),
+          updatedAt: run.updatedAt,
+        })),
+        asks: {
+          pending: asks.filter(ask => ask.status === 'pending').length,
+          answered: asks.filter(ask => ask.status === 'answered').length,
+          'timed-out': asks.filter(ask => ask.status === 'timed-out').length,
+          cancelled: asks.filter(ask => ask.status === 'cancelled').length,
+        },
+        workflows: {
+          active: workflows.filter(workflow => activeWorkflowStatuses.has(workflow.status)).length,
+          completed: workflows.filter(workflow => workflow.status === 'completed').length,
+          failed: workflows.filter(workflow => workflow.status === 'failed').length,
+          cancelled: workflows.filter(workflow => workflow.status === 'cancelled').length,
+        },
+        pauses: pauses.map(pause => ({ ...pause })),
+      }
+      if (options.record === true) {
+        await this.managerActions.record({
+          kind: 'observe',
+          actor: 'manager',
+          detail: { botCount: bots.length, ...observation.asks },
+        })
+      }
+      return observation
+    })
+  }
+
+  /** Wait until a Manager task reaches a terminal state or the caller's budget elapses. */
+  public async managerWait(taskId: string, options: ManagerWaitOptions = {}): Promise<ManagerWaitResult> {
+    return this.withDurableMutation(async () => {
+      const timeoutMs = boundedWaitTimeout(options.timeoutMs)
+      const pollMs = boundedPollInterval(options.pollMs)
+      const started = Date.now()
+      let current = await this.tasks.task(taskId)
+      if (current === undefined) throw new Error('Manager task not found: ' + taskId)
+      for (;;) {
+        if (current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled') {
+          const waitedMs = Date.now() - started
+          await this.managerActions.record({
+            kind: 'wait',
+            actor: 'manager',
+            taskId,
+            detail: { status: current.status, waitedMs },
+          })
+          return {
+            taskId,
+            status: current.status,
+            ...(current.result === undefined ? {} : { result: current.result }),
+            ...(current.error === undefined ? {} : { error: String(current.error) }),
+            timedOut: false,
+            waitedMs,
+          }
+        }
+        if (Date.now() - started >= timeoutMs) break
+        await new Promise(resolve => setTimeout(resolve, pollMs))
+        current = await this.tasks.task(taskId)
+        if (current === undefined) throw new Error('Manager task not found: ' + taskId)
+      }
+      const waitedMs = Date.now() - started
+      await this.managerActions.record({
+        kind: 'wait',
+        actor: 'manager',
+        taskId,
+        detail: { status: current.status, timedOut: true, waitedMs },
+      })
+      return { taskId, status: current.status, timedOut: true, waitedMs }
+    })
+  }
+
+  /** Durably pause a Bot so the Manager stops delegating new work to it. */
+  public async managerPause(
+    botId: string,
+    input: { reason?: string; durationMs?: number; actor?: string } = {},
+  ): Promise<ManagerPauseActionResult> {
+    return this.withDurableMutation(async () => {
+      const normalized = botId.trim().toLowerCase()
+      const bot = this.directory.get(normalized)
+      if (!bot) throw new Error('unknown Bot: ' + normalized)
+      const actor = input.actor ?? 'manager'
+      const record = await this.managerPauses.pause({
+        botId: normalized,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
+        ...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
+        actor,
+      })
+      await this.managerActions.record({
+        kind: 'pause',
+        actor,
+        botId: normalized,
+        detail: { reason: record.reason, until: record.until },
+      })
+      return { botId: normalized, reason: record.reason, until: record.until }
+    })
+  }
+
+  /** Resume a paused Bot. Returns false when the Bot was not paused. */
+  public async managerResume(botId: string, actor = 'manager'): Promise<boolean> {
+    return this.withDurableMutation(async () => {
+      const normalized = botId.trim().toLowerCase()
+      const resumed = await this.managerPauses.resume(normalized, actor)
+      if (resumed) {
+        await this.managerActions.record({ kind: 'resume', actor, botId: normalized })
+      }
+      return resumed !== undefined
+    })
+  }
+
+  /** Stop a Manager task and every delegation attached to it, durably. */
+  public async managerStop(
+    taskId: string,
+    input: { reason?: string; actor?: string } = {},
+  ): Promise<ManagerStopResult> {
+    return this.withDurableMutation(async () => {
+      const actor = input.actor ?? 'manager'
+      const task = await this.tasks.task(taskId)
+      const cancellable = task !== undefined && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+      const cancelledTask = cancellable ? await this.cancelFleetTaskUnlocked(taskId, actor) : undefined
+      await this.managerActions.record({
+        kind: 'stop',
+        actor,
+        taskId,
+        ...(task === undefined ? {} : { traceId: task.id }),
+        detail: { reason: input.reason ?? 'stopped by Manager', cancelled: cancelledTask !== undefined },
+      })
+      const status = cancelledTask?.status ?? task?.status
+      return {
+        taskId,
+        cancelled: cancelledTask !== undefined,
+        ...(status === undefined ? {} : { status }),
+      }
+    })
+  }
+
+  /**
+   * Replan after a worker fails or times out. The suggestion is always
+   * recorded durably; when `auto` is set and policy permits, replacement
+   * delegations are dispatched on a fresh task sharing the same trace.
+   */
+  public async managerReplan(input: ManagerReplanInput): Promise<ManagerReplanResult> {
+    return this.withDurableMutation(async () => {
+      const task = await this.tasks.task(input.taskId)
+      if (!task) throw new Error('Manager task not found: ' + input.taskId)
+      const storedPlan = await this.managerActions.last(input.taskId, 'plan')
+      if (!storedPlan?.detail?.plan) throw new Error('no stored Manager plan for task: ' + input.taskId)
+      const currentPlan = storedPlan.detail.plan as ManagerPlan
+      const replyTarget = storedPlan.detail.replyTarget as BotTarget | undefined
+      if (replyTarget === undefined) throw new Error('stored Manager plan has no reply target')
+      const traceId = currentPlan.traceId
+      const actor = input.actor ?? 'manager'
+      const observations = normalizeManagerReplanObservations(input.observations)
+      if (observations.length === 0) throw new Error('replan requires at least one observation')
+      const pausedBots = new Set((await this.managerPauses.paused()).map(pause => pause.botId))
+      const descriptors = managerDescriptorsFromRoster(
+        this.directory.list(),
+        replyTarget,
+        (botId, target) => {
+          const bot = this.directory.get(botId)
+          return bot !== undefined
+            && !bot.approvalRequired
+            && this.config.collaboration?.approvalMode !== 'always'
+            && this.directory.canInvoke(botId, target)
+        },
+        this.activeBotRuns,
+      ).map(descriptor => pausedBots.has(descriptor.id) ? { ...descriptor, status: 'unavailable' as const } : descriptor)
+      const managerBotId = currentPlan.delegations[0]?.fromManager ?? (this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+      const storedMaxAssignments = typeof storedPlan.detail.maxAssignments === 'number'
+        ? storedPlan.detail.maxAssignments
+        : currentPlan.delegations.length
+      const suggestion = generateReplanSuggestion({
+        task: {
+          taskId: task.id,
+          traceId,
+          requester: task.createdBy,
+          instruction: task.instruction,
+          ...(task.acceptanceCriteria.length === 0 ? {} : { acceptanceCriteria: task.acceptanceCriteria }),
+          maxAssignments: Math.max(1, storedMaxAssignments),
+        },
+        currentPlan,
+        observations,
+        availableBots: descriptors,
+        managerBotId,
+      })
+      await this.managerActions.record({
+        kind: 'replan',
+        actor,
+        taskId: input.taskId,
+        traceId,
+        detail: { suggestion: structuredClone(suggestion), auto: input.auto === true },
+      })
+      if (input.auto !== true) {
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false }
+      }
+      const approvalRequired = suggestion.approval.required
+        || suggestion.policyDecision === 'approval-required'
+        || this.config.collaboration?.approvalMode === 'always'
+      if (approvalRequired) {
+        const approval = await this.approvals.create({
+          kind: 'bot-invocation',
+          requestedBy: task.createdBy,
+          summary: 'Manager 重规划：' + task.instruction,
+          entityId: input.taskId,
+          ...(this.config.collaboration?.approvalTtlMs === undefined ? {} : { ttlMs: this.config.collaboration.approvalTtlMs }),
+        })
+        await this.tasks.audit('approval', approval.id, actor, 'manager.replan_approval_requested', {
+          taskId: input.taskId,
+          planId: suggestion.planId,
+          planRevision: suggestion.planRevision,
+        }, traceId)
+        this.scheduleApprovalExpiry(approval.expiresAt)
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false, approvalCode: approval.code }
+      }
+      if (suggestion.replacementDelegations.length === 0) {
+        return { taskId: input.taskId, traceId, suggestion, autoDispatched: false }
+      }
+      const newTask = await this.tasks.createTask({
+        title: 'Manager replan: ' + task.title.replace(/^Manager:\s*/u, ''),
+        instruction: task.instruction,
+        createdBy: task.createdBy,
+        assignedTo: managerBotId,
+        acceptanceCriteria: task.acceptanceCriteria,
+      })
+      const plan: ManagerPlan = {
+        schemaVersion: 1,
+        planId: suggestion.planId,
+        planRevision: suggestion.planRevision,
+        taskId: newTask.id,
+        traceId,
+        policyDecision: 'allow',
+        reasons: [...suggestion.reasons],
+        budget: currentPlan.budget,
+        delegations: suggestion.replacementDelegations,
+        approval: { required: false, risk: suggestion.approval.risk, reason: suggestion.approval.reason, scope: suggestion.approval.scope },
+        generatedAt: Date.now(),
+      }
+      const dispatched = await this.dispatchManagerPlan(plan, task.createdBy, replyTarget, false)
+      await this.managerActions.record({
+        kind: 'plan',
+        actor,
+        taskId: newTask.id,
+        traceId,
+        detail: { plan: structuredClone(plan), replyTarget, replanOf: input.taskId },
+      })
+      return {
+        taskId: input.taskId,
+        traceId,
+        suggestion,
+        autoDispatched: true,
+        dispatchedTaskId: newTask.id,
+        dispatchedEnvelopes: dispatched.map(envelope => ({ ...envelope })),
+        plan,
+      }
+    })
+  }
+
+  /** Replayable Manager history: every durable action, queryable. */
+  public async managerHistory(query: ManagerActionQuery = {}): Promise<ManagerActionRecord[]> {
+    return this.managerActions.query(query)
   }
 
   private assertSavedWorkflowsEnabled(): void {
@@ -1266,6 +1765,16 @@ export class BotGateway {
   }
 
   private async launchRoutine(launch: RoutineLaunch): Promise<RoutineLaunchResult> {
+    const to = typeof launch.inputs.to === 'string' ? launch.inputs.to.trim().replace(/^@/u, '').toLowerCase() : ''
+    const instruction = typeof launch.inputs.instruction === 'string' ? launch.inputs.instruction.trim() : ''
+    if (launch.workflowId.startsWith(CRON_BOT_WORKFLOW_PREFIX) && to !== '' && instruction !== '') {
+      try {
+        const dispatched = await this.dispatchWebDashboardTask(to, instruction)
+        return { status: 'started', ...(dispatched.taskId === undefined ? {} : { runId: dispatched.taskId }) }
+      } catch (error: unknown) {
+        return { status: 'failed', error: String(error), retryable: true }
+      }
+    }
     try {
       const replyTarget = launch.replyTarget ?? { platform: 'internal', chatId: launch.ownerId }
       const result = await this.launchWorkflowDefinition(
@@ -1299,6 +1808,62 @@ export class BotGateway {
   public async getWorkflowDefinition(workflowId: string, actor = 'local-dashboard', workspaceId?: string): Promise<WorkflowDefinition | undefined> {
     this.assertSavedWorkflowsEnabled()
     return this.workflows.get(workflowId, { actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
+  }
+
+  /** Save an edited revision of a saved Workflow. */
+  public async updateWorkflowDefinition(
+    workflowId: string,
+    input: WorkflowDraft,
+    actor = input.ownerId,
+    expectedRevision?: number,
+  ): Promise<WorkflowDefinition> {
+    return this.withDurableMutation(async () => {
+      this.assertSavedWorkflowsEnabled()
+      const current = await this.workflows.get(workflowId, { actorId: actor })
+      if (current === undefined) throw new Error('Workflow not found: ' + workflowId)
+      return this.workflows.update(workflowId, input, actor, expectedRevision ?? current.revision)
+    })
+  }
+
+  /** Soft-delete a saved Workflow so it stops appearing in lists and launches. */
+  public async deleteWorkflowDefinition(workflowId: string, actor = 'local-dashboard'): Promise<boolean> {
+    return this.withDurableMutation(async () => {
+      this.assertSavedWorkflowsEnabled()
+      const current = await this.workflows.get(workflowId, { actorId: actor })
+      if (current === undefined || current.status === 'deleted') return false
+      await this.workflows.softDelete(workflowId, actor, current.revision)
+      return true
+    })
+  }
+
+  /** Stop every running instance of a saved Workflow; returns the count stopped. */
+  public async cancelWorkflowRuns(workflowId: string, actor = 'local-dashboard'): Promise<number> {
+    return this.withDurableMutation(async () => {
+      const snapshot = await this.tasks.snapshot()
+      const roots = snapshot.tasks.filter(task => (
+        task.workflowDefinitionId === workflowId
+        && task.workflowNodeId === '__root__'
+        && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+      ))
+      let cancelled = 0
+      for (const root of roots) {
+        const stopped = await this.cancelFleetTaskUnlocked(root.id, actor)
+        if (stopped !== undefined) cancelled += 1
+      }
+      return cancelled
+    })
+  }
+
+  /** Export a Workflow as a checksummed manifest for backup or cross-machine sharing. */
+  public async exportWorkflowManifest(workflowId: string, actor = 'local-dashboard', workspaceId?: string): Promise<WorkflowManifest> {
+    this.assertSavedWorkflowsEnabled()
+    return this.workflows.exportManifest(workflowId, { actorId: actor, ...(workspaceId === undefined ? {} : { workspaceId }) })
+  }
+
+  /** Import a checksummed Workflow manifest; the imported definition is owned by the actor. */
+  public async importWorkflowManifest(manifest: WorkflowManifest, actor = 'local-dashboard'): Promise<WorkflowDefinition> {
+    this.assertSavedWorkflowsEnabled()
+    return this.workflows.importManifest(manifest, actor)
   }
 
   private async getPinnedWorkflowDefinition(root: TaskRecord): Promise<WorkflowDefinition | undefined> {
@@ -1374,7 +1939,13 @@ export class BotGateway {
     if (launchId.length > 200) throw new Error('Workflow launchId is too long')
     const workflowRunId = 'workflow-run:' + definition.id + ':' + definition.revision + ':' + launchId
     const correlationId = 'workflow:' + definition.id + ':' + definition.revision + ':' + launchId
-    const workflowInputs = options.inputs === undefined ? {} : structuredClone(options.inputs)
+    const deadlineMs = options.deadlineMs === undefined
+      ? undefined
+      : Math.max(1_000, Math.floor(options.deadlineMs))
+    const workflowInputs = {
+      ...(options.inputs === undefined ? {} : structuredClone(options.inputs)),
+      ...(deadlineMs === undefined ? {} : { __dshWorkflowDeadline: Date.now() + deadlineMs }),
+    }
     validateWorkflowLaunchInputs(definition, workflowInputs)
     validatePeerPayload({ workflowInputs }, normalizePeerPolicy(this.config.collaboration ?? {}).maxPayloadBytes)
     const snapshot = await this.tasks.snapshot()
@@ -1412,6 +1983,16 @@ export class BotGateway {
     )
     if (dispatched.length > 0) {
       void this.drainCollaboration().catch(error => this.log('warn', 'Workflow launch drain failed: ' + String(error)))
+    }
+    if (deadlineMs !== undefined) {
+      this.scheduleWorkflowWake({
+        definition,
+        workflowRunId,
+        rootTaskId: rootTask.id,
+        requester,
+        replyTarget,
+        correlationId,
+      }, rootTask, deadlineMs)
     }
     return {
       workflowId: definition.id,
@@ -1491,8 +2072,12 @@ export class BotGateway {
       if (existingTask?.status === 'failed' || existingTask?.status === 'cancelled') {
         throw new Error('Workflow node is already terminal: ' + storageNodeId)
       }
-      const candidates = this.directory.list()
-        .filter(bot => bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
+      const candidateIds = node.capability === undefined
+        ? this.directory.ids()
+        : this.directory.botsWithCapability(node.capability)
+      const candidates = candidateIds
+        .map(id => this.directory.get(id))
+        .filter((bot): bot is BotDescriptor => bot !== undefined && bot.enabled && this.directory.canInvoke(bot.id, replyTarget))
         .filter(bot => node.capability === undefined || bot.capabilities.some(capability => capability === node.capability || capability.includes(node.capability!)))
         .filter(bot => !bot.approvalRequired && this.config.collaboration?.approvalMode !== 'always')
         .sort((left, right) => Number(this.activeBotRuns.has(left.id)) - Number(this.activeBotRuns.has(right.id)) || left.id.localeCompare(right.id))
@@ -1530,6 +2115,13 @@ export class BotGateway {
       let run = task.currentRunId === undefined ? undefined : knownRuns.get(task.currentRunId)
       let createdRun = false
       if (needsNewRun) {
+        if (definitionNode.retry !== undefined) {
+          const maxAttempts = Math.max(1, Math.floor(definitionNode.retry.maxAttempts))
+          const attempts = snapshot.runs.filter(candidate => candidate.taskId === task.id).length
+          if (attempts >= maxAttempts) {
+            throw new Error('Workflow node exhausted ' + attempts + ' retries: ' + storageNodeId)
+          }
+        }
         run = await this.tasks.createRun(task.id, selectedBot.id, (run?.attempt ?? 0) + 1)
         knownRuns.set(run.id, run)
         createdRun = true
@@ -1595,6 +2187,17 @@ export class BotGateway {
         runId: run.id,
         botId: selectedBot.id,
       }, correlationId)
+      if (createdRun && definitionNode.timeout !== undefined) {
+        const timeoutMs = Math.max(1_000, Math.floor(definitionNode.timeout.timeoutMs))
+        this.scheduleWorkflowWake({
+          definition,
+          workflowRunId,
+          rootTaskId: rootTask.id,
+          requester,
+          replyTarget,
+          correlationId,
+        }, rootTask, Math.max(100, task.createdAt + timeoutMs - Date.now()))
+      }
       dispatched.push(envelope)
     }
     return dispatched
@@ -1633,26 +2236,138 @@ export class BotGateway {
   public async replyToMessage(input: ReplyToBotMessageInput): Promise<BotMessageEnvelope> {
     const targetBot = input.to ?? input.message.from
     const target = this.directory.get(targetBot)
-    if (!target) throw new Error('reply target is not an available Bot: ' + targetBot)
+    // Replies may target the user who asked: the reply is a control-plane
+    // completion recorded against the durable Ask, delivered by the ask waiter.
+    const userTarget = target === undefined
+      && input.to === undefined
+      && (input.message.fromAddress?.type === 'user' || input.message.from.startsWith('user:'))
+    if (!target && !userTarget) throw new Error('reply target is not an available Bot: ' + targetBot)
+    const askId = typeof input.message.payload?.askId === 'string' && input.message.payload.askId.trim() !== ''
+      ? input.message.payload.askId.trim()
+      : undefined
+    const replyPayload = askId === undefined
+      ? input.payload
+      : { ...(input.payload ?? {}), askId, __dshAsk: true }
+    const toAddress = input.toAddress ?? (userTarget
+      ? (input.message.fromAddress ?? { id: input.message.from, type: 'user' as const })
+      : { id: target!.id, type: 'bot' as const })
     return this.sendBotMessage({
       from: input.from,
-      to: target.id,
+      to: toAddress.id,
       instruction: input.instruction,
       replyTarget: input.replyTarget,
       kind: 'reply',
       ...(input.title === undefined ? {} : { title: input.title }),
       ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
       ...(input.fromAddress === undefined ? {} : { fromAddress: input.fromAddress }),
-      ...(input.toAddress === undefined ? {} : { toAddress: input.toAddress }),
+      toAddress,
       ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
       ...(input.toSessionId === undefined ? {} : { toSessionId: input.toSessionId }),
-      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-      ...(input.payload === undefined ? {} : { payload: input.payload }),
+      ...(input.idempotencyKey === undefined && askId === undefined ? {} : {
+        idempotencyKey: input.idempotencyKey ?? askReplyIdempotencyKey(askId!, input.from),
+      }),
+      ...(replyPayload === undefined ? {} : { payload: replyPayload }),
       correlationId: input.message.correlationId,
       ...(input.message.conversationId === undefined ? {} : { conversationId: input.message.conversationId }),
       replyTo: input.message.id,
       traceId: input.message.traceId ?? input.message.correlationId,
+      ...(userTarget ? {
+        taskId: input.message.taskId,
+        runId: input.message.runId,
+        attemptId: input.message.attemptId,
+      } : {}),
     })
+  }
+
+  /**
+   * Ask one or more Bots a question and durably remember the Ask until every
+   * target replies or the deadline passes. Returns immediately with an askId;
+   * use botWait() to block for the aggregated answers. Replies are correlated
+   * across Teams/Threads by the Ask's correlationId/traceId, and a late reply
+   * to an expired Ask is still recorded for audit.
+   */
+  public async botAsk(input: BotAskInput): Promise<BotAskResult> {
+    return this.withDurableMutation(async () => {
+      if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
+      if (this.config.collaboration?.features?.peerMessaging !== true) {
+        throw new Error('Peer Messaging is disabled; enable collaboration.features.peerMessaging first')
+      }
+      const targets = [...new Set(input.to.map(id => String(id).trim().toLowerCase()).filter(Boolean))]
+      if (targets.length === 0) throw new Error('bot ask requires at least one target Bot')
+      for (const to of targets) {
+        const bot = this.directory.get(to)
+        const remote = bot === undefined ? this.remoteRouteForBot(to) : undefined
+        if (!bot && remote === undefined) throw new Error('Bot is unavailable or not authorized: ' + to)
+        if (bot && !this.directory.canInvoke(bot.id, input.replyTarget)) {
+          throw new Error('Bot is unavailable or not authorized: ' + to)
+        }
+      }
+      const ask = await this.askRegistry.register({
+        from: input.from,
+        to: targets,
+        question: input.question,
+        ...(input.ttlMs === undefined ? {} : { ttlMs: input.ttlMs }),
+        ...(input.maxReplies === undefined ? {} : { maxReplies: input.maxReplies }),
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.traceId === undefined ? {} : { traceId: input.traceId }),
+        ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
+        ...(input.teamId === undefined ? {} : { teamId: input.teamId }),
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
+        ...(input.parentAskId === undefined ? {} : { parentAskId: input.parentAskId }),
+      })
+      const remainingTtl = Math.max(1_000, ask.deadline - Date.now())
+      const envelopes: BotMessageEnvelope[] = []
+      for (const to of targets) {
+        const envelope = await this.sendBotMessageUnlocked({
+          from: input.from,
+          to,
+          instruction: input.question,
+          replyTarget: input.replyTarget,
+          kind: 'request',
+          ...(input.fromAddress === undefined ? {} : { fromAddress: input.fromAddress }),
+          ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+          correlationId: ask.correlationId,
+          traceId: ask.traceId,
+          ttlMs: remainingTtl,
+          payload: { ...(input.payload ?? {}), askId: ask.askId, __dshAsk: true },
+        })
+        envelopes.push(envelope)
+      }
+      await this.tasks.audit('message', ask.askId, input.from, 'ask.registered', {
+        to: targets,
+        correlationId: ask.correlationId,
+        deadline: ask.deadline,
+        envelopeCount: envelopes.length,
+      }, ask.correlationId)
+      return this.askResult(ask, envelopes)
+    })
+  }
+
+  /** Block until the Ask is answered, expires, or the caller's budget elapses. */
+  public async botWait(askId: string, options: BotAskWaitOptions = {}): Promise<BotAskResult> {
+    const record = await this.askRegistry.wait(askId, options)
+    return this.askResult(record)
+  }
+
+  /** Non-blocking Ask status, including any replies collected so far. */
+  public async botAskStatus(askId: string): Promise<BotAskResult | undefined> {
+    const record = await this.askRegistry.get(askId)
+    return record && this.askResult(record)
+  }
+
+  private askResult(record: BotAskRecord, envelopes?: readonly BotMessageEnvelope[]): BotAskResult {
+    return {
+      askId: record.askId,
+      correlationId: record.correlationId,
+      status: record.status,
+      question: record.question,
+      from: record.from,
+      to: [...record.to],
+      replies: record.replies.map(reply => ({ ...reply })),
+      ...(envelopes === undefined ? {} : { envelopes: envelopes.map(envelope => ({ ...envelope })) }),
+      timedOut: record.status === 'pending',
+    }
   }
 
   /** Public typed Bot-to-Bot seam backed by Task/Run and the durable Mailbox. */
@@ -1663,9 +2378,11 @@ export class BotGateway {
   private async sendBotMessageUnlocked(input: SendBotMessageInput): Promise<BotMessageEnvelope> {
     if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet is disabled')
     const requestedBotId = input.to.trim().toLowerCase()
-    const bot = this.directory.get(requestedBotId)
-    const remoteRoute = bot === undefined ? this.remoteRouteForBot(requestedBotId) : undefined
-    if (!bot && remoteRoute === undefined) throw new Error('Bot is unavailable or not authorized: ' + input.to)
+    const userReplyTarget = input.kind === 'reply'
+      && (input.toAddress?.type === 'user' || requestedBotId.startsWith('user:'))
+    const bot = userReplyTarget ? undefined : this.directory.get(requestedBotId)
+    const remoteRoute = bot === undefined && !userReplyTarget ? this.remoteRouteForBot(requestedBotId) : undefined
+    if (!bot && remoteRoute === undefined && !userReplyTarget) throw new Error('Bot is unavailable or not authorized: ' + input.to)
     if (bot && !this.directory.canInvoke(bot.id, input.replyTarget)) {
       throw new Error('Bot is unavailable or not authorized: ' + input.to)
     }
@@ -1700,7 +2417,7 @@ export class BotGateway {
     if (
       typeof toAddress.id !== 'string'
       || toAddress.id.toLowerCase() !== targetBotId
-      || (toAddress.type !== undefined && toAddress.type !== 'bot')
+      || (!userReplyTarget && toAddress.type !== undefined && toAddress.type !== 'bot')
     ) {
       throw new Error('toAddress must identify the selected Bot')
     }
@@ -1715,29 +2432,33 @@ export class BotGateway {
     const peerPolicy = normalizePeerPolicy(this.config.collaboration ?? {})
     validatePeerPayload(messagePayload, peerPolicy.maxPayloadBytes)
 
-    const task = await this.tasks.createTask({
-      title: input.title ?? input.instruction,
-      instruction: input.instruction,
-      createdBy: input.from,
-      assignedTo: targetBotId,
-      ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
-    })
-    try {
-      if (bot !== undefined) {
-        await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+    let task: TaskRecord | undefined
+    let run: RunRecord | undefined
+    if (!userReplyTarget) {
+      task = await this.tasks.createTask({
+        title: input.title ?? input.instruction,
+        instruction: input.instruction,
+        createdBy: input.from,
+        assignedTo: targetBotId,
+        ...(input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria }),
+      })
+      try {
+        if (bot !== undefined) {
+          await this.withBotLifecycleFence(() => this.assertBotsAcceptingWork([bot.id]))
+        }
+      } catch (error: unknown) {
+        await this.tasks.cancelTask(task.id, 'system:admission')
+        throw error
       }
-    } catch (error: unknown) {
-      await this.tasks.cancelTask(task.id, 'system:admission')
-      throw error
+      run = await this.tasks.createRun(task.id, targetBotId, 1)
     }
-    const run = await this.tasks.createRun(task.id, targetBotId, 1)
     const envelope = createPeerEnvelope({
       kind: input.kind ?? 'request',
       from: fromAddress,
       to: toAddress,
-      taskId: task.id,
-      runId: run.id,
-      attemptId: run.attemptId,
+      taskId: input.taskId ?? task?.id ?? 'ask-reply:' + randomUUID(),
+      runId: input.runId ?? run?.id ?? 'ask-reply-run:' + randomUUID(),
+      attemptId: input.attemptId ?? run?.attemptId ?? 'ask-reply-attempt:' + randomUUID(),
       ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
       ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
       ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
@@ -1749,6 +2470,29 @@ export class BotGateway {
       ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
       payload: messagePayload,
     }, this.config.collaboration ?? {})
+    if (input.kind === 'reply') {
+      const askId = typeof messagePayload.askId === 'string' && messagePayload.askId.trim() !== ''
+        ? messagePayload.askId.trim()
+        : undefined
+      if (askId !== undefined) {
+        // A reply carrying an askId answers a durable bot_ask. Record it before
+        // enqueue so aggregation is complete before any delivery is observed.
+        await this.askRegistry.recordReply(askId, {
+          from: fromAddress.id,
+          text: input.instruction,
+          messageId: envelope.id,
+        })
+        await this.tasks.audit('message', envelope.id, fromAddress.id, 'ask.reply_recorded', {
+          askId,
+          to: input.to,
+        }, envelope.correlationId)
+      }
+    }
+    if (userReplyTarget) {
+      // Control-plane reply to the asking user: no Task/Run/Mailbox delivery;
+      // the ask waiter delivers the aggregated answer to the chat.
+      return envelope
+    }
     if (remoteRoute !== undefined) {
       try {
         await this.dispatchRemoteEnvelope(envelope, remoteRoute)
@@ -1758,22 +2502,22 @@ export class BotGateway {
         // without creating a second local Task/Run.
         await this.tasks.audit('message', envelope.id, input.from, 'message.remote_send_failed', {
           targetNodeId: remoteRoute.nodeId,
-          taskId: task.id,
-          runId: run.id,
+          taskId: task!.id,
+          runId: run!.id,
           error: String(error).slice(0, 500),
         }, envelope.correlationId)
         throw error
       }
       await this.tasks.audit('message', envelope.id, input.from, 'message.remote_sent', {
         targetNodeId: remoteRoute.nodeId,
-        taskId: task.id,
-        runId: run.id,
+        taskId: task!.id,
+        runId: run!.id,
       }, envelope.correlationId)
       return envelope
     }
     await this.mailbox.enqueue(envelope, peerMessageIdempotencyKey(envelope))
     await this.tasks.audit('message', envelope.id, input.from, 'message.queued', {
-      taskId: task.id,
+      taskId: task!.id,
       to: bot!.id,
       schemaVersion: envelope.schemaVersion ?? null,
       hop: envelope.hop ?? 0,
@@ -2218,6 +2962,19 @@ export class BotGateway {
       }
       const current = await this.registry.get(botId)
       if (current === undefined || current.definition.source === 'config') return undefined
+      if (current.definition.status === 'draft' && status === 'active') {
+        if (!this.isLocalOwner(actor)) {
+          throw new Error('草稿必须先通过 8 位确认码激活；不需要的草稿可以直接删除。')
+        }
+        const approval = await this.ensureBotActivationApproval(current, actor)
+        const resolved = await this.resolveFleetApprovalUnlocked(approval.code, 'approved', actor)
+        if (resolved?.status !== 'approved') {
+          throw new Error('激活草稿失败。请再点一次确认激活。')
+        }
+        const activated = await this.registry.get(botId)
+        if (activated === undefined) throw new Error('激活后找不到该 Bot。')
+        return activated
+      }
       if (current.definition.status === 'draft' && status !== 'deleted') {
         throw new Error('草稿必须先通过 8 位确认码激活；不需要的草稿可以直接删除。')
       }
@@ -2502,6 +3259,282 @@ export class BotGateway {
     this.localWebReplySessions.set(targetKey(LOCAL_WEB_TARGET), id)
     await this.rememberSessionTarget(id, LOCAL_WEB_TARGET)
     await this.ensureLocalWebOwnerTools(id)
+  }
+
+  /** Inject a Fleet / @mention / slash command into a registered owner DSH web session. */
+  public async dispatchOwnerWebCommand(sessionId: string, text: string): Promise<void> {
+    const id = sessionKey(sessionId)
+    if (!this.canRegisterOwnerWebSession(id)) throw new Error('无效的 DSH Web 会话，不能注入 Fleet 命令。')
+    await this.registerLocalWebOwnerSession(id)
+    const trimmed = text.trim()
+    if (trimmed === '') throw new Error('命令不能为空。')
+    await this.withDurableMutation(() => this.acceptOwnerWebInbound({
+      id: `local-web:cmd:${id}:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text: trimmed,
+      receivedAt: Date.now(),
+    }, id))
+  }
+
+  /** Trusted local-dashboard Bot task dispatch (no owner-session command injection). */
+  public async dispatchWebDashboardTask(to: string, instruction: string): Promise<{ taskId?: string; handle: string }> {
+    const handle = to.trim().replace(/^@/u, '').toLowerCase()
+    const text = instruction.trim()
+    if (handle === '' || text === '') throw new Error('Bot 和任务内容不能为空。')
+    const envelope = await this.sendBotMessage({
+      from: actorForTarget(LOCAL_WEB_TARGET),
+      to: handle,
+      instruction: text,
+      replyTarget: LOCAL_WEB_TARGET,
+      title: text.slice(0, 80),
+    })
+    return { handle, taskId: envelope.taskId }
+  }
+
+  /** Trusted local-dashboard Fleet auto-plan (no `/fleet` command injection). */
+  public async planWebDashboardTask(instruction: string): Promise<{ workflowId: string; taskId: string; status: string }> {
+    const text = instruction.trim()
+    if (text === '') throw new Error('任务内容不能为空。')
+    if (this.config.collaboration?.enabled === false) throw new Error('Bot Fleet 当前未启用，请先在本机设置页开启。')
+    if (this.config.collaboration?.autoPlanner === false) throw new Error('自动 Fleet Planner 当前未启用。')
+    const message: InboundMessage = {
+      id: `local-web:plan:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    return this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法创建 Fleet 计划（重复请求）。')
+      }
+      const sessionId = this.latestLocalWebOwnerSession() ?? 'local-web:dashboard'
+      const claimed = await this.wal.claim(accepted.item.id, sessionId)
+      if (!claimed) throw new Error('无法锁定 Fleet 计划。')
+      const plan = this.planner.plan(text, this.directory, LOCAL_WEB_TARGET, this.config.collaboration?.maxGroupBots ?? 6)
+      const plannedBots = [...new Set([
+        ...plan.workerBotIds,
+        ...(plan.verifierBotId === undefined ? [] : [plan.verifierBotId]),
+        plan.synthesizerBotId,
+      ])]
+      const workflow = await this.createFleetWorkflow(
+        message,
+        accepted.item.id,
+        actorForTarget(LOCAL_WEB_TARGET),
+        text,
+        plan,
+        this.requiresFleetApproval(plannedBots, true),
+      )
+      return { workflowId: workflow.id, taskId: workflow.taskId, status: workflow.status }
+    })
+  }
+
+  /** Trusted local-dashboard Team task (no owner-session @mention injection). */
+  public async dispatchWebDashboardTeamTask(teamId: string, instruction: string): Promise<{ teamId: string; taskId?: string; roomId?: string }> {
+    const reference = teamId.trim().replace(/^@/u, '')
+    const text = instruction.trim()
+    if (reference === '' || text === '') throw new Error('Team 和任务内容不能为空。')
+    const binding = await this.bindingForLocalWeb(LOCAL_WEB_TARGET)
+    if (binding === undefined) throw new Error('请先点「Owner 会话」，再给 Team 发任务。')
+    const message: InboundMessage = {
+      id: `local-web:team:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    let createdRoomId: string | undefined
+    await this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法发送 Team 任务（重复请求）。')
+      }
+      createdRoomId = await this.handleTeamMention(message, accepted.item.id, binding, reference, text)
+    })
+    return { teamId: reference, ...(createdRoomId === undefined ? {} : { roomId: createdRoomId }) }
+  }
+
+  /** Trusted local-dashboard Group Room continuation (no owner-session @mention injection). */
+  public async dispatchWebDashboardRoomTask(botIds: readonly string[], instruction: string): Promise<{ botIds: string[]; roomId?: string }> {
+    const ids = [...new Set(botIds.map(value => value.trim().replace(/^@/u, '').toLowerCase()).filter(Boolean))]
+    const text = instruction.trim()
+    if (ids.length === 0 || text === '') throw new Error('Bot 和任务内容不能为空。')
+    const binding = await this.bindingForLocalWeb(LOCAL_WEB_TARGET)
+    if (binding === undefined) throw new Error('请先点「Owner 会话」，再继续群聊协作。')
+    const message: InboundMessage = {
+      id: `local-web:room:${Date.now()}`,
+      target: LOCAL_WEB_TARGET,
+      text,
+      receivedAt: Date.now(),
+    }
+    let createdRoomId: string | undefined
+    await this.withDurableMutation(async () => {
+      const accepted = await this.wal.accept(message)
+      if (!accepted.inserted || accepted.item.state !== 'accepted') {
+        throw new Error('无法继续群聊协作（重复请求）。')
+      }
+      createdRoomId = await this.handleCollaborationRequest(message, accepted.item.id, binding, ids, text)
+    })
+    return { botIds: ids, ...(createdRoomId === undefined ? {} : { roomId: createdRoomId }) }
+  }
+
+  /** Trusted local-dashboard Group Room open: resolves the middle-column projection target. */
+  public async openWebDashboardRoom(roomId: string): Promise<{ sessionId: string; title: string; participants: string[]; closed: boolean }> {
+    const reference = roomId.trim()
+    if (reference === '') throw new Error('缺少群房间 ID。')
+    const room = await this.rooms.get(reference)
+    if (room === undefined) throw new Error('群房间不存在或已被清理。')
+    await this.projectRoomToSession(reference)
+    return {
+      sessionId: `hermes-group-${reference}`,
+      title: groupRoomTitle(room.participants),
+      participants: [...room.participants],
+      closed: room.closed,
+    }
+  }
+
+  /**
+   * Mirror unconsumed Group Room transcript lines into the middle-column
+   * `hermes-group-<roomId>` session. Append-only (never starts a turn) and
+   * idempotent via the monotonic `projectedCount` watermark, so the client
+   * can call it after creating the session to backfill history, and bot turn
+   * completions call it again to append only new lines.
+   */
+  private async projectRoomToSession(roomId: string): Promise<void> {
+    const room = await this.rooms.get(roomId)
+    if (room === undefined) return
+    // No session to deliver into yet; leave the watermark untouched so the
+    // next call (after the client creates hermes-group-<roomId>) projects it.
+    if (this.bridge === undefined) return
+    const projected = room.projectedCount ?? 0
+    if (room.messageCount <= projected) return
+    // `room.messages` is a fixed-window sliding buffer (maxMessages), so its
+    // array index does NOT equal the global message index. Map the watermark
+    // onto array space using the window's leading total-count offset.
+    const windowStart = room.messageCount - room.messages.length
+    const from = Math.max(projected, windowStart)
+    const messages = room.messages.slice(from - windowStart)
+    if (messages.length === 0) {
+      // Window has slid past the watermark; advance it so we never re-deliver.
+      if (projected < windowStart) await this.rooms.markProjected(roomId, windowStart)
+      return
+    }
+    const sessionId = `hermes-group-${roomId}`
+    let delivered = 0
+    for (const message of messages) {
+      const actor = message.from.startsWith('user:') ? 'user' : message.from
+      if (this.bridge.deliverGroupSessionMessage(sessionId as SessionId, `@${actor}：\n${message.text}`) === true) delivered += 1
+    }
+    const newWatermark = from + delivered
+    if (newWatermark > projected) await this.rooms.markProjected(roomId, newWatermark)
+  }
+
+  /** Trusted local-dashboard Cron: recurring Bot task, no slash commands. */
+  public async createWebDashboardRoutine(input: {
+    name: string
+    cron: string
+    timezone?: string
+    to: string
+    instruction: string
+  }): Promise<RoutineRecord> {
+    const name = input.name.trim()
+    const cron = input.cron.trim()
+    const to = input.to.trim().replace(/^@/u, '').toLowerCase()
+    const instruction = input.instruction.trim()
+    if (name === '' || cron === '' || to === '' || instruction === '') {
+      throw new Error('名称、时间表、Bot 和任务内容不能为空。')
+    }
+    if (!this.directory.canInvoke(to, LOCAL_WEB_TARGET)) {
+      throw new Error(`Bot @${to} 不存在或当前用户无权使用。`)
+    }
+    return this.createRoutine({
+      name,
+      ownerId: actorForTarget(LOCAL_WEB_TARGET),
+      workflowId: CRON_BOT_WORKFLOW_PREFIX + to,
+      cron,
+      timezone: input.timezone?.trim() || 'Asia/Shanghai',
+      inputs: { to, instruction },
+      replyTarget: LOCAL_WEB_TARGET,
+    })
+  }
+
+  /** Trusted local-dashboard Bot draft creation (no Feishu/Telegram binding required). */
+  public async createWebDashboardBotDraft(input: BotCreateDraftToolInput): Promise<BotCreateDraftToolResult> {
+    return this.createDynamicBotDraft(input, LOCAL_WEB_TARGET)
+  }
+
+  /**
+   * Trusted local-dashboard Bot archive edit. Works for both draft and active
+   * registry Bots owned by the local web owner; never requires `/bot edit`.
+   */
+  public async updateWebDashboardBot(input: {
+    readonly handle: string
+    readonly title?: string
+    readonly description?: string
+    readonly capabilities?: readonly string[]
+    readonly soul?: string
+    readonly role?: 'worker' | 'verifier' | 'synthesizer' | 'generalist'
+  }): Promise<{ botId: string; handle: string; version: number; status: string }> {
+    return this.withBotNamespaceMutation(async () => {
+      if (!this.anyBotCreationEnabled()) throw new Error('对话创建 Bot 尚未启用，请先在本机 Fleet 设置中开启。')
+      const actor = actorForTarget(LOCAL_WEB_TARGET)
+      const handle = input.handle.trim().replace(/^@/u, '').toLowerCase()
+      if (handle === '') throw new Error('Bot handle 不能为空。')
+      const entry = await this.registry.getByHandle(handle)
+      if (entry === undefined || entry.definition.source === 'config' || entry.definition.ownerId !== actor) {
+        throw new Error(`找不到当前用户的动态 Bot：@${handle}`)
+      }
+      if (entry.definition.status === 'deleted') throw new Error('已删除的 Bot 不能修改。')
+      const patch: Partial<BotRevisionDraft> = {
+        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(input.description === undefined ? {} : { description: input.description }),
+        ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
+        ...(input.soul === undefined ? {} : { soul: input.soul }),
+        ...(input.role === undefined ? {} : { fleetRole: input.role }),
+        changeSummary: 'Updated from the web dashboard',
+      }
+      if (Object.keys(patch).length === 1) throw new Error('至少要提供一个需要修改的 Bot 字段')
+      const revised = await this.registry.revise(entry.definition.id, patch, actor, entry.definition.version)
+      if (revised.definition.status === 'active') await this.refreshBotDirectory()
+      return {
+        botId: revised.definition.id,
+        handle: revised.definition.handle,
+        version: revised.definition.version,
+        status: revised.definition.status,
+      }
+    })
+  }
+
+  /** Trusted local-dashboard Team creation for the web BOTS panel. */
+  public async createWebDashboardTeam(name: string, memberBotIds: readonly string[]): Promise<TeamDefinition> {
+    const actor = actorForTarget(LOCAL_WEB_TARGET)
+    const members = [...new Set(memberBotIds.map(value => value.trim().toLowerCase()).filter(Boolean))]
+    if (name.trim() === '' || members.length === 0) throw new Error('Team 名称和成员不能为空。')
+    for (const botId of members) {
+      if (!this.directory.canInvoke(botId, LOCAL_WEB_TARGET)) {
+        throw new Error(`Bot @${botId} 不存在或当前用户无权使用。`)
+      }
+    }
+    const existing = (await this.teams.listTeams({ actorId: actor }))
+      .find(team => team.status === 'active' && team.name === name.trim() && sameBotSet(team.memberBotIds, members))
+    if (existing !== undefined) return existing
+    return this.teams.createTeam({
+      name: name.trim(),
+      scope: 'user',
+      ownerId: actor,
+      memberBotIds: members,
+      maxConcurrency: Math.min(3, members.length),
+    }, actor)
+  }
+
+  /** Trusted local-dashboard Team deletion (soft-delete; keeps the durable record). */
+  public async deleteWebDashboardTeam(teamId: string): Promise<void> {
+    const actor = actorForTarget(LOCAL_WEB_TARGET)
+    const id = teamId.trim()
+    if (id === '') throw new Error('缺少 Team。')
+    const team = await this.teams.getTeam(id)
+    if (team === undefined || team.ownerId !== actor) throw new Error('找不到这个 Team。')
+    if (team.status === 'deleted') return
+    await this.teams.updateTeam(team.id, { status: 'deleted' }, actor, team.version)
   }
 
   private latestLocalWebOwnerSession(): string | undefined {
@@ -2831,6 +3864,7 @@ export class BotGateway {
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, actor)
         await this.rooms.append(room.id, source.createdBy, source.instruction)
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('could not reserve replay Group Room turn')
         botId = first.botId
@@ -2869,7 +3903,11 @@ export class BotGateway {
   }
 
   private canManageTask(task: TaskRecord, actor: string): boolean {
-    return actor === 'local-dashboard' || actor === 'local-admin' || task.createdBy === actor
+    const managerBotId = (this.config.collaboration?.managerBotId ?? 'manager').trim().toLowerCase()
+    return actor === 'local-dashboard'
+      || actor === 'local-admin'
+      || actor === managerBotId
+      || task.createdBy === actor
   }
 
   /** Start a short-lived, local-UI-driven identity discovery flow. */
@@ -3484,11 +4522,12 @@ export class BotGateway {
     binding: ChatBinding,
     teamReference: string,
     instruction: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const claimed = await this.wal.claim(walId, binding.sessionId)
-    if (!claimed) return
+    if (!claimed) return undefined
     const requester = actorForTarget(message.target)
     let createdTaskId: string | undefined
+    let createdRoomId: string | undefined
     let threadId: string | undefined
     try {
       const route = await this.teamRouter.resolve({
@@ -3514,7 +4553,7 @@ export class BotGateway {
           taskId: workflow.taskId,
           memberBotIds: route.participantBotIds,
         }, thread.contextId)
-        return
+        return undefined
       }
 
       const task = await this.tasks.createTask({
@@ -3534,9 +4573,11 @@ export class BotGateway {
       if (route.participantBotIds.length > 1) {
         const room = await this.rooms.open(message.target, task.id, route.participantBotIds)
         roomId = room.id
+        createdRoomId = room.id
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, requester)
         await this.rooms.append(room.id, requester, instruction || '请根据当前 Team 上下文协作处理。')
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('无法为 Team Room 保留第一轮')
         assignedBot = first.botId
@@ -3589,7 +4630,7 @@ export class BotGateway {
       const suffix = skipped.length > 0
         ? ` 未路由成员：${skipped.map(botId => '@' + botId).join('、')}。`
         : ''
-      await this.sendText(
+      await this.sendAck(
         message.target,
         roomId === undefined
           ? `已将 Team ${route.team.name} 的任务交给 ${route.participantBotIds.map(botId => '@' + botId).join('、')}。任务 ID：${task.id}。${suffix}`
@@ -3598,6 +4639,7 @@ export class BotGateway {
       )
       await this.wal.complete(walId)
       void this.drainCollaboration().catch(error => this.log('warn', 'Team Router dispatch failed: ' + String(error)))
+      return createdRoomId
     } catch (error: unknown) {
       if (threadId !== undefined) await this.setTeamThreadStatus(threadId, 'cancelled')
       if (createdTaskId !== undefined) {
@@ -3615,6 +4657,7 @@ export class BotGateway {
         'team-error:' + message.id,
       )
     }
+    return undefined
   }
 
   private async setTeamThreadStatus(threadId: string, status: 'completed' | 'cancelled'): Promise<void> {
@@ -3680,23 +4723,24 @@ export class BotGateway {
     binding: ChatBinding,
     botIds: readonly string[],
     instruction: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
+    let createdRoomId: string | undefined
     const validBots = botIds.filter(botId => this.directory.get(botId)?.enabled && this.directory.canInvoke(botId, message.target))
-    if (!validBots.length) return
+    if (!validBots.length) return undefined
     try {
       const claimed = await this.wal.claim(walId, binding.sessionId)
-      if (!claimed) return
+      if (!claimed) return undefined
       const from = `user:${message.target.platform}:${message.target.userId ?? message.target.chatId}`
       const denied = botIds.filter(botId => !validBots.includes(botId))
       if (denied.length > 0) {
         await this.sendText(message.target, `以下 Bot 没有对你或当前聊天授权：${denied.map(botId => '@' + botId).join('、')}`, `mesh-denied:${message.id}`)
         await this.wal.complete(walId)
-        return
+        return undefined
       }
       if (this.requiresFleetApproval(validBots, false)) {
         const plan = this.planForExplicitBots(validBots)
         await this.createFleetWorkflow(message, walId, from, instruction, plan, true)
-        return
+        return undefined
       }
       const task = await this.tasks.createTask({
         title: instruction,
@@ -3712,9 +4756,11 @@ export class BotGateway {
       if (validBots.length > 1) {
         const room = await this.rooms.open(message.target, task.id, validBots)
         roomId = room.id
+        createdRoomId = room.id
         roomEpoch = room.epoch
         await this.tasks.attachRoom(task.id, room.id, from)
         await this.rooms.append(room.id, from, instruction)
+        await this.projectRoomToSession(room.id)
         const first = await this.rooms.reserveNext(room.id)
         if (!first) throw new Error('could not reserve the first Group Room turn')
         assignedBot = first.botId
@@ -3752,7 +4798,7 @@ export class BotGateway {
         roomId: roomId ?? null,
       }, envelope.correlationId)
       const label = validBots.map(botId => `@${botId}`).join('、')
-      await this.sendText(
+      await this.sendAck(
         message.target,
         roomId === undefined
           ? `已将任务交给 ${label}。任务 ID：${task.id}`
@@ -3761,6 +4807,7 @@ export class BotGateway {
       )
       await this.wal.complete(walId)
       void this.drainCollaboration().catch(error => this.log('warn', `Bot collaboration dispatch failed: ${String(error)}`))
+      return createdRoomId
     } catch (error: unknown) {
       await this.handleInboundFailure(
         message,
@@ -3771,6 +4818,7 @@ export class BotGateway {
         `mesh-error:${message.id}`,
       )
     }
+    return undefined
   }
 
   private requiresFleetApproval(botIds: readonly string[], autoPlanned: boolean): boolean {
@@ -4115,6 +5163,7 @@ export class BotGateway {
       return
     }
     if (approval.kind === 'workflow') {
+      if (await this.resolveCompiledWorkflowApproval(approval, resolutionActor)) return
       const workflow = await this.tasks.workflow(approval.entityId)
       if (!workflow) return
       if (approval.status === 'rejected' || approval.status === 'expired') {
@@ -4259,6 +5308,54 @@ export class BotGateway {
     }
   }
 
+  /** Periodically stop direct-chat Agent sessions that have been idle too long. */
+  private scheduleNextIdleReap(): void {
+    if (this.stopped) return
+    const timeoutMs = Math.max(1_000, Math.floor(this.config.collaboration?.sessionIdleTimeoutMs ?? 0))
+    if (timeoutMs <= 0 || this.idleReapTimer !== undefined) return
+    const checkMs = Math.max(100, Math.floor(this.config.collaboration?.sessionIdleCheckMs ?? 30_000))
+    this.idleReapTimer = setTimeout(() => {
+      this.idleReapTimer = undefined
+      void this.reapIdleSessions().catch(error => {
+        if (!this.stopped) this.log('warn', `idle session reaping failed: ${String(error)}`)
+      })
+    }, checkMs)
+    this.idleReapTimer.unref?.()
+  }
+
+  private async reapIdleSessions(): Promise<void> {
+    if (this.stopped) return
+    const timeoutMs = Math.max(1_000, Math.floor(this.config.collaboration?.sessionIdleTimeoutMs ?? 0))
+    if (timeoutMs <= 0) return
+    const cutoff = Date.now() - timeoutMs
+    const pendingWal = await this.wal.pending()
+    const busySessionIds = new Set(
+      pendingWal.map(item => item.sessionId).filter((value): value is string => typeof value === 'string'),
+    )
+    const activeRuns = new Set(this.internalRunBySession.keys())
+    for (const [sessionId, lastActiveAt] of [...this.sessionActivity.entries()]) {
+      // Group Room sessions are long-lived middle-column projections, not
+      // worker runtimes; idle reaping must never kill them.
+      if (String(sessionId).startsWith('hermes-group-')) continue
+      if (lastActiveAt > cutoff || busySessionIds.has(sessionId) || activeRuns.has(sessionId)) continue
+      if (this.reapedSessions.has(sessionId)) continue
+      const agent = this.bridge?.getAgent(sessionId as SessionId)
+      if (!agent) {
+        this.sessionActivity.delete(sessionId)
+        this.reapedSessions.add(sessionId)
+        continue
+      }
+      this.bridge?.stop(agent)
+      this.reapedSessions.add(sessionId)
+      this.sessionActivity.delete(sessionId)
+      await this.tasks.audit('run', sessionId, 'system', 'session.idle_reaped', {
+        idleMs: Date.now() - lastActiveAt,
+        timeoutMs,
+      }, sessionId)
+    }
+    this.scheduleNextIdleReap()
+  }
+
   private dispatchHandoff(handoff: HandoffRecord): Promise<void> {
     return this.withRunLock(handoff.runId, () => this.dispatchHandoffLocked(handoff))
   }
@@ -4359,10 +5456,29 @@ export class BotGateway {
       }
       const parallelLimit = Math.max(1, Math.min(6, Math.floor(this.config.collaboration?.maxParallelRuns ?? 6)))
       if (this.activeBotRuns.size >= parallelLimit) return
+      const perUserMax = Math.max(0, Math.floor(this.config.collaboration?.perUserMaxRuns ?? 0))
+      let requesterActive: Map<string, number> | undefined
+      if (perUserMax > 0) {
+        requesterActive = new Map()
+        for (const item of await this.mailbox.snapshot()) {
+          // Only in-flight deliveries consume a requester's quota; queued items
+          // wait for a slot instead of deadlocking the user out.
+          if (item.state !== 'claimed' && item.state !== 'acknowledged' && item.state !== 'running') continue
+          const requester = typeof item.envelope.payload.requester === 'string' ? item.envelope.payload.requester : undefined
+          if (requester === undefined || requester === '') continue
+          requesterActive.set(requester, (requesterActive.get(requester) ?? 0) + 1)
+        }
+      }
       const lease = await this.mailbox.claim(
         this.runnableBotIds(),
         this.collaborationWorkerId,
         new Set(this.activeBotRuns.keys()),
+        Date.now(),
+        requesterActive === undefined ? undefined : (item) => {
+          const requester = typeof item.envelope.payload.requester === 'string' ? item.envelope.payload.requester : undefined
+          if (requester === undefined || requester === '') return true
+          return (requesterActive.get(requester) ?? 0) < perUserMax
+        },
       )
       if (!lease) {
         await this.scheduleNextCollaborationWake()
@@ -4508,7 +5624,9 @@ export class BotGateway {
         }
         return
       }
-      const error = result.status === 'cancelled' ? 'External runtime request cancelled' : 'External runtime request failed'
+      const error = result.status === 'cancelled'
+        ? 'External runtime request cancelled'
+        : (typeof result.text === 'string' && result.text.trim() !== '' ? result.text : 'External runtime request failed')
       try {
         await this.withDurableMutation(() => this.finishInternalRun(internal.runId, undefined, error))
       } catch (finishError: unknown) {
@@ -4770,13 +5888,20 @@ export class BotGateway {
     if (!internal) return
     if (error !== undefined) {
       const currentRun = await this.tasks.run(runId)
-      const maxAttempts = Math.max(1, Math.min(10, Math.floor(this.config.collaboration?.botRunMaxAttempts ?? 3)))
+      const nodeRetrySpec = await this.workflowRetrySpecForPayload(internal.envelope.payload)
+      const maxAttempts = nodeRetrySpec !== undefined
+        ? Math.max(1, Math.floor(nodeRetrySpec.maxAttempts))
+        : Math.max(1, Math.min(10, Math.floor(this.config.collaboration?.botRunMaxAttempts ?? 3)))
       const retrying = currentRun !== undefined
         && currentRun.attempt < maxAttempts
         && (internal.envelope.expiresAt === undefined || internal.envelope.expiresAt > Date.now())
+      const exhaustedByNode = nodeRetrySpec !== undefined && currentRun !== undefined && currentRun.attempt >= maxAttempts
+      const failureError = exhaustedByNode
+        ? new Error('Workflow node exhausted ' + maxAttempts + ' retries: ' + String(error))
+        : error
       const failed = retrying
-        ? await this.mailbox.fail(internal.lease, error, false)
-        : await this.mailbox.deadLetter(internal.lease, error)
+        ? await this.mailbox.fail(internal.lease, failureError, false)
+        : await this.mailbox.deadLetter(internal.lease, failureError)
       if (!failed) {
         await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.stale_failure', {
           taskId: internal.envelope.taskId,
@@ -4785,7 +5910,7 @@ export class BotGateway {
         void this.drainCollaboration().catch(nextError => this.log('warn', `stale failure recovery failed: ${String(nextError)}`))
         return
       }
-      await this.tasks.failRun(runId, error, !retrying && currentRun?.workflowId === undefined)
+      await this.tasks.failRun(runId, failureError, !retrying && currentRun?.workflowId === undefined)
       this.cleanupInternalRun(internal)
       if (retrying && currentRun) {
         const budgetError = await this.compiledWorkflowRetryBudgetError(internal.envelope, currentRun)
@@ -4842,7 +5967,10 @@ export class BotGateway {
               ...(internal.envelope.expiresAt === undefined ? {} : { expiresAt: internal.envelope.expiresAt }),
               payload: { ...internal.envelope.payload },
             })
-          const availableAt = Date.now() + this.botRunRetryDelay(currentRun.attempt)
+          const delay = nodeRetrySpec !== undefined && nodeRetrySpec.backoffMs !== undefined
+            ? Math.max(0, Math.floor(nodeRetrySpec.backoffMs))
+            : this.botRunRetryDelay(currentRun.attempt)
+          const availableAt = Date.now() + delay
           await this.mailbox.enqueue(retryEnvelope, retryIdempotencyKey, availableAt)
           await this.tasks.audit('message', retryEnvelope.id, internal.botId, 'message.retry_queued', {
             previousRunId: currentRun.id,
@@ -4859,8 +5987,21 @@ export class BotGateway {
         return
       }
       if (typeof internal.envelope.payload.workflowDefinitionId === 'string') {
-        await this.failCompiledWorkflow(internal, error)
+        await this.failCompiledWorkflow(internal, failureError)
         void this.drainCollaboration().catch(nextError => this.log('warn', `Compiled Workflow failure drain failed: ${String(nextError)}`))
+        return
+      }
+      if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
+        await this.sendRemoteResult(internal, String(failureError), 'failed').catch(reportError => {
+          this.log('warn', 'remote failure report failed: ' + String(reportError))
+        })
+        await this.tasks.audit('message', internal.envelope.id, internal.botId, 'message.remote_failure_reported', {
+          taskId: internal.envelope.taskId,
+          remoteSourceNodeId: internal.envelope.payload.__dshRemoteSourceNodeId,
+          error: String(failureError).slice(0, 500),
+        }, internal.envelope.correlationId)
+        this.cleanupInternalRun(internal)
+        void this.drainCollaboration().catch(nextError => this.log('warn', `Remote failure continuation failed: ${String(nextError)}`))
         return
       }
       if (typeof internal.envelope.payload.__dshRemoteSourceNodeId === 'string') {
@@ -4975,6 +6116,7 @@ export class BotGateway {
     const handoffId = typeof internal.envelope.payload.handoffId === 'string' ? internal.envelope.payload.handoffId : undefined
     if (roomId) {
       await this.rooms.append(roomId, internal.botId, result)
+      await this.projectRoomToSession(roomId)
       const next = await this.rooms.reserveNext(roomId)
       const currentRun = await this.tasks.run(runId)
       if (next && currentRun) {
@@ -5242,6 +6384,79 @@ export class BotGateway {
     return true
   }
 
+  /** Wake a compiled Workflow after a retry backoff or node timeout elapses. */
+  private scheduleWorkflowWake(input: {
+    readonly definition: WorkflowDefinition
+    readonly workflowRunId: string
+    readonly rootTaskId: string
+    readonly requester: string
+    readonly replyTarget: BotTarget
+    readonly correlationId: string
+  }, root: TaskRecord, delayMs: number): void {
+    if (this.stopped) return
+    const timer = setTimeout(() => {
+      this.workflowWakeTimers.delete(timer)
+      if (this.stopped) return
+      void this.advanceCompiledWorkflowState({ ...input, latestOutput: '' })
+        .catch(error => this.log('warn', 'workflow wake failed: ' + String(error)))
+        .finally(() => {
+          void this.drainCollaboration().catch(error => this.log('warn', 'workflow wake drain failed: ' + String(error)))
+        })
+    }, Math.max(50, delayMs))
+    this.workflowWakeTimers.add(timer)
+    timer.unref?.()
+  }
+
+  /** Resolve an approval gate on a compiled Workflow node; false when not one. */
+  private async resolveCompiledWorkflowApproval(approval: FleetApprovalRecord, resolutionActor: string): Promise<boolean> {
+    const parsed = parseWorkflowApprovalEntityId(approval.entityId)
+    if (!parsed) return false
+    const snapshot = await this.tasks.snapshot()
+    const controlTask = snapshot.tasks.find(task => (
+      task.workflowRunId === parsed.workflowRunId && task.workflowNodeId === parsed.nodeId
+    ))
+    if (!controlTask) return true
+    if (approval.status === 'rejected' || approval.status === 'expired') {
+      await this.tasks.failTask(
+        controlTask.id,
+        approval.status === 'expired' ? 'Workflow 审批已过期' : 'Workflow 审批未获批准',
+        resolutionActor,
+      )
+    } else if (approval.status === 'approved') {
+      await this.tasks.completeTask(
+        controlTask.id,
+        serializeWorkflowResult({ approved: true, approvedBy: resolutionActor, at: Date.now() }),
+        'workflow-runtime',
+      )
+    }
+    await this.tasks.audit('workflow', controlTask.workflowDefinitionId ?? parsed.nodeId, resolutionActor, 'workflow.approval_resolved', {
+      workflowRunId: parsed.workflowRunId,
+      nodeId: parsed.nodeId,
+      status: approval.status,
+      approvalId: approval.id,
+    }, controlTask.workflowTraceId ?? parsed.workflowRunId)
+    const root = snapshot.tasks.find(task => (
+      task.workflowRunId === parsed.workflowRunId && task.workflowNodeId === '__root__'
+    ))
+    if (root && root.status !== 'completed' && root.status !== 'failed' && root.status !== 'cancelled') {
+      const definition = await this.getPinnedWorkflowDefinition(root)
+      const replyTarget = root.workflowReplyTarget
+      if (definition && replyTarget) {
+        await this.advanceCompiledWorkflowState({
+          definition,
+          workflowRunId: parsed.workflowRunId,
+          rootTaskId: root.id,
+          requester: root.createdBy,
+          replyTarget,
+          correlationId: root.workflowTraceId ?? 'workflow:' + root.workflowDefinitionId,
+          latestOutput: '',
+        })
+        void this.drainCollaboration().catch(error => this.log('warn', 'workflow approval drain failed: ' + String(error)))
+      }
+    }
+    return true
+  }
+
   private async advanceCompiledWorkflowState(input: {
     readonly definition: WorkflowDefinition
     readonly workflowRunId: string
@@ -5257,6 +6472,11 @@ export class BotGateway {
       const compensationState = asRecord(root.workflowInputs?.__dshWorkflowCompensation)
       if (compensationState.active === true) {
         await this.advanceCompiledWorkflowCompensationLocked(input, root, compensationState)
+        return
+      }
+      const workflowDeadline = root.workflowInputs?.__dshWorkflowDeadline
+      if (typeof workflowDeadline === 'number' && Date.now() > workflowDeadline) {
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow deadline exceeded after ' + (Date.now() - workflowDeadline) + 'ms')
         return
       }
       const plan = compileWorkflowLaunch(input.definition)
@@ -5325,6 +6545,8 @@ export class BotGateway {
         controlProgress = false
         for (const control of plan.nodes.filter(node => (
           node.kind === 'condition' || node.kind === 'map' || node.kind === 'reduce'
+          || node.kind === 'approval' || node.kind === 'sequential' || node.kind === 'parallel'
+          || node.kind === 'retry' || node.kind === 'timeout' || node.kind === 'compensation'
         ))) {
           if (isCompleted(control.nodeId)) continue
           if (!control.dependsOn.every(isCompleted)) continue
@@ -5381,6 +6603,72 @@ export class BotGateway {
               nodeId: control.nodeId,
               reducer: definitionNode.reduce.reducer,
             }, input.correlationId)
+            controlProgress = true
+            continue
+          }
+
+          if (control.kind === 'approval') {
+            if (definitionNode.approval === undefined) throw new Error('Approval node is missing its approval specification: ' + control.nodeId)
+            let approvalTask = taskByNode.get(control.nodeId)
+            if (approvalTask === undefined) {
+              approvalTask = await this.tasks.createTask({
+                title: input.definition.name + ': ' + definitionNode.label,
+                instruction: 'Gate Workflow approval ' + control.nodeId,
+                createdBy: input.requester,
+                assignedTo: 'workflow',
+                workflowDefinitionId: input.definition.id,
+                workflowRevision: input.definition.revision,
+                workflowRunId: input.workflowRunId,
+                workflowNodeId: control.nodeId,
+                workflowReplyTarget: input.replyTarget,
+                workflowTraceId: input.correlationId,
+                ...(root.workflowInputs === undefined ? {} : { workflowInputs: root.workflowInputs }),
+              })
+              taskByNode.set(control.nodeId, approvalTask)
+            }
+            if (approvalTask.status === 'failed' || approvalTask.status === 'cancelled') continue
+            if (approvalTask.status === 'completed') {
+              workflowOutputs.set(control.nodeId, parseWorkflowResult(approvalTask.result))
+              continue
+            }
+            const entityId = workflowApprovalEntityId(input.workflowRunId, control.nodeId)
+            const pendingApproval = (await this.approvals.snapshot()).find(approval => (
+              approval.kind === 'workflow' && approval.entityId === entityId && approval.status === 'pending'
+            ))
+            if (pendingApproval === undefined) {
+              const approval = await this.approvals.create({
+                kind: 'workflow',
+                requestedBy: input.requester,
+                summary: 'Workflow ' + input.definition.name + ' 需要审批：' + (definitionNode.approval.reason || definitionNode.label),
+                entityId,
+                ...(this.config.collaboration?.approvalTtlMs === undefined ? {} : { ttlMs: this.config.collaboration.approvalTtlMs }),
+              })
+              await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.approval_required', {
+                workflowRunId: input.workflowRunId,
+                nodeId: control.nodeId,
+                approvalCode: approval.code,
+                risk: definitionNode.approval.risk,
+              }, input.correlationId)
+              this.scheduleApprovalExpiry(approval.expiresAt)
+              await this.sendText(
+                input.replyTarget,
+                'Workflow ' + input.definition.name + ' 需要审批：' + (definitionNode.approval.reason || definitionNode.label) + '\n审批码：' + approval.code,
+                'workflow-approval:' + input.workflowRunId + ':' + control.nodeId,
+              )
+            }
+            continue
+          }
+
+          if (control.kind === 'sequential' || control.kind === 'parallel' || control.kind === 'retry' || control.kind === 'timeout' || control.kind === 'compensation') {
+            // Structural pass-through: the container is a grouping marker whose
+            // own completion depends only on its declared dependencies. Ordering
+            // of the children is expressed by the edges the author wired.
+            const containerTask = await ensureControlTask(
+              control.nodeId,
+              serializeWorkflowResult({ expanded: true, childCount: (definitionNode.children ?? []).length, kind: control.kind }),
+              'Expand Workflow container ' + control.nodeId,
+            )
+            taskByNode.set(control.nodeId, containerTask)
             controlProgress = true
             continue
           }
@@ -5468,9 +6756,28 @@ export class BotGateway {
       }
 
       const taskNodes = plan.nodes.filter(node => node.kind === 'task' && !mapTemplateIds.has(node.nodeId))
-      const controlNodes = plan.nodes.filter(node => (
-        node.kind === 'condition' || node.kind === 'map' || node.kind === 'reduce'
-      ))
+      const handledControlKinds = new Set([
+        'condition', 'map', 'reduce', 'approval',
+        'sequential', 'parallel', 'retry', 'timeout', 'compensation',
+      ])
+      const controlNodes = plan.nodes.filter(node => handledControlKinds.has(node.kind))
+      // Enforce per-node timeouts before evaluating failures.
+      for (const node of taskNodes) {
+        const definitionNode = definitionById.get(node.nodeId)
+        const timeoutSpec = definitionNode?.timeout
+        if (timeoutSpec === undefined) continue
+        const task = taskByNode.get(node.nodeId)
+        if (!task || !['pending', 'running', 'waiting'].includes(task.status)) continue
+        const timeoutMs = Math.max(1_000, Math.floor(timeoutSpec.timeoutMs))
+        if (Date.now() - task.createdAt <= timeoutMs) continue
+        const failed = await this.tasks.failTask(task.id, 'Workflow node timed out after ' + timeoutMs + 'ms: ' + node.nodeId, 'workflow-runtime')
+        if (failed) taskByNode.set(node.nodeId, failed)
+        await this.tasks.audit('workflow', input.definition.id, 'workflow-runtime', 'workflow.node_timed_out', {
+          workflowRunId: input.workflowRunId,
+          nodeId: node.nodeId,
+          timeoutMs,
+        }, input.correlationId)
+      }
       const failedNode = taskNodes.find(node => {
         const task = taskByNode.get(node.nodeId)
         return task?.status === 'failed' || task?.status === 'cancelled'
@@ -5480,13 +6787,19 @@ export class BotGateway {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow node ' + failedNode.nodeId + ' failed: ' + (task?.error ?? task?.status ?? 'unknown'))
         return
       }
+      const failedControl = controlNodes.find(node => {
+        const task = taskByNode.get(node.nodeId)
+        return task?.status === 'failed' || task?.status === 'cancelled'
+      })
+      if (failedControl) {
+        const task = taskByNode.get(failedControl.nodeId)
+        await this.markCompiledWorkflowFailedLocked(input, 'Workflow control node ' + failedControl.nodeId + ' ' + (task?.status ?? 'failed') + ': ' + (task?.error ?? ''))
+        return
+      }
       const allTasksCompleted = taskNodes.length > 0 && taskNodes.every(node => isCompleted(node.nodeId))
       const allControlsCompleted = controlNodes.every(node => isCompleted(node.nodeId))
       const unsupportedNodes = plan.nodes.filter(node => (
-        node.kind !== 'task'
-        && node.kind !== 'condition'
-        && node.kind !== 'map'
-        && node.kind !== 'reduce'
+        node.kind !== 'task' && !handledControlKinds.has(node.kind)
       ))
       if (allTasksCompleted && allControlsCompleted && unsupportedNodes.length > 0) {
         await this.markCompiledWorkflowFailedLocked(input, 'Workflow control nodes require a runtime adapter: ' + unsupportedNodes.map(node => node.nodeId).join(', '))
@@ -5587,7 +6900,13 @@ export class BotGateway {
       })
       if (ready.length === 0) {
         if (activeCount === 0) {
-          await this.markCompiledWorkflowFailedLocked(input, 'Workflow is blocked by an unresolved dependency or unsupported control node')
+          const waitingOnControl = controlNodes.some(node => {
+            const task = taskByNode.get(node.nodeId)
+            return task !== undefined && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+          })
+          if (!waitingOnControl) {
+            await this.markCompiledWorkflowFailedLocked(input, 'Workflow is blocked by an unresolved dependency or unsupported control node')
+          }
         }
         return
       }
@@ -5750,6 +7069,17 @@ export class BotGateway {
     const base = Math.max(50, this.config.collaboration?.mailboxRetryBaseMs ?? 1_000)
     const maximum = Math.max(base, this.config.collaboration?.mailboxRetryMaxMs ?? 60_000)
     return Math.min(maximum, base * 2 ** Math.max(0, attempt - 1))
+  }
+
+  /** Resolve the retry-node policy for a compiled Workflow delivery payload. */
+  private async workflowRetrySpecForPayload(payload: Readonly<Record<string, unknown>>): Promise<WorkflowRetrySpec | undefined> {
+    const rootTaskId = typeof payload.workflowRootTaskId === 'string' ? payload.workflowRootTaskId : undefined
+    const nodeId = typeof payload.workflowNodeId === 'string' ? payload.workflowNodeId : undefined
+    if (!rootTaskId || !nodeId) return undefined
+    const root = await this.tasks.task(rootTaskId)
+    if (!root) return undefined
+    const definition = await this.getPinnedWorkflowDefinition(root)
+    return definition?.nodes.find(node => node.id === nodeId)?.retry
   }
 
   private async compiledWorkflowRetryBudgetError(
@@ -6156,7 +7486,7 @@ export class BotGateway {
     name: string,
     args: string,
   ): Promise<boolean> {
-    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines'].includes(name)) return false
+    if (!['new', 'reset', 'stop', 'status', 'help', 'bots', 'bot', 'model', 'mesh', 'fleet', 'teams', 'team', 'tasks', 'task', 'cancel', 'replay', 'approvals', 'approve', 'reject', 'routine', 'routines', 'workflow', 'wf', 'ask', 'manager'].includes(name)) return false
     if (name === 'help') {
       await this.completeWithText(message, walId, binding, formatHelp())
       return true
@@ -6328,6 +7658,161 @@ export class BotGateway {
         )
       } catch (error: unknown) {
         await this.completeWithText(message, walId, binding, 'Routine 操作失败：' + (error instanceof Error ? error.message : String(error)))
+      }
+      return true
+    }
+    if (name === 'workflow' || name === 'wf') {
+      const actor = actorForTarget(message.target)
+      const parts = args.trim().split(/\s+/u).filter(Boolean)
+      const action = (parts[0] ?? 'list').toLowerCase()
+      try {
+        if (action === 'list') {
+          const workflows = await this.listWorkflowDefinitions(actor)
+          const rows = workflows.slice(0, 20).map(workflow => (
+            workflow.id + ' · ' + workflow.status + ' · r' + workflow.revision
+              + ' · ' + workflow.name + ' · ' + workflow.nodes.length + ' 节点'
+          ))
+          await this.completeWithText(message, walId, binding, rows.length
+            ? '已保存的 Workflow：\n' + rows.join('\n')
+            : '当前没有已保存的 Workflow。')
+          return true
+        }
+        if (action === 'run') {
+          const workflowId = parts[1] ?? ''
+          const workflow = await this.getWorkflowDefinition(workflowId, actor)
+          if (workflow === undefined) throw new Error('Workflow 不存在，或当前用户不可见：' + workflowId)
+          let inputs: Record<string, unknown> = {}
+          const json = args.slice('run'.length).trim().replace(workflowId, '').trim()
+          if (json !== '') {
+            const parsed: unknown = JSON.parse(json)
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error('JSON输入必须是对象')
+            }
+            inputs = parsed as Record<string, unknown>
+          }
+          const launch = await this.launchWorkflowDefinition(workflow.id, actor, message.target, actor, {
+            launchId: 'chat:' + Date.now() + ':' + workflow.id,
+            inputs,
+          })
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            '已启动 Workflow：' + workflow.name + '\nRoot 任务：' + launch.rootTaskId + '\n已分发节点：' + launch.dispatched.length,
+          )
+          return true
+        }
+        if (action === 'stop') {
+          const workflowId = parts[1] ?? ''
+          const snapshot = await this.tasks.snapshot()
+          const roots = snapshot.tasks.filter(task => (
+            task.workflowDefinitionId === workflowId
+            && task.workflowNodeId === '__root__'
+            && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
+          ))
+          let cancelled = 0
+          for (const root of roots) {
+            const stopped = await this.cancelFleetTaskUnlocked(root.id, actor)
+            if (stopped !== undefined) cancelled += 1
+          }
+          await this.completeWithText(message, walId, binding, cancelled > 0 ? '已停止 ' + cancelled + ' 个运行中的 Workflow 实例。' : '没有找到运行中的 Workflow 实例。')
+          return true
+        }
+        if (action === 'export') {
+          const workflowId = parts[1] ?? ''
+          if (workflowId === '') throw new Error('缺少 Workflow ID。')
+          const manifest = await this.exportWorkflowManifest(workflowId, actor)
+          await this.completeWithText(
+            message,
+            walId,
+            binding,
+            'Workflow 清单（可 /wf import 到本机或其他节点）：\n' + JSON.stringify(manifest).slice(0, 30_000),
+          )
+          return true
+        }
+        if (action === 'import') {
+          const json = args.slice('import'.length).trim()
+          if (json === '') throw new Error('缺少 Workflow 清单 JSON。')
+          const parsed: unknown = JSON.parse(json)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('清单必须是对象')
+          const imported = await this.importWorkflowManifest(parsed as WorkflowManifest, actor)
+          await this.completeWithText(message, walId, binding, '已导入 Workflow：' + imported.id + ' · ' + imported.name + ' · v' + imported.revision)
+          return true
+        }
+        await this.completeWithText(message, walId, binding, '用法：/wf list | /wf run <id> [JSON输入] | /wf stop <id> | /wf export <id> | /wf import <清单JSON>')
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, 'Workflow 操作失败：' + (error instanceof Error ? error.message : String(error)))
+      }
+      return true
+    }
+    if (name === 'ask') {
+      const actor = actorForTarget(message.target)
+      const targets = [...new Set(
+        [...args.matchAll(/@([a-z0-9][a-z0-9_-]*)/giu)].map(match => String(match[1]).toLowerCase()),
+      )]
+      const question = args.replace(/@[a-z0-9][a-z0-9_-]*/giu, '').trim()
+      if (targets.length === 0 || question === '') {
+        await this.completeWithText(message, walId, binding, '用法：/ask @bot <问题>。可同时 @多个 Bot 扇出提问。例如 /ask @analyst @researcher 帮我交叉验证这组数据。')
+        return true
+      }
+      for (const botId of targets) {
+        const bot = this.directory.get(botId)
+        const remote = bot === undefined ? this.remoteRouteForBot(botId) : undefined
+        if (!bot && remote === undefined) {
+          await this.completeWithText(message, walId, binding, '没有找到这个 Bot：' + botId)
+          return true
+        }
+      }
+      try {
+        const ask = await this.botAsk({
+          from: actor,
+          to: targets,
+          question,
+          replyTarget: message.target,
+        })
+        await this.completeWithText(message, walId, binding, '已向 ' + targets.map(id => '@' + id).join('、') + ' 提问。askId：' + ask.askId)
+        void this.botWait(ask.askId, { timeoutMs: 60_000, pollMs: 300 }).then(async result => {
+          if (result.status === 'answered') {
+            const answer = result.replies.map(reply => '@' + reply.from + '：\n' + reply.text).join('\n\n')
+            await this.sendText(message.target, '回答 ' + ask.askId + '：\n' + answer, 'ask-answer:' + ask.askId)
+          } else {
+            await this.sendText(message.target, '问题 ' + ask.askId + ' 未在时限内得到回复（' + result.status + '）。', 'ask-timeout:' + ask.askId)
+          }
+        }).catch(error => this.log('warn', 'bot ask answer delivery failed: ' + String(error)))
+        return true
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, '提问失败：' + (error instanceof Error ? error.message : String(error)))
+        return true
+      }
+    }
+    if (name === 'manager') {
+      const action = (args.trim().split(/\s+/u)[0] ?? 'status').toLowerCase()
+      try {
+        if (action === 'status') {
+          const observation = await this.managerObserve({ maxBots: 30 })
+          const counts = {
+            available: observation.bots.filter(bot => bot.status === 'available').length,
+            busy: observation.bots.filter(bot => bot.status === 'busy').length,
+            failed: observation.bots.filter(bot => bot.status === 'failed' || bot.status === 'timeout').length,
+            unavailable: observation.bots.filter(bot => bot.status === 'unavailable').length,
+          }
+          const rows = observation.bots.slice(0, 30).map(bot => (
+            '@' + bot.id + ' · ' + bot.status
+            + (bot.inFlight > 0 ? ' · in-flight ' + bot.inFlight : '')
+            + (bot.paused === undefined ? '' : ' · paused')
+          ))
+          await this.completeWithText(message, walId, binding, [
+            'Manager 状态（' + new Date(observation.now).toLocaleTimeString() + '）',
+            `Bot：${observation.bots.length}（可用 ${counts.available} / 忙碌 ${counts.busy} / 失败或超时 ${counts.failed} / 不可用 ${counts.unavailable}）`,
+            `Ask：${observation.asks.pending} 待答 · ${observation.asks.answered} 已答`,
+            `Workflow：${observation.workflows.active} 运行中 · ${observation.workflows.completed} 完成 · ${observation.workflows.failed} 失败`,
+            rows.length === 0 ? '（当前没有逻辑 Bot）' : rows.join('\n'),
+          ].join('\n'))
+          return true
+        }
+        await this.completeWithText(message, walId, binding, '用法：/manager status')
+      } catch (error: unknown) {
+        await this.completeWithText(message, walId, binding, 'Manager 操作失败：' + (error instanceof Error ? error.message : String(error)))
       }
       return true
     }
@@ -7022,6 +8507,15 @@ export class BotGateway {
     }
     const delivered = this.bridge.deliverLocalWebNotice(sessionId as SessionId, text)
     if (!delivered) throw new Error('could not deliver local DSH web collaboration reply into the owner session')
+  }
+
+  private async sendAck(target: BotTarget, text: string, key: string): Promise<void> {
+    await this.outbox.enqueue({ key, target, text })
+    if (target.platform === 'local') {
+      void this.outbox.flush().catch(error => this.log('warn', 'Local dashboard ack flush failed: ' + String(error)))
+      return
+    }
+    await this.outbox.flush()
   }
 
   private async sendText(target: BotTarget, text: string, key: string): Promise<void> {
